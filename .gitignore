@@ -1,0 +1,93 @@
+# Python
+/__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+.conda/
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb_checkpoints/
+
+# IDEs
+.vscode/
+.
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Model checkpoints and training outputs
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+*.h5
+
+# Logs
+logs/
+*.log
+tensorboard/
+runs/
+pretrain_logs/
+pretrain_visualization/
+
+
+# Visualizations and results
+*.wav
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.mp4
+*.avi
+
+# Evaluation and inference outputs
+evaluation_results*.json
+inference_output*.json
+metrics_*.json
+predictions_*.json
+
+# Datasets (usually too large for git)
+datasets/
+
+# Temp and cache
+*.tmp
+.cache/
+*.pyc
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Debug files
+debug*.py
+test_*.png
+
+*.txt
+*.pdf
+
