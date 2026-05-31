@@ -246,9 +246,9 @@ def reverse_label_folder(input_dir: str,
 def main():
     parser = argparse.ArgumentParser(description='将 label.csv 反向映射为音素表。')
     parser.add_argument('--label_csv', default=None, help='输入的 label.csv 文件路径')
-    parser.add_argument('--input_dir', default=r'F:\\schoolworks\\FAU\\ss26\\mt\\program\\labels_annot_16', help='递归处理的输入目录路径')
-    parser.add_argument('--output_dir', default='F:\\schoolworks\\FAU\\ss26\\mt\\program\\phoneme_annot_16', help='批量处理时的输出目录路径')
-    parser.add_argument('--phoneme_table', default=r'F:\\schoolworks\\FAU\\ss26\\mt\\program\\TIMIT_MRI_Get_Phone_Alignment\\Phonemic_Table.xlsx', help='音素表路径（csv/xlsx/xls）')
+    parser.add_argument('--input_dir', default=r'datasets/labels_TIMIT', help='递归处理的输入目录路径')
+    parser.add_argument('--output_dir', default=r'datasets/phoneme_TIMIT', help='批量处理时的输出目录路径')
+    parser.add_argument('--phoneme_table', default=r'utils/TIMIT_MRI_Get_Phone_Alignment/Phonemic_Table.xlsx', help='音素表路径（csv/xlsx/xls）')
     parser.add_argument('--output_csv', default=None, help='输出 csv 文件路径')
     parser.add_argument('--mode', choices=['first', 'concat', 'strict'], default='first',
                         help='主音素输出策略：first/concat/strict')
