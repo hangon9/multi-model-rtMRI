@@ -1,0 +1,52 @@
+experiment:
+  name: contrastive_vit_wav2vec
+  seed: 42
+
+data:
+  root: data/USC-annot-16
+  task: NULL  # manner | place | voicing, set to null for multi-task
+  image_size: 128
+  image_channels: 3
+  mri_fps: 15
+  audio_sample_rate: 16000
+  audio_window_ms: 66.67
+
+model:
+  image_encoder:
+    type: monai_vit
+    pretrained: false
+    img_size: 128
+    patch_size: 16
+    hidden_size: 768
+    mlp_dim: 3072
+    num_layers: 12
+    num_heads: 12
+    dropout_rate: 0.1
+
+  audio_encoder:
+    type: wav2vec2
+    name: facebook/wav2vec2-base-960h
+    freeze: true
+    hidden_size: 768
+    target_time_steps: 31
+
+  projection:
+    visual_tokens: 65
+    target_tokens: 31
+    hidden_size: 768
+
+  classifier:
+    input_dim: 23808
+    dropout: 0.1
+
+loss:
+  lambda_cosine: 0.1
+  use_class_weights: true
+
+train:
+  epochs: 30
+  batch_size: 32
+  lr: 0.0001
+  weight_decay: 0.0005
+  num_workers: 4
+  device: cuda

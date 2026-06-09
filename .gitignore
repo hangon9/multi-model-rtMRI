@@ -74,6 +74,8 @@ predictions_*.json
 
 # Datasets (usually too large for git)
 datasets/
+data/
+
 
 # Temp and cache
 *.tmp
