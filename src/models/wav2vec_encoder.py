@@ -13,6 +13,12 @@ class FrozenWav2Vec2Encoder(nn.Module):
         super().__init__()
 
         self.wav2vec = Wav2Vec2Model.from_pretrained(model_name)
+
+        # Disable SpecAugment masking — our audio windows (~66ms) are far shorter than
+        # the default mask_length (10) after CNN downsampling (~3 time steps).
+        # Since the encoder is frozen, training-time masking is unnecessary.
+        self.wav2vec.config.apply_spec_augment = False
+
         self.target_time_steps = target_time_steps
 
         if freeze:

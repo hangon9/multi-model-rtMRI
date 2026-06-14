@@ -15,7 +15,7 @@ class AudioVisionContrastiveModel(nn.Module):
         target_tokens=31,
         hidden_size=768,
         lambda_cosine=0.1,
-        task="",
+        classification_task="",
     ):
         super().__init__()
 
@@ -47,10 +47,11 @@ class AudioVisionContrastiveModel(nn.Module):
         self.classifier = ClassificationHead(
             input_dim=target_tokens * hidden_size,
             num_classes=num_classes,
+            classification_task=classification_task,
         )
 
         self.lambda_cosine = lambda_cosine
-        self.task = task
+        self.classification_task = classification_task
 
     def encode_image(self, image):
         visual_tokens = self.image_encoder(image)                # (B,65,768)
@@ -63,20 +64,19 @@ class AudioVisionContrastiveModel(nn.Module):
         audio_tokens = self.audio_mlp(audio_tokens)              # (B,31,768)
         return audio_tokens
 
-    def forward(self, image, audio=None):
+    def forward(self, image, audio=None, classification_task=None):
+        active_classification_task = self.classification_task if classification_task is None else classification_task
+
         visual_tokens = self.encode_image(image)
         visual_flat = torch.flatten(visual_tokens, start_dim=1)  # (B,23808)
 
-        logits = self.classifier(visual_flat)
-        if self.task == "":
-            return logits
-        else:
-            logits = logits[self.task]
+        logits = self.classifier(visual_flat, classification_task=active_classification_task)
 
         output = {
             "logits": logits,
             "visual_tokens": visual_tokens,
             "visual_flat": visual_flat,
+            "classification_task": active_classification_task,
         }
 
         if audio is not None:
