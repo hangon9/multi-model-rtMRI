@@ -74,7 +74,10 @@ predictions_*.json
 
 # Datasets (usually too large for git)
 datasets/
-data/
+data/processed/
+data/USC-annot-16/
+data/USC-TIMIT/
+
 
 
 # Temp and cache
