@@ -215,7 +215,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, classificat
     running_cls_loss = 0.0
     running_cos_loss = 0.0
 
-    for batch in tqdm(dataloader):
+    for batch in tqdm(dataloader, desc="Training"):
         image = batch["image"].to(device)
         audio = batch["audio"].to(device)
         labels = batch["labels"]
