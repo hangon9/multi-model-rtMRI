@@ -77,7 +77,7 @@ datasets/
 data/processed/
 data/USC-annot-16/
 data/USC-TIMIT/
-
+*.zip
 
 
 # Temp and cache

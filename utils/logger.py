@@ -107,7 +107,17 @@ class TrainingLogger:
         """Log error message."""
         self.logger.error(message)
     
-    def log_metrics(self, epoch: int, phase: str, metrics: dict, lr: float = None):
+    
+    def log_metrics(
+        self,
+        epoch: int,
+        phase: str,
+        metrics: dict,
+        lr: float = None,
+        fold_id: int = None,
+        classification_task: str = None,
+):
+
         """
         Log metrics for an epoch.
         
@@ -116,20 +126,25 @@ class TrainingLogger:
             phase: 'train' or 'val'
             metrics: Dictionary of metric names and values
             lr: Optional learning rate
+            fold_id: Optional fold ID for cross-validation
+            classification_task: Optional classification task name
         """
         # Log to console
+        self.info(f"Fold {fold_id} - Task: {classification_task}" if fold_id is not None and classification_task is not None else "")
         self.info(f"Epoch {epoch+1} - {phase.upper()}")
         self.info(f"  Loss: {metrics.get('loss_total', 0):.4f}")
         
         # Log loss components
-        if 'loss_ce' in metrics or 'loss_l1' in metrics or 'loss_giou' in metrics:
+        loss_value = metrics.get("loss", metrics.get("loss_total", 0))
+        self.info(f"  Loss: {loss_value:.4f}")
+
+        if "cls_loss" in metrics or "contrast_loss" in metrics:
             self.info("  Loss Components:")
-            if 'loss_ce' in metrics:
-                self.info(f"    loss_ce:    {metrics['loss_ce']:.4f}")
-            if 'loss_cos' in metrics:
-                self.info(f"    loss_cos:   {metrics['loss_cos']:.4f}")
-            if 'loss_infonce' in metrics:
-                self.info(f"    loss_infonce:  {metrics['loss_infonce']:.4f}")
+            if "cls_loss" in metrics:
+                self.info(f"    cls_loss:      {metrics['cls_loss']:.4f}")
+            if "contrast_loss" in metrics:
+                self.info(f"    contrast_loss: {metrics['contrast_loss']:.4f}")
+
         
         # Log prediction stats
         if any(k.startswith('pred_') for k in metrics):
@@ -139,25 +154,30 @@ class TrainingLogger:
                     self.info(f"    {k}: {v:.4f}")
         
         # Log training stats
-        if lr is not None or 'grad_norm' in metrics:
-            self.info("  Training Stats:")
-            if 'grad_norm' in metrics:
-                self.info(f"    grad_norm:  {metrics['grad_norm']:.4f}")
-            if lr is not None:
-                self.info(f"    lr:         {lr:.6f}")
         
-        # Save to metrics file in JSON Lines format
-        metrics_entry = {
-            'timestamp': datetime.now().isoformat(),
-            'epoch': epoch + 1,
-            'phase': phase,
-            **metrics
-        }
         if lr is not None:
-            metrics_entry['lr'] = lr
-        
-        with open(self.metrics_file, 'a') as f:
-            f.write(json.dumps(metrics_entry) + '\n')
+            self.info("  Training Stats:")
+            self.info(f"    lr: {lr:.6f}")
+
+        metrics_entry = {
+            "timestamp": datetime.now().isoformat(),
+            "epoch": epoch + 1,
+            "phase": phase,
+            **metrics,
+        }
+
+        if fold_id is not None:
+            metrics_entry["fold_id"] = fold_id
+
+        if classification_task is not None:
+            metrics_entry["classification_task"] = classification_task
+
+        if lr is not None:
+            metrics_entry["lr"] = lr
+
+        with open(self.metrics_file, "a") as f:
+            f.write(json.dumps(metrics_entry) + "\n")
+
     
     def log_model_info(self, model):
         """Log model architecture information."""

@@ -398,6 +398,15 @@ def main():
                 classification_task=classification_task,
             )
 
+            logger.log_metrics(
+                fold_id=fold_id,
+                epoch=epoch,
+                phase="train",
+                metrics=train_log,
+                lr=optimizer.param_groups[0]['lr'],
+                classification_task=classification_task,
+            )
+
             # Log training loss for every epoch
             log_msg = (
                 f"Fold {fold_id}, Epoch {epoch + 1}: "
