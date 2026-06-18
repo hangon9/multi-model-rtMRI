@@ -78,6 +78,7 @@ data/processed/
 data/USC-annot-16/
 data/USC-TIMIT/
 *.zip
+docs/
 
 
 # Temp and cache
@@ -98,3 +99,6 @@ test_*.png
 
 # Old
 old/*
+
+# Results
+eval_output/*

@@ -1,19 +1,16 @@
 import torch
 import yaml
 import argparse
-import pandas as pd
 
-from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from tqdm import tqdm
-from sklearn.model_selection import train_test_split, GroupShuffleSplit, GroupKFold
+from sklearn.model_selection import GroupKFold
 from pathlib import Path
 
-from data.USCAnnot16Loader import USCAnnot16Dataset
 from src.models.contrastive_model import AudioVisionContrastiveModel
 from src.losses.loss_factory import BuildLoss
 from utils.logger import TrainingLogger
-from data.annot_16_prepare import build_dataframe_annot_16
+from data.splits import make_train_test_split, create_dataloader
 
 CONFIG_PATH = "configs/baseline_config.yaml"
 
@@ -29,95 +26,6 @@ def load_config(config_path: str) -> dict:
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return config
-
-
-def create_dataframe_annot_16(config: dict) -> pd.DataFrame:
-    """
-    Build a DataFrame for the USC-annot-16 dataset if it doesn't exist.
-    """
-    data_cfg = config["data"]
-
-    root = Path(data_cfg["root"])
-    metadata_path = Path(data_cfg["root"]) / "DataFrame-annot-16.csv"
-
-    if metadata_path.exists():
-        print(f"[DataFrame] Found existing CSV: {metadata_path}")
-        df = pd.read_csv(metadata_path)
-    else:
-        print(f"[DataFrame] CSV not found, building: {metadata_path}")
-
-        df = build_dataframe_annot_16(
-            output_csv_path=metadata_path,
-
-            # there are kwargs 
-            root=root,
-            phonemic_table_path=data_cfg["phonemic_table"],
-            fps=data_cfg.get("fps", 15),
-        )
-
-        print(f"[DataFrame] Saved new CSV to: {metadata_path}")
-
-    return df
-
-
-def create_dataframe(config):
-    dataset_name = config["data"]["dataset"]
-
-    if dataset_name == "USC-annot-16":
-        df = create_dataframe_annot_16(config)
-
-    elif dataset_name == "USC-TIMIT":
-        raise NotImplementedError("USC-TIMIT dataset loading not implemented yet.")
-
-    else:
-        raise ValueError(f"Unsupported dataset: {dataset_name}")
-
-    return df
-
-
-
-
-def make_train_test_split(config):
-    """
-    按 subject 分组：
-    先划分出 10% subjects 作为 test set。
-    剩余 subjects 用于 5-fold cross validation。
-    """
-
-    df = create_dataframe(config)
-
-    data_cfg = config["data"]
-
-    group_col = "subject"
-    test_ratio = data_cfg.get("test_ratio", 0.1)
-    seed = data_cfg.get("seed", 42)
-
-    if group_col not in df.columns:
-        raise ValueError(
-            f"Group column '{group_col}' not found in DataFrame. "
-            f"Available columns: {df.columns.tolist()}"
-        )
-
-    groups = df[group_col]
-
-    splitter = GroupShuffleSplit(
-        n_splits=1,
-        test_size=test_ratio,
-        random_state=seed
-    )
-
-    train_val_idx, test_idx = next(
-        splitter.split(
-            df,
-            groups=groups
-        )
-    )
-
-    train_val_df = df.iloc[train_val_idx].reset_index(drop=True)
-    test_df = df.iloc[test_idx].reset_index(drop=True)
-
-    return train_val_df, test_df
-
 
 def get_fold_indices(train_val_df, config):
     """
@@ -155,58 +63,78 @@ def get_fold_indices(train_val_df, config):
 
     return splits
 
+_MANNER_COLS  = ["Silence", "Stop", "Nasal", "Fricative", "Approximant", "Vowel"]
+_PLACE_COLS   = ["Labial", "Dental", "Alveolar", "Postalveolar",
+                 "Palatal", "Velar", "Glottal", "Front", "Central", "Back"]
+_VOICING_COLS = ["Voiced", "Voiceless"]
 
 
-def create_dataloader(
-    dataframe,
-    config: dict,
-    train=True,
-):
+def _derive_class_indices(df, task: str):
+    """
+    Same as USCAnnot16Dataset.__getitem__ 
+    """
+    if task == "manner":
+        # argmax([Silence, Stop, Nasal, Fricative, Approximant, Vowel]) → 0-5
+        return df[_MANNER_COLS].values.argmax(axis=1)
 
-    '''
-    Create train and validation dataloaders.
-    '''
-    cfg_data = config["data"]
-    cfg_img = config["model"]["image_encoder"]
-    cfg_train = config["train"]
-    untrained_subjects = cfg_data.get("untrained_subjects", None)
-    untrained_tasks = cfg_data.get("untrained_tasks", None)
-    image_size = cfg_img.get("img_size", 128)
-    target_sample_rate = cfg_data.get("audio_sample_rate", 16000)
-    batch_size = cfg_train.get("batch_size", 16)
-    num_workers = cfg_train.get("num_workers", 4)
-    fps = cfg_data.get("fps", 15)
-    audio_window_sec = cfg_data.get("audio_window_sec", 0.06667)
+    elif task == "place":
+        # Silence 帧 → 0；其余 argmax([Labial...Back]) + 1 → 1-10
+        idx = df[_PLACE_COLS].values.argmax(axis=1) + 1
+        idx[df["Silence"].values == 1.0] = 0
+        return idx
 
-    if cfg_data["dataset"] == "USC-annot-16":
-        dataset = USCAnnot16Dataset(
-        dataframe,
-        untrained_subjects=untrained_subjects,
-        untrained_tasks=untrained_tasks,
-        image_size=image_size,
-        target_sample_rate=target_sample_rate,
-        fps=fps,
-        audio_window_sec=audio_window_sec,
-        label_columns=None,
-        cache_audio=True,
-        train=train,
-        )
-    
+    elif task == "voicing":
+        # Silence 帧 → 0；其余 argmax([Voiced, Voiceless]) + 1 → 1-2
+        idx = df[_VOICING_COLS].values.argmax(axis=1) + 1
+        idx[df["Silence"].values == 1.0] = 0
+        return idx
 
-    loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=train,
-        num_workers=num_workers,
-        pin_memory=True,
-    )
-
-    return loader
-
-    # elif cfg_data["dataset"] == "USC-TIMIT":
+    else:
+        raise ValueError(f"Unknown task for weight derivation: {task}")
 
 
+def get_class_weights(train_df, config):
+    """
+    计算每折训练集的 balanced class weights。
 
+    Returns:
+        Single task: Tensor shape (n_classes,), or None
+        Multi-task: dict {"manner": Tensor, "place": Tensor, "voicing": Tensor}. or None
+    """
+    use_class_weights = config["loss"].get("use_class_weights", False)  # ← 读 loss 节
+    classification_task = config["data"]["classification_task"] or ""
+
+    if not use_class_weights:
+        return None
+
+    def _balanced_weights(class_indices, n_classes: int):
+        """
+        w_i = N / (n_classes × count_i)
+        等价于 sklearn compute_class_weight("balanced")，
+        且对折内缺失类别（count=0）做了保护（赋最大权重）。
+        """
+        import numpy as np
+        N = len(class_indices)
+        weights = np.zeros(n_classes, dtype=np.float32)
+        for c in range(n_classes):
+            count = (class_indices == c).sum()
+            weights[c] = N / (n_classes * count) if count > 0 else 0.0
+
+        # 缺失类别：赋当前最大权重，避免 CE loss 遇到 weight=0
+        if (weights == 0).any():
+            max_w = weights[weights > 0].max() if (weights > 0).any() else 1.0
+            weights[weights == 0] = max_w
+
+        return torch.tensor(weights, dtype=torch.float32)
+
+    def _weights_for(task):
+        indices = _derive_class_indices(train_df, task)
+        return _balanced_weights(indices, NUM_CLASSES[task])
+
+    if classification_task == "":
+        return {task: _weights_for(task) for task in ("manner", "place", "voicing")}
+    else:
+        return _weights_for(classification_task)
 
 def train_one_epoch(model, dataloader, criterion, optimizer, device, classification_task=None):
     model.train()
@@ -337,10 +265,7 @@ def main():
     classification_task = config["data"]["classification_task"]
 
     # Create train, validation, and test dataloaders
-    train_val_df, test_df = make_train_test_split(config)
-
-    logger.info(f"test samples: {len(test_df)}")
-    test_loader = create_dataloader(test_df, config, train=False)
+    train_val_df, _ = make_train_test_split(config)
 
     n_splits = config["data"].get("n_splits", 5)
     num_epochs = config["train"].get("epochs", 30)
@@ -375,9 +300,12 @@ def main():
             classification_task=classification_task,
         ).to(device)
 
+        class_weights = get_class_weights(train_df, config)   # ← 每折单独算
+
         criterion = BuildLoss(
-            lambda_contrast=0.1,
-            classification_task=classification_task
+            lambda_contrast=config["loss"]["lambda"],          # ← 从 config 读，不再硬编码 0.1
+            classification_task=classification_task,
+            class_weights=class_weights,                       # ← 传入
         ).to(device)
 
         optimizer = AdamW(

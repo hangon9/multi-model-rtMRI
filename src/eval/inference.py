@@ -8,16 +8,7 @@ import pandas as pd
 import torch
 
 from src.models.contrastive_model import AudioVisionContrastiveModel
-
-# make_train_test_split 和 create_dataloader 按要求从 train.py 导入。
-# 这里保留两个 fallback，方便在不同运行入口（python -m / 直接脚本）下都能 import 成功。
-try:
-    from src.train import make_train_test_split, create_dataloader
-except ImportError:  # pragma: no cover
-    try:
-        from train import make_train_test_split, create_dataloader
-    except ImportError:  # pragma: no cover
-        from ..train import make_train_test_split, create_dataloader
+from data.splits import make_train_test_split, create_dataloader
 
 
 NUM_CLASSES: dict[str, int] = {

@@ -9,7 +9,7 @@ class BuildLoss(nn.Module):
         self,
         lambda_contrast=0.1,
         contrast_loss_name="cosine",
-        class_weights=None,
+        class_weights=None,           # None | Tensor(单任务) | dict(多任务)
         contrast_loss_kwargs=None,
         classification_task="",
     ):
@@ -17,48 +17,73 @@ class BuildLoss(nn.Module):
 
         self.lambda_contrast = lambda_contrast
         self.classification_task = classification_task or ""
-
-        if class_weights is not None:
-            self.ce_loss = nn.CrossEntropyLoss(weight=class_weights)
-        else:
-            self.ce_loss = nn.CrossEntropyLoss()
-
-        if contrast_loss_kwargs is None:
-            contrast_loss_kwargs = {}
-
-        self.contrast_loss = apply_contrast_loss(
-            contrast_loss_name,
-            **contrast_loss_kwargs
-        )
-
         self.contrast_loss_name = contrast_loss_name
 
+        # ── CE Loss 构建 ─────────────────────────────────────────
+        if self.classification_task == "":
+            # 多任务：三个头各用各自的权重
+            if isinstance(class_weights, dict):
+                self.ce_losses = nn.ModuleDict({
+                    task: nn.CrossEntropyLoss(weight=class_weights[task])
+                    for task in ("manner", "place", "voicing")
+                })
+            elif class_weights is None:
+                self.ce_losses = nn.ModuleDict({
+                    task: nn.CrossEntropyLoss()
+                    for task in ("manner", "place", "voicing")
+                })
+            else:
+                raise ValueError(
+                    "Multi-task BuildLoss 的 class_weights 必须是 dict 或 None，"
+                    f"收到 {type(class_weights)}"
+                )
+            self.ce_loss = None   # 多任务不使用
+
+        else:
+            # 单任务：单一权重张量
+            if class_weights is not None and not isinstance(class_weights, torch.Tensor):
+                raise ValueError(
+                    "Single-task BuildLoss 的 class_weights 必须是 Tensor 或 None，"
+                    f"收到 {type(class_weights)}"
+                )
+            self.ce_loss = nn.CrossEntropyLoss(weight=class_weights)
+            self.ce_losses = None  # 单任务不使用
+
+        # ── Contrast Loss ────────────────────────────────────────
+        if contrast_loss_kwargs is None:
+            contrast_loss_kwargs = {}
+        self.contrast_loss = apply_contrast_loss(
+            contrast_loss_name, **contrast_loss_kwargs
+        )
+
     def forward(self, logits, labels, visual_flat, audio_flat, classification_task=None):
-        active_classification_task = self.classification_task if classification_task is None else classification_task
+        active_classification_task = (
+            self.classification_task if classification_task is None else classification_task
+        )
 
         if active_classification_task == "":
             if not isinstance(logits, dict):
                 raise ValueError("Multi-task loss expects a dict of logits.")
             if not isinstance(labels, dict):
-                raise ValueError("Multi-task loss expects labels as a dict keyed by classification_task name.")
+                raise ValueError("Multi-task loss expects labels as a dict.")
 
-            classification_task_logits = logits.get("all_logits", logits)
-            classification_task_losses = []
+            task_logits = logits.get("all_logits", logits)
+            task_losses = []
 
             for name in ("manner", "place", "voicing"):
-                if name not in classification_task_logits:
+                if name not in task_logits or name not in labels:
                     continue
-                if name not in labels:
-                    raise ValueError(f"Missing label for classification_task '{name}' in multi-task training.")
+                # 直接用各自的 ce_losses[name]，权重已内置
+                task_losses.append(
+                    self.ce_losses[name](task_logits[name], labels[name])
+                )
 
-                classification_task_losses.append(self.ce_loss(classification_task_logits[name], labels[name]))
+            if not task_losses:
+                raise ValueError("No task losses computed for multi-task training.")
+            cls_loss = sum(task_losses) / len(task_losses)
 
-            if not classification_task_losses:
-                raise ValueError("No classification_task losses were computed for multi-task training.")
-
-            cls_loss = sum(classification_task_losses) / len(classification_task_losses)
         else:
-            # Unwrap dict logits / labels for single-task
+            # 单任务：解包 dict logits/labels（逻辑不变）
             if isinstance(logits, dict):
                 if active_classification_task in logits:
                     logits = logits[active_classification_task]
@@ -66,25 +91,21 @@ class BuildLoss(nn.Module):
                     logits = logits["logits"]
                 else:
                     raise ValueError(
-                        f"Logits dict does not contain key "
-                        f"'{active_classification_task}' "
-                        f"or a 'logits' fallback. "
-                        f"Keys: {list(logits.keys())}"
+                        f"Logits dict 不含 '{active_classification_task}' 或 'logits' key。"
+                        f"可用 key：{list(logits.keys())}"
                     )
 
             if isinstance(labels, dict):
                 if active_classification_task not in labels:
                     raise ValueError(
-                        f"Labels dict does not contain key "
-                        f"'{active_classification_task}'. "
-                        f"Available keys: {list(labels.keys())}"
+                        f"Labels dict 不含 '{active_classification_task}'。"
+                        f"可用 key：{list(labels.keys())}"
                     )
                 labels = labels[active_classification_task]
 
             cls_loss = self.ce_loss(logits, labels)
 
         contrast_loss = self.contrast_loss(visual_flat, audio_flat)
-
         total_loss = cls_loss + self.lambda_contrast * contrast_loss
 
         return {
