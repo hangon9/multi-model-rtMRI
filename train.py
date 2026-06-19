@@ -314,6 +314,15 @@ def main():
             weight_decay=config["train"].get("weight_decay", 5e-4),
         )
 
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=config["train"].get("lr", 1e-4),
+            epochs=num_epochs,
+            steps_per_epoch=len(train_loader),
+            pct_start=0.3,
+            anneal_strategy="cos",
+        )
+
         for epoch in range(num_epochs):
             logger.info(f"Fold {fold_id}, Epoch {epoch + 1}/{num_epochs}")
 
@@ -390,6 +399,8 @@ def main():
                     )
             else:
                 logger.info(log_msg)
+
+            scheduler.step()
 
 
 if __name__ == "__main__":
