@@ -13,9 +13,16 @@ def parse_training_log(log_dir: str | Path) -> pd.DataFrame:
             train_loss, train_cls_loss, train_contrast_loss,
             val_loss(NaN on non-val epochs), val_cls_loss, val_contrast_loss
     """
-    log_path = Path(log_dir) / 'training.log'
-    if not log_path.exists():
-        raise FileNotFoundError(f'Log file not found: {log_path}')
+    
+    path = Path(log_dir)
+
+    if path.is_file():
+        log_path = path
+    elif path.is_dir():
+        log_path = path / "training.log"
+    else:
+        raise FileNotFoundError(...)
+
     
     # 仅有训练 loss 的行（非验证 epoch）
     _RE_TRAIN = re.compile(
