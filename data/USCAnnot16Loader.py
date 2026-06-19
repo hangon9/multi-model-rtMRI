@@ -94,7 +94,7 @@ class USCAnnot16Dataset(Dataset):
         if train:
             return T.Compose([
                 T.Resize((self.image_size, self.image_size)),
-                T.RandomHorizontalFlip(p=0.5),
+                T.RandomAffine(degrees=3, translate=(0.02, 0.02), scale=(0.98, 1.02)),
                 T.Grayscale(num_output_channels=3),
                 T.ToTensor(),
             ])
