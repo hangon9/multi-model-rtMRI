@@ -10,12 +10,28 @@ class CosineContrastLoss(nn.Module):
         self.loss_fn = nn.CosineEmbeddingLoss()
 
     def forward(self, visual_flat, audio_flat):
-        target = torch.ones(
-            visual_flat.size(0),
-            device=visual_flat.device,
-            dtype=visual_flat.dtype,
-        )
-        return self.loss_fn(visual_flat, audio_flat, target)
+        visual_flat = F.normalize(visual_flat, dim=-1)
+        audio_flat = F.normalize(audio_flat, dim=-1)
+
+        B = visual_flat.size(0)
+
+        # positive pairs: (visual_flat[i], audio_flat[i])
+        pos_visual = visual_flat
+        pos_audio = audio_flat
+        pos_target = torch.ones(B, device=visual_flat.device)
+
+        # negative pairs: (visual_flat[i], audio_flat[j]) for j != i
+        neg_visual = visual_flat
+        neg_audio = torch.roll(audio_flat, shifts=1, dims=0)
+        neg_target = -torch.ones(B, device=visual_flat.device)
+
+        # combine positive and negative pairs
+        input1 = torch.cat([pos_visual, neg_visual], dim=0)
+        input2 = torch.cat([pos_audio, neg_audio], dim=0)
+        target = torch.cat([pos_target, neg_target], dim=0)
+
+        return self.loss_fn(input1, input2, target)
+
     
 
 class NTXentLoss(nn.Module):
