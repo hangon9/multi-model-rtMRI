@@ -6,10 +6,13 @@ class SingleClassificationHead(nn.Module):
     def __init__(self, input_dim=31 * 768, num_classes=6, dropout=0.1):
         super().__init__()
 
+# "a linear multilayer perceptron with a softmax activation function is used for the classification"
         self.net = nn.Sequential(
             nn.LayerNorm(input_dim),
+            nn.Linear(input_dim, 512),
+            nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(input_dim, num_classes),
+            nn.Linear(512, num_classes),
         )
 
     def forward(self, x):
