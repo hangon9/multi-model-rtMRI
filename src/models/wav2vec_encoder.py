@@ -37,7 +37,13 @@ class FrozenWav2Vec2Encoder(nn.Module):
 
         # 如果 T_audio 不等于 31，用 adaptive pooling 对齐到 31
         x = x.transpose(1, 2)          # (B, 768, T_audio)
-        x = self.temporal_pool(x)      # (B, 768, 31)
-        x = x.transpose(1, 2)          # (B, 31, 768)
+        if x.size(2) != self.target_time_steps:
+            print(
+                f"Warning: Wav2Vec2 output time steps ({x.size(2)}) "
+                f"does not match target ({self.target_time_steps}). "
+                "Applying temporal pooling."
+            )
+            x = self.temporal_pool(x)      # (B, 768, 31)
+            x = x.transpose(1, 2)          # (B, 31, 768)
 
         return x
