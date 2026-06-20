@@ -295,6 +295,7 @@ def main() -> None:
     args = parser.parse_args()
 
     # ---- resolve paths ----
+    print("[evaluate] Resolving paths ...")
     checkpoint_path = str(Path(args.checkpoint).resolve())
     output_dir = Path(args.output_dir).resolve()
     figures_dir = output_dir / "figures"

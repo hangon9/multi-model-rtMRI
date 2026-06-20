@@ -136,7 +136,7 @@ def get_class_weights(train_df, config):
     else:
         return _weights_for(classification_task)
 
-def train_one_epoch(model, dataloader, criterion, optimizer, device, classification_task=None):
+def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, classification_task=None):
     model.train()
 
     running_loss = 0.0
@@ -168,6 +168,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, classificat
 
         losses["loss"].backward()
         optimizer.step()
+        scheduler.step()
 
         running_loss += losses["loss"].item()
         running_cls_loss += losses["cls_loss"].item()
@@ -331,6 +332,7 @@ def main():
                 dataloader=train_loader,
                 criterion=criterion,
                 optimizer=optimizer,
+                scheduler=scheduler,
                 device=device,
                 classification_task=classification_task,
             )
@@ -399,8 +401,6 @@ def main():
                     )
             else:
                 logger.info(log_msg)
-
-            scheduler.step()
 
 
 if __name__ == "__main__":
