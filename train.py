@@ -340,7 +340,7 @@ def main():
             logger.log_metrics(
                 fold_id=fold_id,
                 epoch=epoch,
-                phase="train",
+                phase="training",
                 metrics=train_log,
                 lr=optimizer.param_groups[0]['lr'],
                 classification_task=classification_task,
@@ -363,6 +363,15 @@ def main():
                     device=device,
                     classification_task=classification_task,
                 )
+
+                logger.log_metrics(
+                fold_id=fold_id,
+                epoch=epoch,
+                phase="validation",
+                metrics=val_log,
+                lr=optimizer.param_groups[0]['lr'],
+                classification_task=classification_task,
+            )
 
                 log_msg += (
                     f", val_loss={val_log['loss']:.4f}, "
