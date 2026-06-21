@@ -50,6 +50,9 @@ def _build_model(config: dict[str, Any], classification_task: str, device: torch
     projection_cfg = config["model"].get("projection", {})
     loss_cfg = config.get("loss", {})
 
+    contrast_loss_name = loss_cfg.get("contrast_loss", None)
+    use_contrast = contrast_loss_name is not None and str(contrast_loss_name).lower() not in ("none", "null")
+
     return AudioVisionContrastiveModel(
         num_classes=NUM_CLASSES[classification_task],
         visual_tokens=projection_cfg["visual_tokens"],
@@ -57,6 +60,7 @@ def _build_model(config: dict[str, Any], classification_task: str, device: torch
         hidden_size=projection_cfg["hidden_size"],
         lambda_cosine=loss_cfg["lambda"],
         classification_task=classification_task,
+        use_contrast=use_contrast,
     ).to(device)
 
 

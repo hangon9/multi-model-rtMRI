@@ -4,6 +4,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class NoContrastLoss(nn.Module):
+    """No-op contrast loss: always returns 0. Used when contrastive learning is disabled."""
+
+    def forward(self, visual_flat, audio_flat):
+        return torch.tensor(0.0, device=visual_flat.device, requires_grad=False)
+
+
 class CosineContrastLoss(nn.Module):
     def __init__(self):
         super().__init__()
@@ -51,13 +58,19 @@ class NTXentLoss(nn.Module):
 
 
 def apply_contrast_loss(loss_name, **kwargs):
+    if loss_name is None:
+        return NoContrastLoss()
+
     loss_name = loss_name.lower()
+
+    if loss_name in ("none", "null"):
+        return NoContrastLoss()
 
     if loss_name == "cosine":
         return CosineContrastLoss()
 
     elif loss_name in ["nt_xent", "infonce"]:
         return NTXentLoss(**kwargs)
-    
+
     else:
         raise ValueError(f"Unsupported contrast loss: {loss_name}")

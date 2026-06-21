@@ -139,13 +139,14 @@ def get_class_weights(train_df, config):
 def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, classification_task=None):
     model.train()
 
+    use_contrast = getattr(model, "use_contrast", True)
     running_loss = 0.0
     running_cls_loss = 0.0
     running_cos_loss = 0.0
 
     for batch in tqdm(dataloader, desc="Training"):
         image = batch["image"].to(device)
-        audio = batch["audio"].to(device)
+        audio = batch["audio"].to(device) if use_contrast else None
         labels = batch["labels"]
         if isinstance(labels, dict):
             labels = {k: v.to(device) for k, v in labels.items()}
@@ -162,7 +163,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
             logits=outputs["logits"],
             labels=labels,
             visual_flat=outputs["visual_flat"],
-            audio_flat=outputs["audio_flat"],
+            audio_flat=outputs.get("audio_flat"),
             classification_task=active_classification_task,
         )
 
@@ -186,13 +187,14 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
 def validate_one_epoch(model, dataloader, criterion, device, classification_task=None):
     model.eval()
 
+    use_contrast = getattr(model, "use_contrast", True)
     running_loss = 0.0
     running_cls_loss = 0.0
     running_cos_loss = 0.0
 
     for batch in tqdm(dataloader, desc="Validation"):
         image = batch["image"].to(device)
-        audio = batch["audio"].to(device)
+        audio = batch["audio"].to(device) if use_contrast else None
         labels = batch["labels"]
         if isinstance(labels, dict):
             labels = {k: v.to(device) for k, v in labels.items()}
@@ -215,7 +217,7 @@ def validate_one_epoch(model, dataloader, criterion, device, classification_task
             logits=outputs["logits"],
             labels=labels,
             visual_flat=outputs["visual_flat"],
-            audio_flat=outputs["audio_flat"],
+            audio_flat=outputs.get("audio_flat"),
             classification_task=active_classification_task,
         )
 
@@ -292,6 +294,9 @@ def main():
         val_loader = create_dataloader(val_df, config, train=False)
 
         # init model, criterion, optimizer for each fold
+        contrast_loss_name = config["loss"].get("contrast_loss", None)
+        use_contrast = contrast_loss_name is not None and str(contrast_loss_name).lower() not in ("none", "null")
+
         model = AudioVisionContrastiveModel(
             num_classes=NUM_CLASSES[classification_task],
             visual_tokens=65,
@@ -299,6 +304,7 @@ def main():
             hidden_size=768,
             lambda_cosine=0.1,
             classification_task=classification_task,
+            use_contrast=use_contrast,
         ).to(device)
 
         class_weights = get_class_weights(train_df, config)   # ← 每折单独算
@@ -307,6 +313,7 @@ def main():
             lambda_contrast=config["loss"]["lambda"],          # ← 从 config 读，不再硬编码 0.1
             classification_task=classification_task,
             class_weights=class_weights,                       # ← 传入
+            contrast_loss_name=contrast_loss_name,
         ).to(device)
 
         optimizer = AdamW(

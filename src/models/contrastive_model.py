@@ -16,8 +16,11 @@ class AudioVisionContrastiveModel(nn.Module):
         hidden_size=768,
         lambda_cosine=0.1,
         classification_task="",
+        use_contrast=True,
     ):
         super().__init__()
+
+        self.use_contrast = use_contrast
 
         self.image_encoder = MRIViTEncoder(
             img_size=128,
@@ -29,11 +32,12 @@ class AudioVisionContrastiveModel(nn.Module):
             dropout_rate=0.1,
         )
 
-        self.audio_encoder = FrozenWav2Vec2Encoder(
-            model_name="facebook/wav2vec2-base-960h",
-            target_time_steps=target_tokens,
-            freeze=True,
-        )
+        if self.use_contrast:
+            self.audio_encoder = FrozenWav2Vec2Encoder(
+                model_name="facebook/wav2vec2-base-960h",
+                target_time_steps=target_tokens,
+                freeze=True,
+            )
 
         self.visual_token_projection = TokenProjection(
             in_tokens=visual_tokens,
@@ -42,7 +46,8 @@ class AudioVisionContrastiveModel(nn.Module):
         )
 
         self.visual_mlp = ModalityMLP(hidden_size=hidden_size)
-        self.audio_mlp = ModalityMLP(hidden_size=hidden_size)
+        if self.use_contrast:
+            self.audio_mlp = ModalityMLP(hidden_size=hidden_size)
 
         self.classifier = ClassificationHead(
             input_dim=target_tokens * hidden_size,
@@ -60,6 +65,8 @@ class AudioVisionContrastiveModel(nn.Module):
         return visual_tokens
 
     def encode_audio(self, audio):
+        if not self.use_contrast:
+            return None
         audio_tokens = self.audio_encoder(audio)                 # (B,31,768)
         audio_tokens = self.audio_mlp(audio_tokens)              # (B,31,768)
         return audio_tokens
@@ -79,7 +86,7 @@ class AudioVisionContrastiveModel(nn.Module):
             "classification_task": active_classification_task,
         }
 
-        if audio is not None:
+        if audio is not None and self.use_contrast:
             audio_tokens = self.encode_audio(audio)
             audio_flat = torch.flatten(audio_tokens, start_dim=1)
 

@@ -50,6 +50,7 @@ class BuildLoss(nn.Module):
             self.ce_losses = None  # 单任务不使用
 
         # ── Contrast Loss ────────────────────────────────────────
+        self.contrast_enabled = contrast_loss_name is not None and str(contrast_loss_name).lower() not in ("none", "null")
         if contrast_loss_kwargs is None:
             contrast_loss_kwargs = {}
         self.contrast_loss = apply_contrast_loss(
@@ -105,12 +106,18 @@ class BuildLoss(nn.Module):
 
             cls_loss = self.ce_loss(logits, labels)
 
-        contrast_loss = self.contrast_loss(visual_flat, audio_flat)
-        total_loss = cls_loss + self.lambda_contrast * contrast_loss
+        if audio_flat is not None and self.contrast_enabled:
+            contrast_loss = self.contrast_loss(visual_flat, audio_flat)
+            total_loss = cls_loss + self.lambda_contrast * contrast_loss
+        else:
+            contrast_loss = torch.tensor(0.0, device=visual_flat.device)
+            total_loss = cls_loss
 
-        return {
+        result = {
             "loss": total_loss,
             "cls_loss": cls_loss,
             "contrast_loss": contrast_loss,
-            f"{self.contrast_loss_name}_loss": contrast_loss,
         }
+        if self.contrast_loss_name:
+            result[f"{self.contrast_loss_name}_loss"] = contrast_loss
+        return result
