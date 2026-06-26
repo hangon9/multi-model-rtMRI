@@ -3,16 +3,17 @@ import torch.nn as nn
 
 
 class SingleClassificationHead(nn.Module):
-    def __init__(self, input_dim=31 * 768, num_classes=6, dropout=0.1):
+    def __init__(self, input_dim=31 * 768, hidden_dim=512, num_classes=6, dropout=0.1):
         super().__init__()
 
 # "a linear multilayer perceptron with a softmax activation function is used for the classification"
         self.net = nn.Sequential(
             nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, 512),
+            nn.Dropout(dropout),
+            nn.Linear(input_dim, hidden_dim),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(512, num_classes),
+            nn.Linear(hidden_dim, num_classes),
         )
 
     def forward(self, x):
@@ -20,25 +21,33 @@ class SingleClassificationHead(nn.Module):
 
 
 class ClassificationHead(nn.Module):
-    def __init__(self, input_dim=31 * 768, num_classes=None, dropout=0.1, classification_task=""):
+    def __init__(self, input_type="sequential", input_dim=31 * 768, hidden_dim=512, num_classes=None, dropout=0.1, classification_task=""):
         super().__init__()
-
+        if input_type not in ("sequential", "pooled"):
+            raise ValueError(f"Invalid input_type: {input_type}. Expected 'sequential' or 'pooled'.")
+        if input_type == "sequential":
+            input_dim = 31 * 768
+        elif input_type == "pooled":
+            input_dim = 768
         self.classification_task = classification_task or ""
 
         if self.classification_task == "":
             self.heads = nn.ModuleDict({
                 "manner": SingleClassificationHead(
                     input_dim=input_dim,
+                    hidden_dim=hidden_dim,
                     num_classes=6,
                     dropout=dropout
                 ),
                 "place": SingleClassificationHead(
                     input_dim=input_dim,
+                    hidden_dim=hidden_dim,
                     num_classes=11,
                     dropout=dropout
                 ),
                 "voicing": SingleClassificationHead(
                     input_dim=input_dim,
+                    hidden_dim=hidden_dim,
                     num_classes=3,
                     dropout=dropout
                 ),
@@ -49,6 +58,7 @@ class ClassificationHead(nn.Module):
 
             self.head = SingleClassificationHead(
                 input_dim=input_dim,
+                hidden_dim=hidden_dim,
                 num_classes=num_classes,
                 dropout=dropout,
             )

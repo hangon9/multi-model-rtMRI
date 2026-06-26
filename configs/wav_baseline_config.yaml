@@ -1,0 +1,43 @@
+
+experiment_name: wav_baseline
+
+data:
+  dataset: USC-annot-16 # options: USC-annot-16 | USC-TIMIT
+  root: data/USC-annot-16
+  phonemic_table: data/Phonemic_Table.xlsx
+  classification_task:  # manner | place | voicing, set to "" or None for multi-task
+  untrained_subjects: # list of subjects to hold out for testing
+  untrained_tasks: # list of tasks to hold out for testing
+  test_ratio: 0.1
+  n_splits: 5
+  fps: 15
+  audio_sample_rate: 16000
+  audio_window_sec: 0.33335 # before: 2frame + 1frame + after: 2frame = 5frame = 0.33335s
+  seed: 42
+
+model:
+  image_encoder:
+    img_size: 128
+  audio_encoder:
+    model_name: facebook/wav2vec2-base
+    freeze_feature_extractor: true
+    freeze_transformer_layers: 6 # max: 12 for wav2vec2-base, 24 for wav2vec2-large
+    attn_dim: 256
+    clf_hidden_dim: 256
+    dropout: 0.1
+
+train:
+  epochs: 20
+  batch_size: 8
+  num_workers: 4
+  lr: 1.0e-5
+  weight_decay: 0.01
+
+loss:
+  lambda_contrast: 0.0
+  contrast_loss_name: null
+  contrast_loss_kwargs: null
+
+paths:
+  checkpoint_dir: ./checkpoints
+  log_dir: ./logs

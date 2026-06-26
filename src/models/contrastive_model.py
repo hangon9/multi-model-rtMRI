@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 from src.models.vit_encoder import MRIViTEncoder
-from src.models.wav2vec_encoder import FrozenWav2Vec2Encoder
+from models.frozen_wav2vec_encoder import FrozenWav2Vec2Encoder
 from src.models.projection import TokenProjection, ModalityMLP
 from src.models.classifier import ClassificationHead
 
@@ -50,6 +50,7 @@ class AudioVisionContrastiveModel(nn.Module):
             self.audio_mlp = ModalityMLP(hidden_size=hidden_size)
 
         self.classifier = ClassificationHead(
+            input_type="flattened",
             input_dim=target_tokens * hidden_size,
             num_classes=num_classes,
             classification_task=classification_task,

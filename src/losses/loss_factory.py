@@ -8,7 +8,7 @@ class BuildLoss(nn.Module):
     def __init__(
         self,
         lambda_contrast=0.1,
-        contrast_loss_name="cosine",
+        contrast_loss_name="cosine",    # None | "cosine" | "info_nce"
         class_weights=None,           # None | Tensor(单任务) | dict(多任务)
         contrast_loss_kwargs=None,
         classification_task="",
