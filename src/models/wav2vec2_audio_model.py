@@ -4,7 +4,7 @@ import torch.nn as nn
 
 from src.models.attention_pooling import AttentionPooling
 from src.models.classifier import ClassificationHead
-from src.models.frozen_wav2vec_encoder import FrozenWav2Vec2Encoder
+from models.wav2vec_encoder import Wav2Vec2Encoder
 
 
 # class TrainableWav2Vec2Encoder(nn.Module):
@@ -68,7 +68,7 @@ class Wav2Vec2MultiHeadClassifier(nn.Module):
     ):
         super().__init__()
         self.classification_task = classification_task or ""
-        self.encoder = FrozenWav2Vec2Encoder(
+        self.encoder = Wav2Vec2Encoder(
             model_name=model_name,
             freeze_feature_extractor=freeze_feature_extractor,
             freeze_transformer_layers=freeze_transformer_layers,
