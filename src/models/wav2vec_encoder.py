@@ -3,7 +3,7 @@ import torch.nn as nn
 from transformers import Wav2Vec2Model
 
 
-class FrozenWav2Vec2Encoder(nn.Module):
+class Wav2Vec2Encoder(nn.Module):
     def __init__(
         self,
         model_name="facebook/wav2vec2-base-960h",
