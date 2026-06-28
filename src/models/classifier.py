@@ -28,7 +28,7 @@ class ClassificationHead(nn.Module):
         if input_type == "sequential":
             input_dim = 31 * 768
         elif input_type == "pooled":
-            input_dim = 768
+            input_dim = input_dim
         self.classification_task = classification_task or ""
 
         if self.classification_task == "":
