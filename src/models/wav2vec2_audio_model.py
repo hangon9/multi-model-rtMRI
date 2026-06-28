@@ -4,7 +4,7 @@ import torch.nn as nn
 
 from src.models.attention_pooling import AttentionPooling
 from src.models.classifier import ClassificationHead
-from models.wav2vec_encoder import Wav2Vec2Encoder
+from src.models.wav2vec_encoder import Wav2Vec2Encoder
 
 
 # class TrainableWav2Vec2Encoder(nn.Module):
