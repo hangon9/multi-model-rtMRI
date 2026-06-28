@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 from src.models.vit_encoder import MRIViTEncoder
-from models.frozen_wav2vec_encoder import FrozenWav2Vec2Encoder
+from models.wav2vec_encoder import FrozenWav2Vec2Encoder
 from src.models.projection import TokenProjection, ModalityMLP
 from src.models.classifier import ClassificationHead
 

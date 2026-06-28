@@ -4,16 +4,25 @@ src/eval/evaluate.py
 CLI entry point for the full evaluation pipeline.
 
 Usage:
-    python -m src.eval.evaluate --checkpoint checkpoints/best_model.pt --output-dir eval_output
-    python -m src.eval.evaluate --checkpoint checkpoints/best_model.pt --log-dir logs/baseline_20260617_184319 --output-dir eval_output
-    python -m src.eval.evaluate --checkpoint checkpoints/best_model.pt --output-dir eval_output --skip-inference
+    # Explicit log directory
+    python -m src.eval.evaluate --checkpoint checkpoints/best_model.pt \\
+        --log-dir logs/wav_baseline_20260627_081322 --output-dir eval_output
+
+    # Auto-discover the most-recent run in a parent directory
+    python -m src.eval.evaluate --checkpoint checkpoints/best_model.pt \\
+        --runs-dir logs/ --run-prefix wav_baseline --output-dir eval_output
+
+    # Skip training-curve plots entirely
+    python -m src.eval.evaluate --checkpoint checkpoints/best_model.pt \\
+        --output-dir eval_output --skip-inference
 
 Pipeline:
     1. Parse CLI arguments
-    2. (optional) parse_training_log()  →  loss curves
-    3. run_inference()                  →  results, meta
-    4. For each active task: compute_metrics() + confusion_matrix
-    5. Generate all visualizations (loss curves, PRF1 bars, confusion matrices)
+    2. (optional) find_latest_run_dir()  → resolve log directory
+    3. (optional) parse_training_log()   → loss curves
+    4. run_inference()                   → results, meta
+    5. For each active task: compute_metrics() + confusion_matrix
+    6. Generate all visualizations (loss curves, PRF1 bars, confusion matrices)
 """
 
 from __future__ import annotations
@@ -21,6 +30,8 @@ from __future__ import annotations
 import argparse
 import json
 import pickle
+import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -58,6 +69,62 @@ CLASS_NAMES: Dict[str, List[str]] = {
 
 
 # ---------------------------------------------------------------------------
+# Run-directory auto-discovery
+# ---------------------------------------------------------------------------
+
+_DATE_SUFFIX_RE = re.compile(r"_(\d{8}_\d{6})$")
+
+
+def find_latest_run_dir(
+    base_dir: str | Path,
+    prefix: str | None = None,
+) -> Path:
+    """
+    Scan *base_dir* and return the subdirectory whose name ends with the
+    most-recent ``_YYYYMMDD_HHMMSS`` timestamp.
+
+    Example folder names that are matched:
+        wav_baseline_20260627_081322
+        contrast_contrastive_20260614_123456
+        run_20260628_090000
+
+    Args:
+        base_dir: parent directory to scan (must exist).
+        prefix:   optional name-prefix filter, e.g. ``"wav_baseline"``
+                  (matched with ``str.startswith``; ``None`` = no filter).
+
+    Returns:
+        ``Path`` to the latest matching subdirectory.
+
+    Raises:
+        FileNotFoundError: when no matching subdirectory is found.
+    """
+    base = Path(base_dir)
+    if not base.is_dir():
+        raise FileNotFoundError(f"runs-dir does not exist or is not a directory: {base!r}")
+
+    candidates: list[tuple[datetime, Path]] = []
+    for entry in base.iterdir():
+        if not entry.is_dir():
+            continue
+        if prefix and not entry.name.startswith(prefix):
+            continue
+        m = _DATE_SUFFIX_RE.search(entry.name)
+        if m:
+            dt = datetime.strptime(m.group(1), "%Y%m%d_%H%M%S")
+            candidates.append((dt, entry))
+
+    if not candidates:
+        msg = f"No timestamped run directories found in {base!r}"
+        if prefix:
+            msg += f" with prefix {prefix!r}"
+        raise FileNotFoundError(msg)
+
+    _, latest = max(candidates, key=lambda t: t[0])
+    return latest
+
+
+# ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
 
@@ -71,12 +138,43 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         help="Path to best_model.pt checkpoint",
     )
-    parser.add_argument(
+
+    # ── log-dir sources (mutually exclusive; --log-dir takes priority) ──────
+    log_group = parser.add_argument_group(
+        "training-log source",
+        "Supply one of these to enable loss-curve plots. "
+        "--log-dir takes priority over --runs-dir.",
+    )
+    log_group.add_argument(
         "--log-dir",
         type=str,
         default=None,
-        help="Run log directory containing training.log; if omitted, skip loss curves",
+        help=(
+            "Explicit run directory containing training.log / metrics.jsonl. "
+            "If omitted, --runs-dir is used for auto-discovery."
+        ),
     )
+    log_group.add_argument(
+        "--runs-dir",
+        type=str,
+        default=None,
+        help=(
+            "Parent directory to scan for the most-recently dated run folder "
+            "(e.g. logs/).  Folders must match the pattern "
+            "*_YYYYMMDD_HHMMSS (e.g. wav_baseline_20260627_081322). "
+            "Ignored when --log-dir is provided."
+        ),
+    )
+    log_group.add_argument(
+        "--run-prefix",
+        type=str,
+        default=None,
+        help=(
+            "Optional name-prefix filter applied when scanning --runs-dir "
+            "(e.g. 'wav_baseline').  Has no effect if --log-dir is given."
+        ),
+    )
+
     parser.add_argument(
         "--output-dir",
         type=str,
@@ -107,7 +205,6 @@ def build_parser() -> argparse.ArgumentParser:
 # ---------------------------------------------------------------------------
 # Inference helpers
 # ---------------------------------------------------------------------------
-
 def _resolve_device(args_device: Optional[str]) -> str:
     if args_device is not None:
         return args_device
@@ -125,7 +222,6 @@ def _active_tasks_from_meta(meta: Dict[str, Any]) -> Tuple[str, ...]:
         return TASKS
     if classification_task in TASKS:
         return (classification_task,)
-    # fallback: infer from results keys
     return tuple(TASKS)
 
 
@@ -142,7 +238,7 @@ def _run_or_load_inference(
     if skip_inference and results_pkl.exists():
         print(f"[evaluate] Loading cached results from {results_pkl}")
         with results_pkl.open("rb") as f:
-            return pickle.load(f)  # (results, meta)
+            return pickle.load(f)
 
     print("[evaluate] Running inference ...")
     results, meta = run_inference(
@@ -151,7 +247,6 @@ def _run_or_load_inference(
         eval_mode=eval_mode,
     )
 
-    # Cache
     raw_dir.mkdir(parents=True, exist_ok=True)
     with results_pkl.open("wb") as f:
         pickle.dump((results, meta), f)
@@ -169,33 +264,29 @@ def _build_report_obj(
     y_pred: np.ndarray,
     class_names: List[str],
 ) -> Dict[str, Any]:
-    """Build a report dict compatible with visualize.plot_task_prf1 / plot_task_confusion."""
     metrics = compute_metrics(y_true, y_pred, class_names)
 
-    # Per-class entries
     per_class: Dict[str, Dict[str, float]] = {}
     for name in class_names:
         if name in metrics["per_class"]:
             per_class[name] = {
                 "precision": float(metrics["per_class"][name]["precision"]),
-                "recall": float(metrics["per_class"][name]["recall"]),
-                "f1": float(metrics["per_class"][name]["f1"]),
+                "recall":    float(metrics["per_class"][name]["recall"]),
+                "f1":        float(metrics["per_class"][name]["f1"]),
             }
 
-    # Confusion matrix
     cm = confusion_matrix(y_true, y_pred, labels=range(len(class_names)))
 
-    report_obj: Dict[str, Any] = {
+    return {
         "per_class": per_class,
         "macro avg": {
             "precision": float(metrics["macro_precision"]),
-            "recall": float(metrics["macro_recall"]),
-            "f1": float(metrics["macro_f1"]),
+            "recall":    float(metrics["macro_recall"]),
+            "f1":        float(metrics["macro_f1"]),
         },
         "confusion_matrix": cm.tolist(),
         "class_names": class_names,
     }
-    return report_obj
 
 
 def _save_metrics_json(
@@ -203,10 +294,8 @@ def _save_metrics_json(
     task: str,
     metrics_dir: Path,
 ) -> None:
-    """Save per-task metrics as JSON (without confusion matrix for readability)."""
     metrics_dir.mkdir(parents=True, exist_ok=True)
     out = metrics_dir / f"{task}_metrics.json"
-    # Strip confusion matrix from the JSON for lighter reading
     slim = {k: v for k, v in report_obj.items() if k != "confusion_matrix"}
     with out.open("w", encoding="utf-8") as f:
         json.dump(slim, f, indent=2, ensure_ascii=False)
@@ -218,22 +307,19 @@ def _save_metrics_json(
 # ---------------------------------------------------------------------------
 
 def _generate_loss_plots(log_dir: str, checkpoint_path: str, figures_dir: Path) -> None:
-    """Parse training log and produce fold-wise & aggregate loss curves."""
     from src.eval.visualize import load_checkpoint_meta
 
     print(f"[evaluate] Parsing training log from {log_dir} ...")
     loss_df = parse_training_log(log_dir)
 
-    # Save parsed log as CSV for inspection
     loss_csv = figures_dir.parent / "raw" / "loss.csv"
     loss_csv.parent.mkdir(parents=True, exist_ok=True)
     loss_df.to_csv(loss_csv, index=False)
     print(f"[evaluate] Saved parsed log → {loss_csv}")
 
     ckpt_path = Path(checkpoint_path)
-
-    # Group by fold
     histories: Dict[int, Any] = {}
+
     for fold in sorted(loss_df["fold"].unique()):
         df_fold = loss_df[loss_df["fold"] == fold].copy().reset_index(drop=True)
         histories[fold] = df_fold
@@ -243,7 +329,6 @@ def _generate_loss_plots(log_dir: str, checkpoint_path: str, figures_dir: Path) 
         plot_fold_loss_components(df_fold, fold, figures_dir)
         print(f"[evaluate] Saved loss plots for fold {fold}")
 
-    # Aggregate plot: all folds' validation curves
     if histories:
         best_meta = load_checkpoint_meta(
             ckpt_path.parent, fold=None, best_model_name=ckpt_path.name
@@ -257,7 +342,6 @@ def _generate_task_plots(
     figures_dir: Path,
     metrics_dir: Path,
 ) -> None:
-    """For each active task: compute metrics, plot PRF1 & confusion matrix."""
     for task in results:
         y_true = results[task]["labels"]
         y_pred = results[task]["preds"]
@@ -266,21 +350,17 @@ def _generate_task_plots(
         if not class_names:
             print(f"[evaluate] WARNING: no class names for task={task}, skipping plots")
             continue
-        if len(class_names) != len(np.unique(np.concatenate([y_true, y_pred]))):
-            n_expected = len(class_names)
-            n_observed = int(max(np.max(y_true), np.max(y_pred))) + 1
-            if n_observed != n_expected:
-                print(
-                    f"[evaluate] WARNING: task={task} has {n_expected} class names "
-                    f"but data uses {n_observed} classes. Clamping to {n_expected}."
-                )
+
+        n_expected = len(class_names)
+        n_observed  = int(max(np.max(y_true), np.max(y_pred))) + 1
+        if n_observed != n_expected:
+            print(
+                f"[evaluate] WARNING: task={task} has {n_expected} class names "
+                f"but data uses {n_observed} classes. Clamping to {n_expected}."
+            )
 
         report_obj = _build_report_obj(y_true, y_pred, class_names)
-
-        # Save metrics JSON
         _save_metrics_json(report_obj, task, metrics_dir)
-
-        # Generate plots
         plot_task_prf1(report_obj, task, figures_dir)
         plot_task_confusion(report_obj, task, figures_dir)
         print(f"[evaluate] Saved PRF1 & confusion plots for task={task}")
@@ -294,24 +374,33 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    # ---- resolve paths ----
+    # ── Resolve paths ────────────────────────────────────────────────────────
     print("[evaluate] Resolving paths ...")
     checkpoint_path = str(Path(args.checkpoint).resolve())
-    output_dir = Path(args.output_dir).resolve()
+    output_dir  = Path(args.output_dir).resolve()
     figures_dir = output_dir / "figures"
-    raw_dir = output_dir / "raw"
+    raw_dir     = output_dir / "raw"
     metrics_dir = output_dir / "metrics"
 
     ensure_dir(figures_dir)
     ensure_dir(raw_dir)
 
-    # ---- 1. Training loss plots (optional) ----
-    if args.log_dir is not None:
-        _generate_loss_plots(args.log_dir, checkpoint_path, figures_dir)
-    else:
-        print("[evaluate] --log-dir not provided; skipping loss curves.")
+    # ── Resolve log directory ────────────────────────────────────────────────
+    # Priority: --log-dir > --runs-dir auto-discovery > None (skip curves)
+    log_dir: str | None = args.log_dir
 
-    # ---- 2. Inference ----
+    if log_dir is None and args.runs_dir is not None:
+        latest_run = find_latest_run_dir(args.runs_dir, prefix=args.run_prefix)
+        log_dir = str(latest_run)
+        print(f"[evaluate] Auto-detected latest run: {latest_run.name}  ({latest_run})")
+
+    # ── 1. Training loss plots (optional) ───────────────────────────────────
+    if log_dir is not None:
+        _generate_loss_plots(log_dir, checkpoint_path, figures_dir)
+    else:
+        print("[evaluate] No log directory provided; skipping loss curves.")
+
+    # ── 2. Inference ─────────────────────────────────────────────────────────
     device = _resolve_device(args.device)
     results, meta = _run_or_load_inference(
         checkpoint_path=checkpoint_path,
@@ -322,25 +411,25 @@ def main() -> None:
     )
 
     active_tasks = _active_tasks_from_meta(meta)
+    n_samples    = len(results[active_tasks[0]]["labels"]) if active_tasks else 0
     print(
-        f"[evaluate] Inference complete — active tasks: {active_tasks}, "
-        f"samples per task: {len(results[active_tasks[0]]['labels']) if active_tasks else 0}"
+        f"[evaluate] Inference complete — model_family={meta.get('model_family')}, "
+        f"active tasks: {active_tasks}, samples: {n_samples}"
     )
 
-    # ---- 3. Per-task metrics & visualisations ----
+    # ── 3. Per-task metrics & visualisations ─────────────────────────────────
     metrics_dir.mkdir(parents=True, exist_ok=True)
     _generate_task_plots(results, figures_dir, metrics_dir)
 
-    # ---- 4. Save meta for reference ----
+    # ── 4. Save meta ─────────────────────────────────────────────────────────
     meta_path = output_dir / "meta.json"
-    # Convert non-serialisable items
     meta_serialisable: Dict[str, Any] = {}
     for k, v in meta.items():
         if k == "config":
             meta_serialisable[k] = str(v) if not isinstance(v, dict) else v
-        elif isinstance(v, (np.integer,)):
+        elif isinstance(v, np.integer):
             meta_serialisable[k] = int(v)
-        elif isinstance(v, (np.floating,)):
+        elif isinstance(v, np.floating):
             meta_serialisable[k] = float(v)
         else:
             try:
@@ -348,6 +437,7 @@ def main() -> None:
                 meta_serialisable[k] = v
             except (TypeError, ValueError):
                 meta_serialisable[k] = str(v)
+
     with meta_path.open("w", encoding="utf-8") as f:
         json.dump(meta_serialisable, f, indent=2, ensure_ascii=False)
     print(f"[evaluate] Saved meta → {meta_path}")
