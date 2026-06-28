@@ -386,6 +386,11 @@ def main():
             anneal_strategy="cos",
         )
 
+        # Track and save the best checkpoint within the current fold.
+        # This is independent from the global best checkpoint across all folds.
+        fold_best_val_loss = float("inf")
+        fold_best_ckpt_path = checkpoint_dir / f"best_model_fold_{fold_id}.pt"
+
         # ---- training loop ----
         for epoch in range(num_epochs):
             train_log = train_one_epoch(
@@ -434,6 +439,29 @@ def main():
                 )
 
                 logger.info(log_msg)
+
+                # Save best checkpoint within the current fold.
+                # File name is stable, so a better checkpoint overwrites the previous
+                # best checkpoint of the same fold only, without touching other folds.
+                if val_log["loss"] < fold_best_val_loss:
+                    fold_best_val_loss = val_log["loss"]
+                    torch.save(
+                        {
+                            "fold": fold_id,
+                            "epoch": epoch + 1,
+                            "model_state_dict": model.state_dict(),
+                            "optimizer_state_dict": optimizer.state_dict(),
+                            "best_val_loss": fold_best_val_loss,
+                            "checkpoint_type": "fold_best",
+                            "config": config,
+                        },
+                        fold_best_ckpt_path,
+                    )
+                    logger.info(
+                        f"Fold best checkpoint saved (Fold {fold_id}, "
+                        f"Epoch {epoch + 1}, val_loss={fold_best_val_loss:.4f}): "
+                        f"{fold_best_ckpt_path}"
+                    )
 
                 # global best checkpoint
                 if val_log["loss"] < global_best_val_loss:
