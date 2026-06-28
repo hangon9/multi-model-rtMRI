@@ -116,48 +116,39 @@ class TrainingLogger:
         lr: float = None,
         fold_id: int = None,
         classification_task: str = None,
-):
-
+        log_to_console: bool = True,
+    ):
         """
         Log metrics for an epoch.
-        
-        Args:
-            epoch: Current epoch number
-            phase: 'train' or 'val'
-            metrics: Dictionary of metric names and values
-            lr: Optional learning rate
-            fold_id: Optional fold ID for cross-validation
-            classification_task: Optional classification task name
+
+        By default this keeps the old verbose console/file output. Training scripts can
+        pass log_to_console=False to only append metrics to metrics.jsonl, while they
+        print their own compact one-line epoch summary.
         """
-        # Log to console
-        self.info(f"Fold {fold_id} - Task: {classification_task}" if fold_id is not None and classification_task is not None else "")
-        self.info(f"Epoch {epoch+1} - {phase.upper()}")
-        self.info(f"  Loss: {metrics.get('loss_total', 0):.4f}")
-        
-        # Log loss components
-        loss_value = metrics.get("loss", metrics.get("loss_total", 0))
-        self.info(f"  Loss: {loss_value:.4f}")
+        if log_to_console:
+            if fold_id is not None and classification_task is not None:
+                self.info(f"Fold {fold_id} - Task: {classification_task}")
+            self.info(f"Epoch {epoch + 1} - {phase.upper()}")
 
-        if "cls_loss" in metrics or "contrast_loss" in metrics:
-            self.info("  Loss Components:")
-            if "cls_loss" in metrics:
-                self.info(f"    cls_loss:      {metrics['cls_loss']:.4f}")
-            if "contrast_loss" in metrics:
-                self.info(f"    contrast_loss: {metrics['contrast_loss']:.4f}")
+            loss_value = metrics.get("loss", metrics.get("loss_total", 0))
+            self.info(f"  Loss: {loss_value:.4f}")
 
-        
-        # Log prediction stats
-        if any(k.startswith('pred_') for k in metrics):
-            self.info("  Prediction Stats:")
-            for k, v in metrics.items():
-                if k.startswith('pred_'):
-                    self.info(f"    {k}: {v:.4f}")
-        
-        # Log training stats
-        
-        if lr is not None:
-            self.info("  Training Stats:")
-            self.info(f"    lr: {lr:.6f}")
+            if "cls_loss" in metrics or "contrast_loss" in metrics:
+                self.info("  Loss Components:")
+                if "cls_loss" in metrics:
+                    self.info(f"    cls_loss:      {metrics['cls_loss']:.4f}")
+                if "contrast_loss" in metrics:
+                    self.info(f"    contrast_loss: {metrics['contrast_loss']:.4f}")
+
+            if any(k.startswith('pred_') for k in metrics):
+                self.info("  Prediction Stats:")
+                for k, v in metrics.items():
+                    if k.startswith('pred_'):
+                        self.info(f"    {k}: {v:.4f}")
+
+            if lr is not None:
+                self.info("  Training Stats:")
+                self.info(f"    lr: {lr:.6f}")
 
         metrics_entry = {
             "timestamp": datetime.now().isoformat(),
@@ -178,7 +169,6 @@ class TrainingLogger:
         with open(self.metrics_file, "a") as f:
             f.write(json.dumps(metrics_entry) + "\n")
 
-    
     def log_model_info(self, model):
         """Log model architecture information."""
         total_params = sum(p.numel() for p in model.parameters())

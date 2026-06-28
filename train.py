@@ -332,8 +332,6 @@ def main():
         )
 
         for epoch in range(num_epochs):
-            logger.info(f"Fold {fold_id}, Epoch {epoch + 1}/{num_epochs}")
-
             train_log = train_one_epoch(
                 model=model,
                 dataloader=train_loader,
@@ -351,6 +349,7 @@ def main():
                 metrics=train_log,
                 lr=optimizer.param_groups[0]['lr'],
                 classification_task=classification_task,
+                log_to_console=False,
             )
 
             # Log training loss for every epoch
@@ -378,10 +377,11 @@ def main():
                 metrics=val_log,
                 lr=optimizer.param_groups[0]['lr'],
                 classification_task=classification_task,
+                log_to_console=False,
             )
 
                 log_msg += (
-                    f", val_loss={val_log['loss']:.4f}, "
+                    f" | val_loss={val_log['loss']:.4f}, "
                     f"val_cls_loss={val_log['cls_loss']:.4f}, "
                     f"val_contrast_loss={val_log['contrast_loss']:.4f}"
                 )

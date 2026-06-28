@@ -400,6 +400,7 @@ def main():
                 metrics=train_log,
                 lr=optimizer.param_groups[0]["lr"],
                 classification_task=classification_task,
+                log_to_console=False,
             )
 
             log_msg = (
@@ -423,6 +424,7 @@ def main():
                     metrics=val_log,
                     lr=optimizer.param_groups[0]["lr"],
                     classification_task=classification_task,
+                    log_to_console=False,
                 )
 
                 log_msg += (
