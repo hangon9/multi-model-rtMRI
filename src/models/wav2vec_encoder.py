@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
-from transformers import Wav2Vec2Model
-
+from transformers import Wav2Vec2Model, HubertModel
 
 class Wav2Vec2Encoder(nn.Module):
     def __init__(
@@ -12,8 +11,13 @@ class Wav2Vec2Encoder(nn.Module):
         hidden_size: int = 768,
     ):
         super().__init__()
+        if model_name.startswith("facebook/wav2vec2"):
+            self.wav2vec = Wav2Vec2Model.from_pretrained(model_name, use_safetensors=True)
+        elif model_name.startswith("facebook/hubert"):
+            self.wav2vec = HubertModel.from_pretrained(model_name, use_safetensors=True)
+        else:
+            raise ValueError(f"Unsupported model name: {model_name}")
 
-        self.wav2vec = Wav2Vec2Model.from_pretrained(model_name, use_safetensors=True)
         self.hidden_size = self.wav2vec.config.hidden_size
 
         if freeze_feature_extractor:
