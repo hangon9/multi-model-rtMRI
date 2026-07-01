@@ -18,13 +18,13 @@ from pathlib import Path
 
 import yaml
 import torch
-import torch.nn as nn
 from torch.optim import AdamW
 from tqdm import tqdm
 from sklearn.model_selection import GroupKFold
 
 from data.splits import make_train_test_split, create_dataloader
-from src.models.wav2vec2_audio_model import Wav2Vec2MultiHeadClassifier
+from src.models.audio_only_model import AudioMultiHeadClassifier
+from src.losses.loss_factory import BuildLoss
 from utils.logger import TrainingLogger
 
 NUM_CLASSES = {
@@ -163,10 +163,6 @@ def compute_accuracy(logits, labels, classification_task=""):
 
 def build_loss_from_config(config, device, class_weights=None):
     """Build BuildLoss from config, supporting multi-task and single-task."""
-    BuildLoss = import_from_possible_paths(
-        ["src.losses.loss_factory", "loss_factory", "loss.loss_factory", "utils.loss_factory"],
-        "BuildLoss",
-    )
 
     loss_cfg = config.get("loss", {})
     classification_task = config["data"].get("classification_task", "") or ""
@@ -356,7 +352,7 @@ def main():
         val_loader = create_dataloader(val_df, config, train=False)
 
         # ---- model ----
-        model = Wav2Vec2MultiHeadClassifier(
+        model = AudioMultiHeadClassifier(
             num_classes=NUM_CLASSES[classification_task],
             model_name=model_cfg.get("model_name", "facebook/wav2vec2-base"),
             freeze_feature_extractor=model_cfg.get("freeze_feature_extractor", True),

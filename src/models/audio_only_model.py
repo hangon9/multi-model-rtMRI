@@ -4,7 +4,9 @@ import torch.nn as nn
 
 from src.models.attention_pooling import AttentionPooling
 from src.models.classifier import ClassificationHead
-from src.models.wav2vec_encoder import Wav2Vec2Encoder
+from src.models.audio_ssl_encoder import AudioSSLEncoder
+from src.models.projection import TokenProjection
+from src.models.conformer_encoder import ConformerBlock
 
 
 # class TrainableWav2Vec2Encoder(nn.Module):
@@ -51,7 +53,7 @@ from src.models.wav2vec_encoder import Wav2Vec2Encoder
 #         return outputs.last_hidden_state
 
 
-class Wav2Vec2MultiHeadClassifier(nn.Module):
+class AudioMultiHeadClassifier(nn.Module):
     """
     Audio segment -> Wav2Vec2 Encoder -> Attention Pooling -> Multi-head MLP.
     """
@@ -68,7 +70,7 @@ class Wav2Vec2MultiHeadClassifier(nn.Module):
     ):
         super().__init__()
         self.classification_task = classification_task or ""
-        self.encoder = Wav2Vec2Encoder(
+        self.encoder = AudioSSLEncoder(
             model_name=model_name,
             freeze_feature_extractor=freeze_feature_extractor,
             freeze_transformer_layers=freeze_transformer_layers,
