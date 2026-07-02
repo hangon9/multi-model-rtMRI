@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 from src.models.vit_encoder import MRIViTEncoder
-from models.wav2vec_encoder import FrozenWav2Vec2Encoder
+from src.models.audio_ssl_encoder import AudioSSLEncoder
 from src.models.projection import TokenProjection, ModalityMLP
 from src.models.classifier import ClassificationHead
 
@@ -33,7 +33,7 @@ class AudioVisionContrastiveModel(nn.Module):
         )
 
         if self.use_contrast:
-            self.audio_encoder = FrozenWav2Vec2Encoder(
+            self.audio_encoder = AudioSSLEncoder(
                 model_name="facebook/wav2vec2-base-960h",
                 target_time_steps=target_tokens,
                 freeze=True,

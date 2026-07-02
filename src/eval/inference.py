@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 
 from src.models.contrastive_model import AudioVisionContrastiveModel
-from src.models.wav2vec2_audio_model import Wav2Vec2MultiHeadClassifier
+from src.models.audio_only_model import Wav2Vec2MultiHeadClassifier
 from data.splits import make_train_test_split, create_dataloader
 
 
