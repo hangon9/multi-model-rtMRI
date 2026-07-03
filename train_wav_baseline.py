@@ -151,7 +151,9 @@ def compute_accuracy(logits, labels, classification_task=""):
         acc["mean"] = sum(acc.values()) / max(len(acc), 1)
         return acc
     else:
-        # single-task: logits is a Tensor (B, C), labels is a Tensor (B,)
+        # single-task: logits is a Tensor (B, C), labels may be a dict or Tensor
+        if isinstance(labels, dict):
+            labels = labels[classification_task]
         pred = logits.argmax(dim=-1)
         acc_val = (pred == labels).float().mean().item()
         return {classification_task: acc_val, "mean": acc_val}
