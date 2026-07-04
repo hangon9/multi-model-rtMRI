@@ -178,6 +178,130 @@ def build_loss_from_config(config, device, class_weights=None):
 
 
 # ---------------------------------------------------------------------------
+# optimizer helpers: config-compatible parameter groups
+# ---------------------------------------------------------------------------
+
+def _is_no_decay_param(name: str) -> bool:
+    """
+    Return True for parameters that usually should NOT receive weight decay:
+    bias terms and normalization scale parameters.
+    """
+    name_lower = name.lower()
+    no_decay_keywords = (
+        "bias",
+        "layernorm.weight",
+        "layer_norm.weight",
+        "norm.weight",
+    )
+    return any(keyword in name_lower for keyword in no_decay_keywords)
+
+
+def get_optimizer_hparams(config):
+    """
+    Read optimizer hyperparameters WITHOUT requiring any YAML schema change.
+
+    Supported existing keys:
+      - model.audio_encoder.lr_audio_encoder : LR for pretrained audio encoder
+      - loss.lr_downstream                  : LR for pooling/classifier head
+      - train.lr                            : fallback LR if either key is missing
+      - train.weight_decay                  : weight decay for decay groups
+
+    If train.weight_decay is not provided, weight decay defaults to 0.0.
+    Bias / LayerNorm / norm parameters always use weight_decay=0.0.
+    """
+    train_cfg = config.get("train", {})
+    model_cfg = config.get("model", {}).get("audio_encoder", {})
+    loss_cfg = config.get("loss", {})
+
+    fallback_lr = train_cfg.get("lr", 1e-5)
+    encoder_lr = model_cfg.get("lr_audio_encoder", fallback_lr)
+    head_lr = loss_cfg.get("lr_downstream", fallback_lr)
+
+    # Important: if weight_decay is not explicitly passed in YAML, use 0.0.
+    weight_decay = train_cfg.get("weight_decay", 0.0)
+
+    return {
+        "encoder_lr": float(encoder_lr),
+        "head_lr": float(head_lr),
+        "weight_decay": float(weight_decay),
+    }
+
+
+def build_optimizer(model, config, logger=None):
+    """
+    Build AdamW optimizer with 4 parameter groups, while keeping the YAML unchanged:
+      1. encoder_decay     : pretrained encoder params with weight decay
+      2. encoder_no_decay  : pretrained encoder bias/norm params, no weight decay
+      3. head_decay        : pooling/classifier params with weight decay
+      4. head_no_decay     : pooling/classifier bias/norm params, no weight decay
+
+    In AudioMultiHeadClassifier, the audio SSL encoder is stored under
+    `self.encoder`, so top-level parameter names starting with "encoder."
+    are treated as pretrained encoder parameters.
+    """
+    hparams = get_optimizer_hparams(config)
+    encoder_lr = hparams["encoder_lr"]
+    head_lr = hparams["head_lr"]
+    weight_decay = hparams["weight_decay"]
+
+    buckets = {
+        "encoder_decay": [],
+        "encoder_no_decay": [],
+        "head_decay": [],
+        "head_no_decay": [],
+    }
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        is_encoder = name.startswith("encoder.")
+        is_no_decay = _is_no_decay_param(name)
+
+        if is_encoder and is_no_decay:
+            buckets["encoder_no_decay"].append(param)
+        elif is_encoder:
+            buckets["encoder_decay"].append(param)
+        elif is_no_decay:
+            buckets["head_no_decay"].append(param)
+        else:
+            buckets["head_decay"].append(param)
+
+    group_specs = [
+        ("encoder_decay", encoder_lr, weight_decay),
+        ("encoder_no_decay", encoder_lr, 0.0),
+        ("head_decay", head_lr, weight_decay),
+        ("head_no_decay", head_lr, 0.0),
+    ]
+
+    param_groups = []
+    for group_name, lr, wd in group_specs:
+        params = buckets[group_name]
+        if len(params) == 0:
+            continue
+        param_groups.append({
+            "name": group_name,
+            "params": params,
+            "lr": lr,
+            "weight_decay": wd,
+        })
+
+    if len(param_groups) == 0:
+        raise ValueError("No trainable parameters found. Check freeze settings and requires_grad flags.")
+
+    if logger is not None:
+        for group in param_groups:
+            n_params = sum(p.numel() for p in group["params"])
+            logger.info(
+                "Optimizer group "
+                f"{group['name']}: tensors={len(group['params'])}, params={n_params}, "
+                f"lr={group['lr']}, weight_decay={group['weight_decay']}"
+            )
+
+    return AdamW(param_groups)
+
+
+# ---------------------------------------------------------------------------
 # CV split helper
 # ---------------------------------------------------------------------------
 
@@ -210,7 +334,7 @@ def get_fold_indices(train_val_df, config):
 # ---------------------------------------------------------------------------
 
 def train_one_epoch(model, loader, criterion, optimizer, scheduler, device,
-                    classification_task=""):
+                    classification_task="", grad_clip=0.5):
     model.train()
     total_loss = 0.0
     total_cls_loss = 0.0
@@ -236,7 +360,15 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device,
         loss = loss_dict["loss"]
         loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if grad_clip is not None and grad_clip > 0:
+            params_to_clip = [
+                p
+                for group in optimizer.param_groups
+                for p in group["params"]
+                if p.grad is not None
+            ]
+            torch.nn.utils.clip_grad_norm_(params_to_clip, max_norm=grad_clip)
+
         optimizer.step()
         if scheduler is not None:
             scheduler.step()
@@ -310,6 +442,7 @@ def main():
     train_cfg = config.get("train", {})
     model_cfg = config.get("model", {}).get("audio_encoder", {})
     classification_task = config.get("data", {}).get("classification_task", "") or ""
+    grad_clip = train_cfg.get("grad_clip", 0.5)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -327,8 +460,6 @@ def main():
 
     n_splits = config["data"].get("n_splits", 5)
     num_epochs = train_cfg.get("epochs", 10)
-    lr = train_cfg.get("lr", 1e-5)
-    weight_decay = train_cfg.get("weight_decay", 0.01)
     checkpoint_dir = Path(config["paths"]["checkpoint_dir"])
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -367,15 +498,11 @@ def main():
         class_weights = get_class_weights(train_df, config)
         criterion = build_loss_from_config(config, device, class_weights=class_weights)
 
-        optimizer = AdamW(
-            filter(lambda p: p.requires_grad, model.parameters()),
-            lr=lr,
-            weight_decay=weight_decay,
-        )
+        optimizer = build_optimizer(model, config, logger=logger)
 
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=lr,
+            max_lr=[group["lr"] for group in optimizer.param_groups],
             epochs=num_epochs,
             steps_per_epoch=len(train_loader),
             pct_start=0.3,
@@ -391,7 +518,7 @@ def main():
         for epoch in range(num_epochs):
             train_log = train_one_epoch(
                 model, train_loader, criterion, optimizer, scheduler, device,
-                classification_task=classification_task,
+                classification_task=classification_task, grad_clip=grad_clip
             )
 
             logger.log_metrics(
