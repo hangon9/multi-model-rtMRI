@@ -551,7 +551,8 @@ def main():
                     epoch=epoch,
                     phase="validation",
                     metrics=val_log,
-                    lr=optimizer.param_groups[0]["lr"],
+                    lr_encoder=optimizer.param_groups[0]["lr"],
+                    lr_downstream=optimizer.param_groups[2]["lr"],
                     classification_task=classification_task,
                     log_to_console=False,
                 )

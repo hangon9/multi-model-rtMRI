@@ -113,7 +113,8 @@ class TrainingLogger:
         epoch: int,
         phase: str,
         metrics: dict,
-        lr: float = None,
+        lr_encoder: float = None,
+        lr_downstream: float = None,
         fold_id: int = None,
         classification_task: str = None,
         log_to_console: bool = True,
@@ -146,9 +147,13 @@ class TrainingLogger:
                     if k.startswith('pred_'):
                         self.info(f"    {k}: {v:.4f}")
 
-            if lr is not None:
+            if lr_encoder is not None:
                 self.info("  Training Stats:")
-                self.info(f"    lr: {lr:.6f}")
+                self.info(f"    lr_encoder: {lr_encoder:.6f}")
+
+            if lr_downstream is not None:
+                self.info("  Training Stats:")
+                self.info(f"    lr_downstream: {lr_downstream:.6f}")
 
         metrics_entry = {
             "timestamp": datetime.now().isoformat(),
@@ -163,8 +168,11 @@ class TrainingLogger:
         if classification_task is not None:
             metrics_entry["classification_task"] = classification_task
 
-        if lr is not None:
-            metrics_entry["lr"] = lr
+        if lr_encoder is not None:
+            metrics_entry["lr_encoder"] = lr_encoder
+
+        if lr_downstream is not None:
+            metrics_entry["lr_downstream"] = lr_downstream
 
         with open(self.metrics_file, "a") as f:
             f.write(json.dumps(metrics_entry) + "\n")
