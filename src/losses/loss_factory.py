@@ -16,6 +16,7 @@ class BuildLoss(nn.Module):
         lambda_place=1.0,
         lambda_voicing=1.0,
         lambda_vowel_backness=1.0,
+        bce_pos_weight=None,          # Tensor (3,) for vowel_backness BCE pos_weight
     ):
         super().__init__()
 
@@ -29,15 +30,22 @@ class BuildLoss(nn.Module):
         self.lambda_voicing = lambda_voicing
         self.lambda_vowel_backness = lambda_vowel_backness
 
-        # ── CE Loss 构建 (manner, place, voicing) ─────────────────
+        # ── CE Loss 构建 (manner, place, voicing) / BCE (vowel_backness) ──
         if self.classification_task == "":
             # multi-task: build CE losses for manner/place/voicing
             self._build_ce_losses(class_weights)
-            # BCE loss for vowel_backness (no class weights for now)
-            self.bce_vowel_backness = nn.BCEWithLogitsLoss()
+            # BCE loss for vowel_backness with optional pos_weight
+            self.bce_vowel_backness = nn.BCEWithLogitsLoss(pos_weight=bce_pos_weight)
             self.ce_loss = None  # multi-task does not use single ce_loss
+        elif self.classification_task == "vowel_backness":
+            # Single-task BCE for vowel backness
+            if class_weights is not None:
+                pass  # BCE uses pos_weight, not CE-style weight
+            self.ce_loss = None
+            self.ce_losses = None
+            self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=bce_pos_weight)
         else:
-            # single-task
+            # Single-task CE (manner / place / voicing)
             if class_weights is not None and not isinstance(class_weights, torch.Tensor):
                 raise ValueError(
                     "Single-task BuildLoss 的 class_weights 必须是 Tensor 或 None，"
@@ -45,7 +53,7 @@ class BuildLoss(nn.Module):
                 )
             self.ce_loss = nn.CrossEntropyLoss(weight=class_weights)
             self.ce_losses = None
-            self.bce_vowel_backness = None
+            self.bce_loss = None
 
         # ── Contrast Loss ────────────────────────────────────────
         self.contrast_enabled = contrast_loss_name is not None and str(contrast_loss_name).lower() not in ("none", "null")
@@ -140,7 +148,10 @@ class BuildLoss(nn.Module):
                     )
                 labels = labels[active_classification_task]
 
-            cls_loss = self.ce_loss(logits, labels)
+            if active_classification_task == "vowel_backness":
+                cls_loss = self.bce_loss(logits, labels)
+            else:
+                cls_loss = self.ce_loss(logits, labels)
             self._last_task_losses = {}
 
         if audio_flat is not None and self.contrast_enabled:

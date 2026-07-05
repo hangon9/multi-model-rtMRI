@@ -101,6 +101,24 @@ def get_class_weights(train_df, config):
         return _weights_for(classification_task)
 
 
+def get_bce_pos_weight(train_df, config):
+    """Compute BCE pos_weight for vowel_backness if enabled in config.
+
+    pos_weight_c = N_neg / N_pos  for each of the 3 backness classes.
+    Returns Tensor (3,) or None.
+    """
+    if not config["loss"].get("bce_pos_weight", False):
+        return None
+
+    multi_hot = train_df[_VOWEL_BACKNESS_COLS].values  # (N, 3)
+    N = len(multi_hot)
+    n_pos = multi_hot.sum(axis=0)  # (3,)
+    n_neg = N - n_pos
+    import numpy as np
+    pos_weight = n_neg / np.maximum(n_pos, 1.0)
+    return torch.tensor(pos_weight, dtype=torch.float32)
+
+
 # ---------------------------------------------------------------------------
 # utility: dynamic imports
 # ---------------------------------------------------------------------------
@@ -182,7 +200,7 @@ def compute_accuracy(logits, labels, classification_task=""):
 # loss builder
 # ---------------------------------------------------------------------------
 
-def build_loss_from_config(config, device, class_weights=None):
+def build_loss_from_config(config, device, class_weights=None, bce_pos_weight=None):
     """Build BuildLoss from config, supporting multi-task and single-task."""
 
     loss_cfg = config.get("loss", {})
@@ -198,6 +216,7 @@ def build_loss_from_config(config, device, class_weights=None):
         lambda_place=loss_cfg.get("lambda_place", 1.0),
         lambda_voicing=loss_cfg.get("lambda_voicing", 1.0),
         lambda_vowel_backness=loss_cfg.get("lambda_vowel_backness", 1.0),
+        bce_pos_weight=bce_pos_weight,
     )
     return criterion.to(device)
 
@@ -521,7 +540,9 @@ def main():
 
         # ---- loss & optimizer & scheduler ----
         class_weights = get_class_weights(train_df, config)
-        criterion = build_loss_from_config(config, device, class_weights=class_weights)
+        bce_pos_weight = get_bce_pos_weight(train_df, config)
+        criterion = build_loss_from_config(config, device, class_weights=class_weights,
+                                           bce_pos_weight=bce_pos_weight)
 
         optimizer = build_optimizer(model, config, logger=logger)
 
