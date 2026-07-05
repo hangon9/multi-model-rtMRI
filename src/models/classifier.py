@@ -42,13 +42,19 @@ class ClassificationHead(nn.Module):
                 "place": SingleClassificationHead(
                     input_dim=input_dim,
                     hidden_dim=hidden_dim,
-                    num_classes=11,
+                    num_classes=8,   # Silence + 7 consonant place classes
                     dropout=dropout
                 ),
                 "voicing": SingleClassificationHead(
                     input_dim=input_dim,
                     hidden_dim=hidden_dim,
                     num_classes=3,
+                    dropout=dropout
+                ),
+                "vowel_backness": SingleClassificationHead(
+                    input_dim=input_dim,
+                    hidden_dim=hidden_dim,
+                    num_classes=3,   # Front, Central, Back (raw logits for BCE)
                     dropout=dropout
                 ),
             })
@@ -99,6 +105,7 @@ class ClassificationHead(nn.Module):
                     "manner": all_logits["manner"],
                     "place": all_logits["place"],
                     "voicing": all_logits["voicing"],
+                    "vowel_backness": all_logits["vowel_backness"],
                     "all_logits": all_logits,
                     "classification_task": "multi",
                 }

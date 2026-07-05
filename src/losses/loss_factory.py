@@ -12,6 +12,10 @@ class BuildLoss(nn.Module):
         class_weights=None,           # None | Tensor(单任务) | dict(多任务)
         contrast_loss_kwargs=None,
         classification_task="",
+        lambda_manner=1.0,
+        lambda_place=1.0,
+        lambda_voicing=1.0,
+        lambda_vowel_backness=1.0,
     ):
         super().__init__()
 
@@ -19,35 +23,29 @@ class BuildLoss(nn.Module):
         self.classification_task = classification_task or ""
         self.contrast_loss_name = contrast_loss_name
 
-        # ── CE Loss 构建 ─────────────────────────────────────────
-        if self.classification_task == "":
-            # 多任务：三个头各用各自的权重
-            if isinstance(class_weights, dict):
-                self.ce_losses = nn.ModuleDict({
-                    task: nn.CrossEntropyLoss(weight=class_weights[task])
-                    for task in ("manner", "place", "voicing")
-                })
-            elif class_weights is None:
-                self.ce_losses = nn.ModuleDict({
-                    task: nn.CrossEntropyLoss()
-                    for task in ("manner", "place", "voicing")
-                })
-            else:
-                raise ValueError(
-                    "Multi-task BuildLoss 的 class_weights 必须是 dict 或 None，"
-                    f"收到 {type(class_weights)}"
-                )
-            self.ce_loss = None   # 多任务不使用
+        # ── Per-task lambda weights (only used in multi-task mode) ──
+        self.lambda_manner = lambda_manner
+        self.lambda_place = lambda_place
+        self.lambda_voicing = lambda_voicing
+        self.lambda_vowel_backness = lambda_vowel_backness
 
+        # ── CE Loss 构建 (manner, place, voicing) ─────────────────
+        if self.classification_task == "":
+            # multi-task: build CE losses for manner/place/voicing
+            self._build_ce_losses(class_weights)
+            # BCE loss for vowel_backness (no class weights for now)
+            self.bce_vowel_backness = nn.BCEWithLogitsLoss()
+            self.ce_loss = None  # multi-task does not use single ce_loss
         else:
-            # 单任务：单一权重张量
+            # single-task
             if class_weights is not None and not isinstance(class_weights, torch.Tensor):
                 raise ValueError(
                     "Single-task BuildLoss 的 class_weights 必须是 Tensor 或 None，"
                     f"收到 {type(class_weights)}"
                 )
             self.ce_loss = nn.CrossEntropyLoss(weight=class_weights)
-            self.ce_losses = None  # 单任务不使用
+            self.ce_losses = None
+            self.bce_vowel_backness = None
 
         # ── Contrast Loss ────────────────────────────────────────
         self.contrast_enabled = contrast_loss_name is not None and str(contrast_loss_name).lower() not in ("none", "null")
@@ -56,6 +54,25 @@ class BuildLoss(nn.Module):
         self.contrast_loss = apply_contrast_loss(
             contrast_loss_name, **contrast_loss_kwargs
         )
+
+    def _build_ce_losses(self, class_weights):
+        """Build CE losses for manner, place, voicing in multi-task mode."""
+        ce_tasks = ("manner", "place", "voicing")
+        if isinstance(class_weights, dict):
+            self.ce_losses = nn.ModuleDict({
+                task: nn.CrossEntropyLoss(weight=class_weights.get(task))
+                for task in ce_tasks
+            })
+        elif class_weights is None:
+            self.ce_losses = nn.ModuleDict({
+                task: nn.CrossEntropyLoss()
+                for task in ce_tasks
+            })
+        else:
+            raise ValueError(
+                "Multi-task BuildLoss 的 class_weights 必须是 dict 或 None，"
+                f"收到 {type(class_weights)}"
+            )
 
     def forward(self, logits, labels, visual_flat, audio_flat, classification_task=None):
         active_classification_task = (
@@ -69,19 +86,38 @@ class BuildLoss(nn.Module):
                 raise ValueError("Multi-task loss expects labels as a dict.")
 
             task_logits = logits.get("all_logits", logits)
-            task_losses = []
 
-            for name in ("manner", "place", "voicing"):
-                if name not in task_logits or name not in labels:
-                    continue
-                # 直接用各自的 ce_losses[name]，权重已内置
-                task_losses.append(
-                    self.ce_losses[name](task_logits[name], labels[name])
-                )
+            # ── CE losses: manner, place, voicing ────────────────
+            ce_loss_manner = self.ce_losses["manner"](
+                task_logits["manner"], labels["manner"]
+            )
+            ce_loss_place = self.ce_losses["place"](
+                task_logits["place"], labels["place"]
+            )
+            ce_loss_voicing = self.ce_losses["voicing"](
+                task_logits["voicing"], labels["voicing"]
+            )
 
-            if not task_losses:
-                raise ValueError("No task losses computed for multi-task training.")
-            cls_loss = sum(task_losses) / len(task_losses)
+            # ── BCE loss: vowel_backness ─────────────────────────
+            bce_loss_vowel = self.bce_vowel_backness(
+                task_logits["vowel_backness"], labels["vowel_backness"]
+            )
+
+            # ── Weighted sum ─────────────────────────────────────
+            cls_loss = (
+                self.lambda_manner * ce_loss_manner
+                + self.lambda_place * ce_loss_place
+                + self.lambda_voicing * ce_loss_voicing
+                + self.lambda_vowel_backness * bce_loss_vowel
+            )
+
+            # Store per-task losses for logging
+            self._last_task_losses = {
+                "manner": ce_loss_manner.detach(),
+                "place": ce_loss_place.detach(),
+                "voicing": ce_loss_voicing.detach(),
+                "vowel_backness": bce_loss_vowel.detach(),
+            }
 
         else:
             # 单任务：解包 dict logits/labels（逻辑不变）
@@ -105,6 +141,7 @@ class BuildLoss(nn.Module):
                 labels = labels[active_classification_task]
 
             cls_loss = self.ce_loss(logits, labels)
+            self._last_task_losses = {}
 
         if audio_flat is not None and self.contrast_enabled:
             contrast_loss = self.contrast_loss(visual_flat, audio_flat)
@@ -118,6 +155,9 @@ class BuildLoss(nn.Module):
             "cls_loss": cls_loss,
             "contrast_loss": contrast_loss,
         }
+        # Include per-task losses for detailed logging
+        for task_name, task_loss in self._last_task_losses.items():
+            result[f"loss_{task_name}"] = task_loss
         if self.contrast_loss_name:
             result[f"{self.contrast_loss_name}_loss"] = contrast_loss
         return result

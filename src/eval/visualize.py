@@ -56,7 +56,7 @@ except Exception:  # pragma: no cover
 except Exception:  # pragma: no cover
     PROJECT_CLASS_NAMES = None
 
-TASKS = ("manner", "place", "voicing")
+TASKS = ("manner", "place", "voicing", "vowel_backness")
 PAPER_MACRO_F1 = {
     "manner": 0.81,
     "place": 0.78,
@@ -68,6 +68,7 @@ CLASS_NAMES_FALLBACK: Dict[str, List[str]] = {
     "manner": [],
     "place": [],
     "voicing": [],
+    "vowel_backness": [],
 }
 
 

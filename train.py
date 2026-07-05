@@ -17,9 +17,11 @@ CONFIG_PATH = "configs/baseline_config.yaml"
 NUM_CLASSES = {
     "": 18,
     "manner": 6,
-    "place": 11,
+    "place": 8,
     "voicing": 3,
 }
+
+TASKS = ("manner", "place", "voicing", "vowel_backness")
 
 def load_config(config_path: str) -> dict:
     """Load YAML configuration."""
@@ -65,8 +67,9 @@ def get_fold_indices(train_val_df, config):
 
 _MANNER_COLS  = ["Silence", "Stop", "Nasal", "Fricative", "Approximant", "Vowel"]
 _PLACE_COLS   = ["Labial", "Dental", "Alveolar", "Postalveolar",
-                 "Palatal", "Velar", "Glottal", "Front", "Central", "Back"]
+                 "Palatal", "Velar", "Glottal"]
 _VOICING_COLS = ["Voiced", "Voiceless"]
+_VOWEL_BACKNESS_COLS = ["Front", "Central", "Back"]
 
 
 def _derive_class_indices(df, task: str):
@@ -78,7 +81,7 @@ def _derive_class_indices(df, task: str):
         return df[_MANNER_COLS].values.argmax(axis=1)
 
     elif task == "place":
-        # Silence 帧 → 0；其余 argmax([Labial...Back]) + 1 → 1-10
+        # Silence 帧 → 0；其余 argmax([Labial..Glottal]) + 1 → 1-7
         idx = df[_PLACE_COLS].values.argmax(axis=1) + 1
         idx[df["Silence"].values == 1.0] = 0
         return idx
@@ -88,6 +91,10 @@ def _derive_class_indices(df, task: str):
         idx = df[_VOICING_COLS].values.argmax(axis=1) + 1
         idx[df["Silence"].values == 1.0] = 0
         return idx
+
+    elif task == "vowel_backness":
+        # Return multi-hot targets for BCE: shape (N, 3)
+        return df[_VOWEL_BACKNESS_COLS].values.astype("float32")
 
     else:
         raise ValueError(f"Unknown task for weight derivation: {task}")
@@ -314,6 +321,10 @@ def main():
             classification_task=classification_task,
             class_weights=class_weights,                       # ← 传入
             contrast_loss_name=contrast_loss_name,
+            lambda_manner=config["loss"].get("lambda_manner", 1.0),
+            lambda_place=config["loss"].get("lambda_place", 1.0),
+            lambda_voicing=config["loss"].get("lambda_voicing", 1.0),
+            lambda_vowel_backness=config["loss"].get("lambda_vowel_backness", 1.0),
         ).to(device)
 
         optimizer = AdamW(

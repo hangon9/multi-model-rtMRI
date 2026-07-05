@@ -18,11 +18,11 @@ from data.splits import make_train_test_split, create_dataloader
 NUM_CLASSES: dict[str, int] = {
     "": 18,
     "manner": 6,
-    "place": 11,
+    "place": 8,
     "voicing": 3,
 }
 
-TASKS: tuple[str, ...] = ("manner", "place", "voicing")
+TASKS: tuple[str, ...] = ("manner", "place", "voicing", "vowel_backness")
 
 # Maps experiment_name values → model family tag
 _EXPERIMENT_TO_FAMILY: dict[str, str] = {
@@ -367,7 +367,11 @@ def run_inference(
 
             for task in active_tasks:
                 logits = _extract_logits(output, task, active_tasks)
-                preds  = torch.argmax(logits, dim=-1)
+                if task == "vowel_backness":
+                    # BCE: sigmoid + threshold 0.5 → binary predictions
+                    preds = (torch.sigmoid(logits) >= 0.5).float()
+                else:
+                    preds = torch.argmax(logits, dim=-1)
                 labels = _extract_labels(batch, task)
 
                 preds_by_task[task].append(preds.detach().cpu())

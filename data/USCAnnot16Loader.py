@@ -171,11 +171,12 @@ class USCAnnot16Dataset(Dataset):
         # ── Manner: argmax over [Silence, Stop, Nasal, Fricative, Approximant, Vowel] ──
         manner_idx = int(vals[0:6].argmax())          # 0-5
 
-        # ── Place: Silence=1 → 0; else argmax over [Labial..Back] + 1 ──
+        # ── Place (consonant place only): Silence=1 → 0;
+        #     else argmax over [Labial..Glottal] (cols 6-12, 7 classes) + 1 ──
         if vals[0] == 1.0:
             place_idx = 0
         else:
-            place_idx = int(vals[6:16].argmax()) + 1  # 1-10
+            place_idx = int(vals[6:13].argmax()) + 1  # 1-7
 
         # ── Voicing: Silence=1 → 0; else argmax over [Voiced, Voiceless] + 1 ──
         if vals[0] == 1.0:
@@ -183,10 +184,15 @@ class USCAnnot16Dataset(Dataset):
         else:
             voicing_idx = int(vals[16:18].argmax()) + 1  # 1-2
 
+        # ── Vowel Backness: multi-hot [Front, Central, Back] for BCE loss.
+        #     Silence → [0, 0, 0], vowels get their one-hot backness.
+        vowel_backness = vals[13:16].copy()  # cols: Front, Central, Back
+
         labels = {
-            "manner":  torch.tensor(manner_idx, dtype=torch.long),
-            "place":   torch.tensor(place_idx,  dtype=torch.long),
-            "voicing": torch.tensor(voicing_idx, dtype=torch.long),
+            "manner":         torch.tensor(manner_idx, dtype=torch.long),
+            "place":          torch.tensor(place_idx,  dtype=torch.long),
+            "voicing":        torch.tensor(voicing_idx, dtype=torch.long),
+            "vowel_backness": torch.tensor(vowel_backness, dtype=torch.float32),
         }
 
         return {

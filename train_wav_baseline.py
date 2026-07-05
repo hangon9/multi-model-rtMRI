@@ -30,15 +30,17 @@ from utils.logger import TrainingLogger
 NUM_CLASSES = {
     "": 18,
     "manner": 6,
-    "place": 11,
+    "place": 8,
     "voicing": 3,
+    "vowel_backness": 3,
 }
-TASKS = ("manner", "place", "voicing")
+TASKS = ("manner", "place", "voicing", "vowel_backness")
 
 _MANNER_COLS  = ["Silence", "Stop", "Nasal", "Fricative", "Approximant", "Vowel"]
 _PLACE_COLS   = ["Labial", "Dental", "Alveolar", "Postalveolar",
-                 "Palatal", "Velar", "Glottal", "Front", "Central", "Back"]
+                 "Palatal", "Velar", "Glottal"]
 _VOICING_COLS = ["Voiced", "Voiceless"]
+_VOWEL_BACKNESS_COLS = ["Front", "Central", "Back"]
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +59,9 @@ def _derive_class_indices(df, task: str):
         idx = df[_VOICING_COLS].values.argmax(axis=1) + 1
         idx[df["Silence"].values == 1.0] = 0
         return idx
+    elif task == "vowel_backness":
+        # Return multi-hot targets for BCE: shape (N, 3)
+        return df[_VOWEL_BACKNESS_COLS].values.astype("float32")
     else:
         raise ValueError(f"Unknown task for weight derivation: {task}")
 
@@ -91,7 +96,7 @@ def get_class_weights(train_df, config):
         return _balanced_weights(indices, NUM_CLASSES[task])
 
     if classification_task == "":
-        return {task: _weights_for(task) for task in TASKS}
+        return {task: _weights_for(task) for task in TASKS if task != "vowel_backness"}
     else:
         return _weights_for(classification_task)
 
@@ -125,7 +130,7 @@ def load_config(path: str) -> dict:
 
 def move_labels_to_device(labels, device):
     if not isinstance(labels, dict):
-        raise ValueError("Expected labels to be a dict with keys: manner/place/voicing")
+        raise ValueError("Expected labels to be a dict with keys: manner/place/voicing/vowel_backness")
     return {k: v.to(device, non_blocking=True) for k, v in labels.items() if k in TASKS}
 
 
@@ -142,10 +147,26 @@ def get_audio_from_batch(batch):
 def compute_accuracy(logits, labels, classification_task=""):
     """Compute per-task accuracy.  Supports both multi-task dict and single-task tensor."""
     if classification_task == "":
-        # multi-task: logits is a dict with keys "manner", "place", "voicing"
+        # multi-task: logits is a dict with keys "manner", "place", "voicing", "vowel_backness"
         acc = {}
         for task in TASKS:
-            if task in logits and task in labels:
+            if task not in logits or task not in labels:
+                continue
+            if task == "vowel_backness":
+                # BCE: sigmoid + threshold 0.5 → binary predictions
+                pred = (torch.sigmoid(logits[task]) >= 0.5).float()
+                # Per-label accuracy averaged over all 3 backness classes
+                acc[task] = (pred == labels[task]).float().mean().item()
+                # Accuracy on non-silence frames only (any backness label = 1)
+                nonsil_mask = labels[task].sum(dim=-1) > 0
+                if nonsil_mask.sum() > 0:
+                    acc[f"{task}_nonsil"] = (
+                        (pred[nonsil_mask] == labels[task][nonsil_mask])
+                        .float().mean().item()
+                    )
+                else:
+                    acc[f"{task}_nonsil"] = 0.0
+            else:
                 pred = logits[task].argmax(dim=-1)
                 acc[task] = (pred == labels[task]).float().mean().item()
         acc["mean"] = sum(acc.values()) / max(len(acc), 1)
@@ -173,6 +194,10 @@ def build_loss_from_config(config, device, class_weights=None):
         class_weights=class_weights,
         contrast_loss_kwargs=loss_cfg.get("contrast_loss_kwargs", None),
         classification_task=classification_task,
+        lambda_manner=loss_cfg.get("lambda_manner", 1.0),
+        lambda_place=loss_cfg.get("lambda_place", 1.0),
+        lambda_voicing=loss_cfg.get("lambda_voicing", 1.0),
+        lambda_vowel_backness=loss_cfg.get("lambda_vowel_backness", 1.0),
     )
     return criterion.to(device)
 

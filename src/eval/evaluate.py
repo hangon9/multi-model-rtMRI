@@ -60,10 +60,13 @@ CLASS_NAMES: Dict[str, List[str]] = {
     ],
     "place": [
         "Silence", "Labial", "Dental", "Alveolar", "Postalveolar",
-        "Palatal", "Velar", "Glottal", "Front", "Central", "Back",
+        "Palatal", "Velar", "Glottal",
     ],
     "voicing": [
         "Silence", "Voiced", "Voiceless",
+    ],
+    "vowel_backness": [
+        "Front", "Central", "Back",
     ],
 }
 
@@ -343,6 +346,10 @@ def _generate_task_plots(
     metrics_dir: Path,
 ) -> None:
     for task in results:
+        if task == "vowel_backness":
+            print("[evaluate] Skipping vowel_backness metrics (multi-label BCE, "
+                  "not yet supported in the integer-label pipeline).")
+            continue
         y_true = results[task]["labels"]
         y_pred = results[task]["preds"]
         class_names = CLASS_NAMES.get(task, [])
