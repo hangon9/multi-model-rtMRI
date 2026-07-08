@@ -21,6 +21,10 @@ wheels/
 *.egg
 MANIFEST
 
+# hpc
+*.yaml
+*.slurm
+*.sh
 
 # Virtual environments
 venv/
