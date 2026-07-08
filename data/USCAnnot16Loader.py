@@ -171,21 +171,20 @@ class USCAnnot16Dataset(Dataset):
         # ── Manner: argmax over [Silence, Stop, Nasal, Fricative, Approximant, Vowel] ──
         manner_idx = int(vals[0:6].argmax())          # 0-5
 
-        # ── Place (consonant place only): Silence=1 → 0;
-        #     else argmax over [Labial..Glottal] (cols 6-12, 7 classes) + 1 ──
-        if vals[0] == 1.0:
-            place_idx = 0
+        # ── Place: consonant → 0-6; silence/vowel → -100 (CE ignore_index) ──
+        if vals[0] == 1.0 or vals[5] == 1.0:
+            place_idx = -100
         else:
-            place_idx = int(vals[6:13].argmax()) + 1  # 1-7
+            place_idx = int(vals[6:13].argmax())  # 0-6
 
-        # ── Voicing: Silence=1 → 0; else argmax over [Voiced, Voiceless] + 1 ──
-        if vals[0] == 1.0:
-            voicing_idx = 0
+        # ── Voicing: consonant → 0-1; silence/vowel → -100 ──
+        if vals[0] == 1.0 or vals[5] == 1.0:
+            voicing_idx = -100
         else:
-            voicing_idx = int(vals[16:18].argmax()) + 1  # 1-2
+            voicing_idx = int(vals[16:18].argmax())  # 0-1
 
         # ── Vowel Backness: multi-hot [Front, Central, Back] for BCE loss.
-        #     Silence → [0, 0, 0], vowels get their one-hot backness.
+        #     Only vowel samples are trained; non-vowel rows are masked in loss.
         vowel_backness = vals[13:16].copy()  # cols: Front, Central, Back
 
         labels = {

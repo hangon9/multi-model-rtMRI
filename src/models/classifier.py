@@ -21,7 +21,7 @@ class SingleClassificationHead(nn.Module):
 
 
 class ClassificationHead(nn.Module):
-    def __init__(self, input_type="sequential", input_dim=31 * 768, hidden_dim=512, num_classes=None, dropout=0.1, classification_task=""):
+    def __init__(self, input_type="sequential", input_dim=31 * 768, hidden_dim=512, num_classes=None, dropout=0.1, classification_task="", gated=False):
         super().__init__()
         if input_type not in ("sequential", "pooled"):
             raise ValueError(f"Invalid input_type: {input_type}. Expected 'sequential' or 'pooled'.")
@@ -30,8 +30,11 @@ class ClassificationHead(nn.Module):
         elif input_type == "pooled":
             input_dim = input_dim
         self.classification_task = classification_task or ""
+        self.gated = gated
 
         if self.classification_task == "":
+            place_classes = 7 if gated else 8
+            voicing_classes = 2 if gated else 3
             self.heads = nn.ModuleDict({
                 "manner": SingleClassificationHead(
                     input_dim=input_dim,
@@ -42,13 +45,13 @@ class ClassificationHead(nn.Module):
                 "place": SingleClassificationHead(
                     input_dim=input_dim,
                     hidden_dim=hidden_dim,
-                    num_classes=8,   # Silence + 7 consonant place classes
+                    num_classes=place_classes,
                     dropout=dropout
                 ),
                 "voicing": SingleClassificationHead(
                     input_dim=input_dim,
                     hidden_dim=hidden_dim,
-                    num_classes=3,
+                    num_classes=voicing_classes,
                     dropout=dropout
                 ),
                 "vowel_backness": SingleClassificationHead(
@@ -82,8 +85,8 @@ class ClassificationHead(nn.Module):
             Multi-task:
                 {
                     "manner": Tensor [B, 6],
-                    "place": Tensor [B, 11],
-                    "voicing": Tensor [B, 3],
+                    "place": Tensor [B, 7] or [B, 8],
+                    "voicing": Tensor [B, 2] or [B, 3],
                     "all_logits": dict,
                     "task": "multi"
                 }

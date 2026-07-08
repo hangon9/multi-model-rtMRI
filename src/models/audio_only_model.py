@@ -83,6 +83,7 @@ class AudioMultiHeadClassifier(nn.Module):
             dropout=dropout,
             classification_task=classification_task,
             num_classes=num_classes,
+            gated=True,
         )
 
     def forward(self, audio: torch.Tensor, attention_mask: torch.Tensor | None = None, classification_task=None) -> dict[str, torch.Tensor]:

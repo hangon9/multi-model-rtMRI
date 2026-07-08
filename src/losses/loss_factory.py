@@ -9,14 +9,16 @@ class BuildLoss(nn.Module):
         self,
         lambda_contrast=0.1,
         contrast_loss_name="cosine",    # None | "cosine" | "info_nce"
-        class_weights=None,           # None | Tensor(单任务) | dict(多任务)
+        class_weights=None,             # None | Tensor(单任务) | dict(多任务)
         contrast_loss_kwargs=None,
         classification_task="",
         lambda_manner=1.0,
         lambda_place=1.0,
         lambda_voicing=1.0,
         lambda_vowel_backness=1.0,
-        bce_pos_weight=None,          # Tensor (3,) for vowel_backness BCE pos_weight
+        bce_pos_weight=None,            # Tensor (3,) for vowel_backness BCE pos_weight
+        ce_ignore_index=-100,           # CE ignore index, used to skip invalid labels
+        vowel_manner_id=5,              # manner label id for vowel frames
     ):
         super().__init__()
 
@@ -30,20 +32,37 @@ class BuildLoss(nn.Module):
         self.lambda_voicing = lambda_voicing
         self.lambda_vowel_backness = lambda_vowel_backness
 
+        # ── Ignore / mask settings ──────────────────────────────────
+        self.ce_ignore_index = ce_ignore_index
+        self.vowel_manner_id = vowel_manner_id
+
         # ── CE Loss 构建 (manner, place, voicing) / BCE (vowel_backness) ──
         if self.classification_task == "":
             # multi-task: build CE losses for manner/place/voicing
             self._build_ce_losses(class_weights)
-            # BCE loss for vowel_backness with optional pos_weight
-            self.bce_vowel_backness = nn.BCEWithLogitsLoss(pos_weight=bce_pos_weight)
+
+            # Multi-task BCE for vowel_backness:
+            # reduction='none' is required because we manually mask non-vowel frames.
+            self.bce_vowel_backness = nn.BCEWithLogitsLoss(
+                pos_weight=bce_pos_weight,
+                reduction="none",
+            )
             self.ce_loss = None  # multi-task does not use single ce_loss
+            self.bce_loss = None
+
         elif self.classification_task == "vowel_backness":
-            # Single-task BCE for vowel backness
+            # Single-task BCE for vowel_backness.
+            # Keep reduction='none' for consistency, then reduce manually in forward.
             if class_weights is not None:
                 pass  # BCE uses pos_weight, not CE-style weight
             self.ce_loss = None
             self.ce_losses = None
-            self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=bce_pos_weight)
+            self.bce_loss = nn.BCEWithLogitsLoss(
+                pos_weight=bce_pos_weight,
+                reduction="none",
+            )
+            self.bce_vowel_backness = None
+
         else:
             # Single-task CE (manner / place / voicing)
             if class_weights is not None and not isinstance(class_weights, torch.Tensor):
@@ -51,12 +70,19 @@ class BuildLoss(nn.Module):
                     "Single-task BuildLoss 的 class_weights 必须是 Tensor 或 None，"
                     f"收到 {type(class_weights)}"
                 )
-            self.ce_loss = nn.CrossEntropyLoss(weight=class_weights)
+            self.ce_loss = nn.CrossEntropyLoss(
+                weight=class_weights,
+                ignore_index=self.ce_ignore_index,
+            )
             self.ce_losses = None
             self.bce_loss = None
+            self.bce_vowel_backness = None
 
-        # ── Contrast Loss ────────────────────────────────────────
-        self.contrast_enabled = contrast_loss_name is not None and str(contrast_loss_name).lower() not in ("none", "null")
+        # ── Contrast Loss ────────────────────────────────────────────
+        self.contrast_enabled = (
+            contrast_loss_name is not None
+            and str(contrast_loss_name).lower() not in ("none", "null")
+        )
         if contrast_loss_kwargs is None:
             contrast_loss_kwargs = {}
         self.contrast_loss = apply_contrast_loss(
@@ -64,16 +90,35 @@ class BuildLoss(nn.Module):
         )
 
     def _build_ce_losses(self, class_weights):
-        """Build CE losses for manner, place, voicing in multi-task mode."""
+        """Build CE losses for manner, place, voicing in multi-task mode.
+
+        ignore_index=-100 is used to skip frames whose label should not
+        contribute to a given CE task, e.g. silence / vowel frames for
+        place or voicing if your dataset marks them as -100.
+        """
         ce_tasks = ("manner", "place", "voicing")
+
+        # All three CE tasks use ignore_index=-100 by default.
+        # Whether a frame is ignored depends on whether its label is actually -100.
+        ignore_map = {
+            "manner": self.ce_ignore_index,
+            "place": self.ce_ignore_index,
+            "voicing": self.ce_ignore_index,
+        }
+
         if isinstance(class_weights, dict):
             self.ce_losses = nn.ModuleDict({
-                task: nn.CrossEntropyLoss(weight=class_weights.get(task))
+                task: nn.CrossEntropyLoss(
+                    weight=class_weights.get(task),
+                    ignore_index=ignore_map[task],
+                )
                 for task in ce_tasks
             })
         elif class_weights is None:
             self.ce_losses = nn.ModuleDict({
-                task: nn.CrossEntropyLoss()
+                task: nn.CrossEntropyLoss(
+                    ignore_index=ignore_map[task],
+                )
                 for task in ce_tasks
             })
         else:
@@ -81,6 +126,40 @@ class BuildLoss(nn.Module):
                 "Multi-task BuildLoss 的 class_weights 必须是 dict 或 None，"
                 f"收到 {type(class_weights)}"
             )
+
+    def _masked_vowel_backness_bce(self, logits_vb, targets_vb, manner_labels):
+        """Compute vowel_backness BCE only on vowel frames.
+
+        Args:
+            logits_vb: Tensor, shape (B, 3), raw logits for vowel_backness.
+            targets_vb: Tensor, shape (B, 3), BCE targets.
+            manner_labels: Tensor, shape (B,), manner labels.
+
+        Returns:
+            Scalar tensor: averaged BCE over valid vowel_backness elements only.
+        """
+        # Mask: only vowel frames participate in vowel_backness loss.
+        vowel_mask_bool = manner_labels == self.vowel_manner_id       # (B,)
+        vowel_mask = vowel_mask_bool.float().unsqueeze(-1)            # (B, 1)
+
+        # BCE targets must be legal values before entering BCE.
+        # If non-vowel rows contain ignore labels such as -100, replace them by 0.
+        # They will be masked out immediately after BCE, so this replacement does
+        # not create training signal for non-vowel frames.
+        targets_vb_safe = targets_vb.clone()
+        targets_vb_safe[~vowel_mask_bool] = 0.0
+
+        # Per-element BCE, shape (B, 3). No reduction here.
+        bce_element = self.bce_vowel_backness(logits_vb, targets_vb_safe)
+
+        # Zero out non-vowel frames.
+        bce_masked = bce_element * vowel_mask                         # (B, 3)
+
+        # Average over valid elements only: number of vowel frames * backness dims.
+        num_valid = vowel_mask.sum() * logits_vb.size(-1)
+        bce_loss_vowel = bce_masked.sum() / num_valid.clamp(min=1.0)
+
+        return bce_loss_vowel
 
     def forward(self, logits, labels, visual_flat, audio_flat, classification_task=None):
         active_classification_task = (
@@ -95,7 +174,8 @@ class BuildLoss(nn.Module):
 
             task_logits = logits.get("all_logits", logits)
 
-            # ── CE losses: manner, place, voicing ────────────────
+            # ── CE losses: manner, place, voicing ────────────────────
+            # CrossEntropyLoss will automatically ignore labels == -100.
             ce_loss_manner = self.ce_losses["manner"](
                 task_logits["manner"], labels["manner"]
             )
@@ -106,12 +186,14 @@ class BuildLoss(nn.Module):
                 task_logits["voicing"], labels["voicing"]
             )
 
-            # ── BCE loss: vowel_backness ─────────────────────────
-            bce_loss_vowel = self.bce_vowel_backness(
-                task_logits["vowel_backness"], labels["vowel_backness"]
+            # ── BCE loss: vowel_backness, only on vowel frames ────────
+            bce_loss_vowel = self._masked_vowel_backness_bce(
+                logits_vb=task_logits["vowel_backness"],
+                targets_vb=labels["vowel_backness"],
+                manner_labels=labels["manner"],
             )
 
-            # ── Weighted sum ─────────────────────────────────────
+            # ── Weighted sum ─────────────────────────────────────────
             cls_loss = (
                 self.lambda_manner * ce_loss_manner
                 + self.lambda_place * ce_loss_place
@@ -128,7 +210,7 @@ class BuildLoss(nn.Module):
             }
 
         else:
-            # 单任务：解包 dict logits/labels（逻辑不变）
+            # 单任务：解包 dict logits/labels（逻辑基本不变）
             if isinstance(logits, dict):
                 if active_classification_task in logits:
                     logits = logits[active_classification_task]
@@ -149,16 +231,19 @@ class BuildLoss(nn.Module):
                 labels = labels[active_classification_task]
 
             if active_classification_task == "vowel_backness":
-                cls_loss = self.bce_loss(logits, labels)
+                # self.bce_loss uses reduction='none', so reduce manually.
+                cls_loss = self.bce_loss(logits, labels).mean()
             else:
                 cls_loss = self.ce_loss(logits, labels)
+
             self._last_task_losses = {}
 
         if audio_flat is not None and self.contrast_enabled:
             contrast_loss = self.contrast_loss(visual_flat, audio_flat)
             total_loss = cls_loss + self.lambda_contrast * contrast_loss
         else:
-            contrast_loss = torch.tensor(0.0, device=visual_flat.device)
+            device = cls_loss.device
+            contrast_loss = torch.tensor(0.0, device=device)
             total_loss = cls_loss
 
         result = {
@@ -166,9 +251,12 @@ class BuildLoss(nn.Module):
             "cls_loss": cls_loss,
             "contrast_loss": contrast_loss,
         }
+
         # Include per-task losses for detailed logging
         for task_name, task_loss in self._last_task_losses.items():
             result[f"loss_{task_name}"] = task_loss
+
         if self.contrast_loss_name:
             result[f"{self.contrast_loss_name}_loss"] = contrast_loss
+
         return result

@@ -30,8 +30,8 @@ from utils.logger import TrainingLogger
 NUM_CLASSES = {
     "": 18,
     "manner": 6,
-    "place": 8,
-    "voicing": 3,
+    "place": 7,       # consonant place only; silence/vowel are gated out
+    "voicing": 2,     # consonant voicing only; silence/vowel are gated out
     "vowel_backness": 3,
 }
 TASKS = ("manner", "place", "voicing", "vowel_backness")
@@ -42,37 +42,44 @@ _PLACE_COLS   = ["Labial", "Dental", "Alveolar", "Postalveolar",
 _VOICING_COLS = ["Voiced", "Voiceless"]
 _VOWEL_BACKNESS_COLS = ["Front", "Central", "Back"]
 
+# Manner indices from _MANNER_COLS: Stop/Nasal/Fricative/Approximant are consonants.
+_CONSONANT_MANNER_MIN = 1
+_CONSONANT_MANNER_MAX = 4
+_VOWEL_MANNER = 5
+
 
 # ---------------------------------------------------------------------------
 # utility: class-weight helpers
 # ---------------------------------------------------------------------------
 
 def _derive_class_indices(df, task: str):
-    """Same label derivation as USCAnnot16Dataset.__getitem__."""
+    """Derive targets for class-weight computation with the same gating as the dataset."""
     if task == "manner":
         return df[_MANNER_COLS].values.argmax(axis=1)
+
     elif task == "place":
-        idx = df[_PLACE_COLS].values.argmax(axis=1) + 1
-        idx[df["Silence"].values == 1.0] = 0
+        # Consonants use 0..6; silence and vowels are ignored by CE(ignore_index=-100).
+        idx = df[_PLACE_COLS].values.argmax(axis=1)
+        nonspeech = (df["Silence"].values == 1.0) | (df["Vowel"].values == 1.0)
+        idx[nonspeech] = -100
         return idx
+
     elif task == "voicing":
-        idx = df[_VOICING_COLS].values.argmax(axis=1) + 1
-        idx[df["Silence"].values == 1.0] = 0
+        # Consonants use 0..1; silence and vowels are ignored by CE(ignore_index=-100).
+        idx = df[_VOICING_COLS].values.argmax(axis=1)
+        nonspeech = (df["Silence"].values == 1.0) | (df["Vowel"].values == 1.0)
+        idx[nonspeech] = -100
         return idx
+
     elif task == "vowel_backness":
-        # Return multi-hot targets for BCE: shape (N, 3)
         return df[_VOWEL_BACKNESS_COLS].values.astype("float32")
+
     else:
         raise ValueError(f"Unknown task for weight derivation: {task}")
 
 
 def get_class_weights(train_df, config):
-    """Compute balanced class weights per fold.
-
-    Returns:
-        Single-task: Tensor (n_classes,) or None
-        Multi-task:  dict {task: Tensor} or None
-    """
+    """Compute balanced CE class weights on valid samples only."""
     use_class_weights = config["loss"].get("use_class_weights", False)
     classification_task = config["data"]["classification_task"] or ""
 
@@ -93,28 +100,28 @@ def get_class_weights(train_df, config):
 
     def _weights_for(task):
         indices = _derive_class_indices(train_df, task)
-        return _balanced_weights(indices, NUM_CLASSES[task])
+        valid_indices = indices[indices != -100]
+        return _balanced_weights(valid_indices, NUM_CLASSES[task])
 
     if classification_task == "":
         return {task: _weights_for(task) for task in TASKS if task != "vowel_backness"}
-    else:
-        return _weights_for(classification_task)
+    if classification_task == "vowel_backness":
+        return None
+    return _weights_for(classification_task)
+
 
 
 def get_bce_pos_weight(train_df, config):
-    """Compute BCE pos_weight for vowel_backness if enabled in config.
-
-    pos_weight_c = N_neg / N_pos  for each of the 3 backness classes.
-    Returns Tensor (3,) or None.
-    """
+    """Compute BCE pos_weight for vowel_backness on vowel samples only."""
     if not config["loss"].get("bce_pos_weight", False):
         return None
 
-    multi_hot = train_df[_VOWEL_BACKNESS_COLS].values  # (N, 3)
-    N = len(multi_hot)
-    n_pos = multi_hot.sum(axis=0)  # (3,)
-    n_neg = N - n_pos
     import numpy as np
+    vowel_mask = train_df["Vowel"].values == 1.0
+    multi_hot = train_df.loc[vowel_mask, _VOWEL_BACKNESS_COLS].values.astype("float32")
+    N = len(multi_hot)
+    n_pos = multi_hot.sum(axis=0)
+    n_neg = N - n_pos
     pos_weight = n_neg / np.maximum(n_pos, 1.0)
     return torch.tensor(pos_weight, dtype=torch.float32)
 
@@ -163,37 +170,48 @@ def get_audio_from_batch(batch):
 # ---------------------------------------------------------------------------
 
 def compute_accuracy(logits, labels, classification_task=""):
-    """Compute per-task accuracy.  Supports both multi-task dict and single-task tensor."""
+    """Compute per-task accuracy; in multi-task mode apply phonetic gates."""
     if classification_task == "":
-        # multi-task: logits is a dict with keys "manner", "place", "voicing", "vowel_backness"
         acc = {}
+        if "manner" not in labels:
+            return {"mean": 0.0}
+
+        manner_labels = labels["manner"]
+        cons_mask = (
+            (manner_labels >= _CONSONANT_MANNER_MIN)
+            & (manner_labels <= _CONSONANT_MANNER_MAX)
+        )
+        vowel_mask = manner_labels == _VOWEL_MANNER
+
         for task in TASKS:
             if task not in logits or task not in labels:
                 continue
-            if task == "vowel_backness":
-                # BCE: sigmoid + threshold 0.5 → binary predictions
-                pred = (torch.sigmoid(logits[task]) >= 0.5).float()
-                # Per-label accuracy averaged over all 3 backness classes
-                acc[task] = (pred == labels[task]).float().mean().item()
-                # Accuracy on non-silence frames only (any backness label = 1)
-                nonsil_mask = labels[task].sum(dim=-1) > 0
-                if nonsil_mask.sum() > 0:
-                    acc[f"{task}_nonsil"] = (
-                        (pred[nonsil_mask] == labels[task][nonsil_mask])
-                        .float().mean().item()
-                    )
+
+            if task in ("place", "voicing"):
+                if cons_mask.any():
+                    pred = logits[task].argmax(dim=-1)
+                    acc[task] = (pred[cons_mask] == labels[task][cons_mask]).float().mean().item()
                 else:
-                    acc[f"{task}_nonsil"] = 0.0
-            else:
+                    acc[task] = 0.0
+
+            elif task == "vowel_backness":
+                if vowel_mask.any():
+                    pred = (torch.sigmoid(logits[task]) >= 0.5).float()
+                    acc[task] = (pred[vowel_mask] == labels[task][vowel_mask]).float().mean().item()
+                else:
+                    acc[task] = 0.0
+
+            elif task == "manner":
                 pred = logits[task].argmax(dim=-1)
                 acc[task] = (pred == labels[task]).float().mean().item()
+
         acc["mean"] = sum(acc.values()) / max(len(acc), 1)
         return acc
-    else:
-        # single-task: logits is a Tensor (B, C), labels is a Tensor (B,)
-        pred = logits.argmax(dim=-1)
-        acc_val = (pred == labels).float().mean().item()
-        return {classification_task: acc_val, "mean": acc_val}
+
+    # Single-task mode is intentionally unchanged: no gating here.
+    pred = logits.argmax(dim=-1)
+    acc_val = (pred == labels).float().mean().item()
+    return {classification_task: acc_val, "mean": acc_val}
 
 
 # ---------------------------------------------------------------------------
