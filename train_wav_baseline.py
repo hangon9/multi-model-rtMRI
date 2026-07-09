@@ -400,6 +400,8 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device,
     model.train()
     total_loss = 0.0
     total_cls_loss = 0.0
+    _TASK_LOSS_KEYS = ("loss_manner", "loss_place", "loss_voicing", "loss_vowel_backness")
+    total_task_loss = {k: 0.0 for k in _TASK_LOSS_KEYS}
     total_acc = {"mean": 0.0}
     n = 0
 
@@ -438,17 +440,22 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device,
         bs = audio.size(0)
         total_loss += loss.item() * bs
         total_cls_loss += loss_dict.get("cls_loss", torch.tensor(0.0)).item() * bs
+        for k in _TASK_LOSS_KEYS:
+            if k in loss_dict:
+                total_task_loss[k] += loss_dict[k].item() * bs
         batch_acc = compute_accuracy(logits, labels, classification_task)
         for k in batch_acc:
             total_acc.setdefault(k, 0.0)
             total_acc[k] += batch_acc[k] * bs
         n += bs
 
-    return {
+    result = {
         "loss": total_loss / n,
         "cls_loss": total_cls_loss / n,
         "acc": {k: v / n for k, v in total_acc.items()},
     }
+    result.update({k: v / n for k, v in total_task_loss.items()})
+    return result
 
 
 @torch.no_grad()
@@ -456,6 +463,8 @@ def evaluate(model, loader, criterion, device, classification_task="", name="val
     model.eval()
     total_loss = 0.0
     total_cls_loss = 0.0
+    _TASK_LOSS_KEYS = ("loss_manner", "loss_place", "loss_voicing", "loss_vowel_backness")
+    total_task_loss = {k: 0.0 for k in _TASK_LOSS_KEYS}
     total_acc = {"mean": 0.0}
     n = 0
 
@@ -478,17 +487,22 @@ def evaluate(model, loader, criterion, device, classification_task="", name="val
         bs = audio.size(0)
         total_loss += loss.item() * bs
         total_cls_loss += loss_dict.get("cls_loss", torch.tensor(0.0)).item() * bs
+        for k in _TASK_LOSS_KEYS:
+            if k in loss_dict:
+                total_task_loss[k] += loss_dict[k].item() * bs
         batch_acc = compute_accuracy(logits, labels, classification_task)
         for k in batch_acc:
             total_acc.setdefault(k, 0.0)
             total_acc[k] += batch_acc[k] * bs
         n += bs
 
-    return {
+    result = {
         "loss": total_loss / n,
         "cls_loss": total_cls_loss / n,
         "acc": {k: v / n for k, v in total_acc.items()},
     }
+    result.update({k: v / n for k, v in total_task_loss.items()})
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -598,9 +612,12 @@ def main():
 
             log_msg = (
                 f"Fold {fold_id}, Epoch {epoch + 1}: "
-                f"train_loss={train_log['loss']:.4f}, "
-                f"train_cls_loss={train_log['cls_loss']:.4f}, "
-                f"train_acc_mean={train_log['acc']['mean']:.4f}"
+                f"L={train_log['loss']:.3f} "
+                f"(m={train_log.get('loss_manner', 0):.3f} "
+                f"p={train_log.get('loss_place', 0):.3f} "
+                f"v={train_log.get('loss_voicing', 0):.3f} "
+                f"vb={train_log.get('loss_vowel_backness', 0):.3f}) "
+                f"acc={train_log['acc']['mean']:.3f}"
             )
 
             # validate every 5 epochs and on the last epoch
@@ -622,9 +639,12 @@ def main():
                 )
 
                 log_msg += (
-                    f" | val_loss={val_log['loss']:.4f}, "
-                    f"val_cls_loss={val_log['cls_loss']:.4f}, "
-                    f"val_acc_mean={val_log['acc']['mean']:.4f}"
+                    f" | val L={val_log['loss']:.3f} "
+                    f"(m={val_log.get('loss_manner', 0):.3f} "
+                    f"p={val_log.get('loss_place', 0):.3f} "
+                    f"v={val_log.get('loss_voicing', 0):.3f} "
+                    f"vb={val_log.get('loss_vowel_backness', 0):.3f}) "
+                    f"acc={val_log['acc']['mean']:.3f}"
                 )
 
                 logger.info(log_msg)

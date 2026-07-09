@@ -70,9 +70,12 @@ class BuildLoss(nn.Module):
                     "Single-task BuildLoss 的 class_weights 必须是 Tensor 或 None，"
                     f"收到 {type(class_weights)}"
                 )
+            # reduction='sum' + manual normalisation to avoid NaN when
+            # all targets are ignored in a batch.
             self.ce_loss = nn.CrossEntropyLoss(
                 weight=class_weights,
                 ignore_index=self.ce_ignore_index,
+                reduction="sum",
             )
             self.ce_losses = None
             self.bce_loss = None
@@ -106,11 +109,15 @@ class BuildLoss(nn.Module):
             "voicing": self.ce_ignore_index,
         }
 
+        # Use reduction='sum' + manual normalisation to avoid NaN when
+        # ALL targets in a batch are ignored (e.g. a validation batch
+        # containing zero consonant frames for place/voicing).
         if isinstance(class_weights, dict):
             self.ce_losses = nn.ModuleDict({
                 task: nn.CrossEntropyLoss(
                     weight=class_weights.get(task),
                     ignore_index=ignore_map[task],
+                    reduction="sum",
                 )
                 for task in ce_tasks
             })
@@ -118,6 +125,7 @@ class BuildLoss(nn.Module):
             self.ce_losses = nn.ModuleDict({
                 task: nn.CrossEntropyLoss(
                     ignore_index=ignore_map[task],
+                    reduction="sum",
                 )
                 for task in ce_tasks
             })
@@ -142,10 +150,15 @@ class BuildLoss(nn.Module):
         vowel_mask_bool = manner_labels == self.vowel_manner_id       # (B,)
         vowel_mask = vowel_mask_bool.float().unsqueeze(-1)            # (B, 1)
 
+        # Guard: if no vowel frame in the batch, return a true zero
+        # (with the same device / requires_grad as logits).
+        num_elements = vowel_mask.sum() * logits_vb.size(-1)
+        if num_elements == 0:
+            return logits_vb.new_zeros(())
+
         # BCE targets must be legal values before entering BCE.
-        # If non-vowel rows contain ignore labels such as -100, replace them by 0.
-        # They will be masked out immediately after BCE, so this replacement does
-        # not create training signal for non-vowel frames.
+        # Non-vowel rows are replaced by 0.0; they will be masked out
+        # immediately after BCE, so this creates no training signal.
         targets_vb_safe = targets_vb.clone()
         targets_vb_safe[~vowel_mask_bool] = 0.0
 
@@ -155,9 +168,7 @@ class BuildLoss(nn.Module):
         # Zero out non-vowel frames.
         bce_masked = bce_element * vowel_mask                         # (B, 3)
 
-        # Average over valid elements only: number of vowel frames * backness dims.
-        num_valid = vowel_mask.sum() * logits_vb.size(-1)
-        bce_loss_vowel = bce_masked.sum() / num_valid.clamp(min=1.0)
+        bce_loss_vowel = bce_masked.sum() / num_elements
 
         return bce_loss_vowel
 
@@ -175,16 +186,17 @@ class BuildLoss(nn.Module):
             task_logits = logits.get("all_logits", logits)
 
             # ── CE losses: manner, place, voicing ────────────────────
-            # CrossEntropyLoss will automatically ignore labels == -100.
+            # reduction='sum' + manual normalisation avoids NaN when a
+            # batch has zero valid (non-ignored) targets for a head.
             ce_loss_manner = self.ce_losses["manner"](
                 task_logits["manner"], labels["manner"]
-            )
+            ) / (labels["manner"] != self.ce_ignore_index).sum().clamp(min=1)
             ce_loss_place = self.ce_losses["place"](
                 task_logits["place"], labels["place"]
-            )
+            ) / (labels["place"] != self.ce_ignore_index).sum().clamp(min=1)
             ce_loss_voicing = self.ce_losses["voicing"](
                 task_logits["voicing"], labels["voicing"]
-            )
+            ) / (labels["voicing"] != self.ce_ignore_index).sum().clamp(min=1)
 
             # ── BCE loss: vowel_backness, only on vowel frames ────────
             bce_loss_vowel = self._masked_vowel_backness_bce(
@@ -234,7 +246,10 @@ class BuildLoss(nn.Module):
                 # self.bce_loss uses reduction='none', so reduce manually.
                 cls_loss = self.bce_loss(logits, labels).mean()
             else:
-                cls_loss = self.ce_loss(logits, labels)
+                # reduction='sum' → divide by #valid to avoid NaN on all-ignored batches.
+                raw = self.ce_loss(logits, labels)
+                n_valid = (labels != self.ce_ignore_index).sum()
+                cls_loss = raw / n_valid.clamp(min=1)
 
             self._last_task_losses = {}
 
