@@ -244,13 +244,17 @@ def get_optimizer_hparams(config):
     """
     Read optimizer hyperparameters WITHOUT requiring any YAML schema change.
 
-    Supported existing keys:
-      - model.audio_encoder.lr_audio_encoder : LR for pretrained audio encoder
-      - loss.lr_downstream                  : LR for pooling/classifier head
-      - train.lr                            : fallback LR if either key is missing
-      - train.weight_decay                  : weight decay for decay groups
+    Supported keys (preferred under train):
+      - train.lr_encoder    : LR for pretrained audio encoder (Wav2Vec2)
+      - train.lr_pooling    : LR for AttentionPooling
+      - train.lr_classifier : LR for ClassificationHead
+      - train.lr            : fallback LR if any key is missing
+      - train.weight_decay  : weight decay for decay groups
 
-    If train.weight_decay is not provided, weight decay defaults to 0.0.
+    Backward-compatible fallbacks:
+      - model.audio_encoder.lr_audio_encoder → lr_encoder
+      - loss.lr_downstream                  → lr_pooling / lr_classifier
+
     Bias / LayerNorm / norm parameters always use weight_decay=0.0.
     """
     train_cfg = config.get("train", {})
@@ -258,64 +262,78 @@ def get_optimizer_hparams(config):
     loss_cfg = config.get("loss", {})
 
     fallback_lr = train_cfg.get("lr", 1e-5)
-    encoder_lr = model_cfg.get("lr_audio_encoder", fallback_lr)
-    head_lr = loss_cfg.get("lr_downstream", fallback_lr)
+    # New keys under train (preferred), with fallback to old locations
+    encoder_lr = train_cfg.get(
+        "lr_encoder", model_cfg.get("lr_audio_encoder", fallback_lr)
+    )
+    # lr_downstream used as fallback for both pooling and classifier
+    downstream_fallback = loss_cfg.get("lr_downstream", fallback_lr)
+    pooling_lr = train_cfg.get("lr_pooling", downstream_fallback)
+    classifier_lr = train_cfg.get("lr_classifier", downstream_fallback)
 
     # Important: if weight_decay is not explicitly passed in YAML, use 0.0.
     weight_decay = train_cfg.get("weight_decay", 0.0)
 
     return {
         "encoder_lr": float(encoder_lr),
-        "head_lr": float(head_lr),
+        "pooling_lr": float(pooling_lr),
+        "classifier_lr": float(classifier_lr),
         "weight_decay": float(weight_decay),
     }
 
 
 def build_optimizer(model, config, logger=None):
     """
-    Build AdamW optimizer with 4 parameter groups, while keeping the YAML unchanged:
-      1. encoder_decay     : pretrained encoder params with weight decay
-      2. encoder_no_decay  : pretrained encoder bias/norm params, no weight decay
-      3. head_decay        : pooling/classifier params with weight decay
-      4. head_no_decay     : pooling/classifier bias/norm params, no weight decay
+    Build AdamW optimizer with 6 parameter groups:
+      1. encoder_decay       : pretrained encoder params with weight decay
+      2. encoder_no_decay    : pretrained encoder bias/norm params, no weight decay
+      3. pooling_decay       : AttentionPooling params with weight decay
+      4. pooling_no_decay    : AttentionPooling bias/norm params, no weight decay
+      5. classifier_decay    : ClassificationHead params with weight decay
+      6. classifier_no_decay : ClassificationHead bias/norm params, no weight decay
 
-    In AudioMultiHeadClassifier, the audio SSL encoder is stored under
-    `self.encoder`, so top-level parameter names starting with "encoder."
-    are treated as pretrained encoder parameters.
+    In AudioMultiHeadClassifier:
+      - self.encoder    → "encoder.*"  parameters
+      - self.pooling    → "pooling.*"  parameters
+      - self.classifier → everything else ("classifier.*")
     """
     hparams = get_optimizer_hparams(config)
     encoder_lr = hparams["encoder_lr"]
-    head_lr = hparams["head_lr"]
+    pooling_lr = hparams["pooling_lr"]
+    classifier_lr = hparams["classifier_lr"]
     weight_decay = hparams["weight_decay"]
 
     buckets = {
         "encoder_decay": [],
         "encoder_no_decay": [],
-        "head_decay": [],
-        "head_no_decay": [],
+        "pooling_decay": [],
+        "pooling_no_decay": [],
+        "classifier_decay": [],
+        "classifier_no_decay": [],
     }
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
 
-        is_encoder = name.startswith("encoder.")
         is_no_decay = _is_no_decay_param(name)
 
-        if is_encoder and is_no_decay:
-            buckets["encoder_no_decay"].append(param)
-        elif is_encoder:
-            buckets["encoder_decay"].append(param)
-        elif is_no_decay:
-            buckets["head_no_decay"].append(param)
+        if name.startswith("encoder."):
+            bucket = "encoder_no_decay" if is_no_decay else "encoder_decay"
+        elif name.startswith("pooling."):
+            bucket = "pooling_no_decay" if is_no_decay else "pooling_decay"
         else:
-            buckets["head_decay"].append(param)
+            bucket = "classifier_no_decay" if is_no_decay else "classifier_decay"
+
+        buckets[bucket].append(param)
 
     group_specs = [
         ("encoder_decay", encoder_lr, weight_decay),
         ("encoder_no_decay", encoder_lr, 0.0),
-        ("head_decay", head_lr, weight_decay),
-        ("head_no_decay", head_lr, 0.0),
+        ("pooling_decay", pooling_lr, weight_decay),
+        ("pooling_no_decay", pooling_lr, 0.0),
+        ("classifier_decay", classifier_lr, weight_decay),
+        ("classifier_no_decay", classifier_lr, 0.0),
     ]
 
     param_groups = []
@@ -382,6 +400,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device,
     model.train()
     total_loss = 0.0
     total_cls_loss = 0.0
+    total_task_losses = {}  # per-task losses: loss_manner, loss_place, etc.
     total_acc = {"mean": 0.0}
     n = 0
 
@@ -420,17 +439,26 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device,
         bs = audio.size(0)
         total_loss += loss.item() * bs
         total_cls_loss += loss_dict.get("cls_loss", torch.tensor(0.0)).item() * bs
+        # accumulate per-task losses if present (multi-task mode)
+        for task_name in ("loss_manner", "loss_place", "loss_voicing", "loss_vowel_backness"):
+            if task_name in loss_dict:
+                total_task_losses.setdefault(task_name, 0.0)
+                total_task_losses[task_name] += loss_dict[task_name].item() * bs
         batch_acc = compute_accuracy(logits, labels, classification_task)
         for k in batch_acc:
             total_acc.setdefault(k, 0.0)
             total_acc[k] += batch_acc[k] * bs
         n += bs
 
-    return {
+    result = {
         "loss": total_loss / n,
         "cls_loss": total_cls_loss / n,
         "acc": {k: v / n for k, v in total_acc.items()},
     }
+    # add per-task losses (averaged) to result
+    for k, v in total_task_losses.items():
+        result[k] = v / n
+    return result
 
 
 @torch.no_grad()
@@ -438,6 +466,7 @@ def evaluate(model, loader, criterion, device, classification_task="", name="val
     model.eval()
     total_loss = 0.0
     total_cls_loss = 0.0
+    total_task_losses = {}  # per-task losses: loss_manner, loss_place, etc.
     total_acc = {"mean": 0.0}
     n = 0
 
@@ -460,17 +489,26 @@ def evaluate(model, loader, criterion, device, classification_task="", name="val
         bs = audio.size(0)
         total_loss += loss.item() * bs
         total_cls_loss += loss_dict.get("cls_loss", torch.tensor(0.0)).item() * bs
+        # accumulate per-task losses if present (multi-task mode)
+        for task_name in ("loss_manner", "loss_place", "loss_voicing", "loss_vowel_backness"):
+            if task_name in loss_dict:
+                total_task_losses.setdefault(task_name, 0.0)
+                total_task_losses[task_name] += loss_dict[task_name].item() * bs
         batch_acc = compute_accuracy(logits, labels, classification_task)
         for k in batch_acc:
             total_acc.setdefault(k, 0.0)
             total_acc[k] += batch_acc[k] * bs
         n += bs
 
-    return {
+    result = {
         "loss": total_loss / n,
         "cls_loss": total_cls_loss / n,
         "acc": {k: v / n for k, v in total_acc.items()},
     }
+    # add per-task losses (averaged) to result
+    for k, v in total_task_losses.items():
+        result[k] = v / n
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +584,9 @@ def main():
 
         optimizer = build_optimizer(model, config, logger=logger)
 
+        # Build LR lookup by group name for logging (6 groups, some may be empty)
+        _lr_lookup = {g["name"]: g["lr"] for g in optimizer.param_groups}
+
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
             max_lr=[group["lr"] for group in optimizer.param_groups],
@@ -572,17 +613,27 @@ def main():
                 epoch=epoch,
                 phase="training",
                 metrics=train_log,
-                lr_encoder=optimizer.param_groups[0]["lr"],
-                lr_downstream=optimizer.param_groups[2]["lr"],
+                lr_encoder=_lr_lookup.get("encoder_decay", _lr_lookup.get("encoder_no_decay", 0.0)),
+                lr_pooling=_lr_lookup.get("pooling_decay", _lr_lookup.get("pooling_no_decay", 0.0)),
+                lr_classifier=_lr_lookup.get("classifier_decay", _lr_lookup.get("classifier_no_decay", 0.0)),
                 classification_task=classification_task,
                 log_to_console=False,
             )
 
+            # Build per-task loss suffix for multi-task mode
+            _task_suffix = ""
+            if "loss_manner" in train_log:
+                _task_suffix = (
+                    f"(m={train_log['loss_manner']:.3f} "
+                    f"p={train_log['loss_place']:.3f} "
+                    f"v={train_log['loss_voicing']:.3f} "
+                    f"vb={train_log['loss_vowel_backness']:.3f})"
+                )
+
             log_msg = (
                 f"Fold {fold_id}, Epoch {epoch + 1}: "
-                f"train_loss={train_log['loss']:.4f}, "
-                f"train_cls_loss={train_log['cls_loss']:.4f}, "
-                f"train_acc_mean={train_log['acc']['mean']:.4f}"
+                f"L={train_log['loss']:.3f} {_task_suffix} "
+                f"acc={train_log['acc']['mean']:.3f}"
             )
 
             # validate every 5 epochs and on the last epoch
@@ -597,16 +648,26 @@ def main():
                     epoch=epoch,
                     phase="validation",
                     metrics=val_log,
-                    lr_encoder=optimizer.param_groups[0]["lr"],
-                    lr_downstream=optimizer.param_groups[2]["lr"],
+                    lr_encoder=_lr_lookup.get("encoder_decay", _lr_lookup.get("encoder_no_decay", 0.0)),
+                    lr_pooling=_lr_lookup.get("pooling_decay", _lr_lookup.get("pooling_no_decay", 0.0)),
+                    lr_classifier=_lr_lookup.get("classifier_decay", _lr_lookup.get("classifier_no_decay", 0.0)),
                     classification_task=classification_task,
                     log_to_console=False,
                 )
 
+                # Build per-task loss suffix for val (multi-task mode)
+                _val_task_suffix = ""
+                if "loss_manner" in val_log:
+                    _val_task_suffix = (
+                        f"(m={val_log['loss_manner']:.3f} "
+                        f"p={val_log['loss_place']:.3f} "
+                        f"v={val_log['loss_voicing']:.3f} "
+                        f"vb={val_log['loss_vowel_backness']:.3f})"
+                    )
+
                 log_msg += (
-                    f" | val_loss={val_log['loss']:.4f}, "
-                    f"val_cls_loss={val_log['cls_loss']:.4f}, "
-                    f"val_acc_mean={val_log['acc']['mean']:.4f}"
+                    f" | L={val_log['loss']:.3f} {_val_task_suffix} "
+                    f"acc={val_log['acc']['mean']:.3f}"
                 )
 
                 logger.info(log_msg)

@@ -114,6 +114,8 @@ class TrainingLogger:
         phase: str,
         metrics: dict,
         lr_encoder: float = None,
+        lr_pooling: float = None,
+        lr_classifier: float = None,
         lr_downstream: float = None,
         fold_id: int = None,
         classification_task: str = None,
@@ -151,8 +153,13 @@ class TrainingLogger:
                 self.info("  Training Stats:")
                 self.info(f"    lr_encoder: {lr_encoder:.6f}")
 
+            if lr_pooling is not None:
+                self.info(f"    lr_pooling: {lr_pooling:.6f}")
+
+            if lr_classifier is not None:
+                self.info(f"    lr_classifier: {lr_classifier:.6f}")
+
             if lr_downstream is not None:
-                self.info("  Training Stats:")
                 self.info(f"    lr_downstream: {lr_downstream:.6f}")
 
         metrics_entry = {
@@ -170,6 +177,12 @@ class TrainingLogger:
 
         if lr_encoder is not None:
             metrics_entry["lr_encoder"] = lr_encoder
+
+        if lr_pooling is not None:
+            metrics_entry["lr_pooling"] = lr_pooling
+
+        if lr_classifier is not None:
+            metrics_entry["lr_classifier"] = lr_classifier
 
         if lr_downstream is not None:
             metrics_entry["lr_downstream"] = lr_downstream
