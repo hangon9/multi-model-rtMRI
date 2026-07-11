@@ -594,19 +594,21 @@ def main():
         criterion = build_loss_from_config(config, device, class_weights=class_weights,
                                            bce_pos_weight=bce_pos_weight)
 
+        
         optimizer = build_optimizer(model, config, logger=logger)
 
-        # Build LR lookup by group name for logging (6 groups, some may be empty)
-        _lr_lookup = {g["name"]: g["lr"] for g in optimizer.param_groups}
+        # Save the intended peak LR before OneCycleLR modifies optimizer group LRs.
+        max_lrs = [group["lr"] for group in optimizer.param_groups]
 
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer,
-            max_lr=[group["lr"] for group in optimizer.param_groups],
+            max_lr=max_lrs,
             epochs=num_epochs,
             steps_per_epoch=len(train_loader),
             pct_start=0.3,
             anneal_strategy="cos",
-        )
+)
+
 
         # Track and save the best checkpoint within the current fold.
         # This is independent from the global best checkpoint across all folds.
@@ -619,6 +621,11 @@ def main():
                 model, train_loader, criterion, optimizer, scheduler, device,
                 classification_task=classification_task, grad_clip=grad_clip
             )
+
+            _lr_lookup = {
+                group["name"]: group["lr"]
+                for group in optimizer.param_groups
+            }
 
             logger.log_metrics(
                 fold_id=fold_id,
