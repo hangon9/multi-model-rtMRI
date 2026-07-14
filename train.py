@@ -168,6 +168,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
     running_loss = 0.0
     running_cls_loss = 0.0
     running_cos_loss = 0.0
+    running_task_losses = {}  # per-task losses in multi-task mode
 
     for batch in tqdm(dataloader, desc="Training"):
         image = batch["image"].to(device)
@@ -199,14 +200,21 @@ def train_one_epoch(model, dataloader, criterion, optimizer, scheduler, device, 
         running_loss += losses["loss"].item()
         running_cls_loss += losses["cls_loss"].item()
         running_cos_loss += losses["contrast_loss"].item()
+        for task_name in ("loss_manner", "loss_place", "loss_voicing", "loss_vowel_backness"):
+            if task_name in losses:
+                running_task_losses.setdefault(task_name, 0.0)
+                running_task_losses[task_name] += losses[task_name].item()
 
     n = len(dataloader)
 
-    return {
+    result = {
         "loss": running_loss / n,
         "cls_loss": running_cls_loss / n,
         "contrast_loss": running_cos_loss / n,
     }
+    for k, v in running_task_losses.items():
+        result[k] = v / n
+    return result
 
 @torch.no_grad()
 def validate_one_epoch(model, dataloader, criterion, device, classification_task=None):
@@ -216,6 +224,7 @@ def validate_one_epoch(model, dataloader, criterion, device, classification_task
     running_loss = 0.0
     running_cls_loss = 0.0
     running_cos_loss = 0.0
+    running_task_losses = {}  # per-task losses in multi-task mode
 
     for batch in tqdm(dataloader, desc="Validation"):
         image = batch["image"].to(device)
@@ -249,14 +258,21 @@ def validate_one_epoch(model, dataloader, criterion, device, classification_task
         running_loss += losses["loss"].item()
         running_cls_loss += losses["cls_loss"].item()
         running_cos_loss += losses["contrast_loss"].item()
+        for task_name in ("loss_manner", "loss_place", "loss_voicing", "loss_vowel_backness"):
+            if task_name in losses:
+                running_task_losses.setdefault(task_name, 0.0)
+                running_task_losses[task_name] += losses[task_name].item()
 
     n = len(dataloader)
 
-    return {
+    result = {
         "loss": running_loss / n,
         "cls_loss": running_cls_loss / n,
         "contrast_loss": running_cos_loss / n,
     }
+    for k, v in running_task_losses.items():
+        result[k] = v / n
+    return result
 
 def main():
     parser = argparse.ArgumentParser(description='Train 3D Grounding-DETR')
@@ -389,11 +405,19 @@ def main():
             )
 
             # Log training loss for every epoch
+            _task_suffix = ""
+            if "loss_manner" in train_log:
+                _task_suffix = (
+                    f"(m={train_log['loss_manner']:.3f} "
+                    f"p={train_log['loss_place']:.3f} "
+                    f"v={train_log['loss_voicing']:.3f} "
+                    f"vb={train_log['loss_vowel_backness']:.3f})"
+                )
+
             log_msg = (
                 f"Fold {fold_id}, Epoch {epoch + 1}: "
-                f"train_loss={train_log['loss']:.4f}, "
-                f"train_cls_loss={train_log['cls_loss']:.4f}, "
-                f"train_contrast_loss={train_log['contrast_loss']:.4f}"
+                f"L={train_log['loss']:.3f} {_task_suffix} "
+                f"contrast={train_log['contrast_loss']:.4f}"
             )
 
             # Validate every 5 epochs and on the last epoch
@@ -416,10 +440,18 @@ def main():
                 log_to_console=False,
             )
 
+                _val_task_suffix = ""
+                if "loss_manner" in val_log:
+                    _val_task_suffix = (
+                        f"(m={val_log['loss_manner']:.3f} "
+                        f"p={val_log['loss_place']:.3f} "
+                        f"v={val_log['loss_voicing']:.3f} "
+                        f"vb={val_log['loss_vowel_backness']:.3f})"
+                    )
+
                 log_msg += (
-                    f" | val_loss={val_log['loss']:.4f}, "
-                    f"val_cls_loss={val_log['cls_loss']:.4f}, "
-                    f"val_contrast_loss={val_log['contrast_loss']:.4f}"
+                    f" | L={val_log['loss']:.3f} {_val_task_suffix} "
+                    f"contrast={val_log['contrast_loss']:.4f}"
                 )
 
                 logger.info(log_msg)

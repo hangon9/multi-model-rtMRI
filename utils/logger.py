@@ -113,7 +113,7 @@ class TrainingLogger:
         epoch: int,
         phase: str,
         metrics: dict,
-        lr_encoder: float = None,
+        lr_backbone: float = None,
         lr_pooling: float = None,
         lr_classifier: float = None,
         lr_downstream: float = None,
@@ -149,9 +149,9 @@ class TrainingLogger:
                     if k.startswith('pred_'):
                         self.info(f"    {k}: {v:.4f}")
 
-            if lr_encoder is not None:
+            if lr_backbone is not None:
                 self.info("  Training Stats:")
-                self.info(f"    lr_encoder: {lr_encoder:.6f}")
+                self.info(f"    lr_backbone: {lr_backbone:.6f}")
 
             if lr_pooling is not None:
                 self.info(f"    lr_pooling: {lr_pooling:.6f}")
@@ -175,8 +175,8 @@ class TrainingLogger:
         if classification_task is not None:
             metrics_entry["classification_task"] = classification_task
 
-        if lr_encoder is not None:
-            metrics_entry["lr_encoder"] = lr_encoder
+        if lr_backbone is not None:
+            metrics_entry["lr_backbone"] = lr_backbone
 
         if lr_pooling is not None:
             metrics_entry["lr_pooling"] = lr_pooling

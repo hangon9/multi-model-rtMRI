@@ -197,7 +197,7 @@ def _build_wav2vec2_model(
     classification_task: str,
     device: torch.device,
 ) -> Wav2Vec2MultiHeadClassifier:
-    model_cfg = config.get("model", {}).get("audio_encoder", {})
+    model_cfg = config.get("model", {}).get("backbone", {})
 
     return Wav2Vec2MultiHeadClassifier(
         num_classes=NUM_CLASSES[classification_task],

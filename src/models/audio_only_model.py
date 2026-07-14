@@ -55,7 +55,7 @@ from src.models.conformer_encoder import ConformerBlock
 
 class AudioMultiHeadClassifier(nn.Module):
     """
-    Audio segment -> Wav2Vec2 Encoder -> Attention Pooling -> Multi-head MLP.
+    Audio segment -> Backbone -> Attention Pooling -> Multi-head MLP.
     """
     def __init__(
         self,
@@ -70,15 +70,15 @@ class AudioMultiHeadClassifier(nn.Module):
     ):
         super().__init__()
         self.classification_task = classification_task or ""
-        self.encoder = AudioSSLEncoder(
+        self.backbone = AudioSSLEncoder(
             model_name=model_name,
             freeze_feature_extractor=freeze_feature_extractor,
             freeze_transformer_layers=freeze_transformer_layers,
         )
-        self.pooling = AttentionPooling(self.encoder.hidden_size, attn_dim, dropout)
+        self.pooling = AttentionPooling(self.backbone.hidden_size, attn_dim, dropout)
         self.classifier = ClassificationHead(
             input_type="pooled",
-            input_dim=self.encoder.hidden_size,
+            input_dim=self.backbone.hidden_size,
             hidden_dim=clf_hidden_dim,
             dropout=dropout,
             classification_task=classification_task,
@@ -87,7 +87,7 @@ class AudioMultiHeadClassifier(nn.Module):
         )
 
     def forward(self, audio: torch.Tensor, attention_mask: torch.Tensor | None = None, classification_task=None) -> dict[str, torch.Tensor]:
-        hidden = self.encoder(audio, attention_mask=attention_mask)   # (B, T, D)
+        hidden = self.backbone(audio, attention_mask=attention_mask)   # (B, T, D)
         pooled, attn_weights = self.pooling(hidden)                   # (B, D), (B, T)
         active_classification_task = self.classification_task if classification_task is None else classification_task
         
