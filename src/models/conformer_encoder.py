@@ -223,7 +223,7 @@ class ConformerEncoder(nn.Module):
     def __init__(
         self,
         d_model,
-        num_layers=4,
+        num_layers=2,
         num_heads=8,
         ffn_expansion_factor=4,
         conv_kernel_size=31,
