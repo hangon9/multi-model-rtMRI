@@ -259,73 +259,45 @@ def _is_no_decay_param(name: str) -> bool:
 
 
 def get_optimizer_hparams(config):
-    """
-    Read optimizer hyperparameters WITHOUT requiring any YAML schema change.
-
-    Supported keys (preferred under train):
-      - train.lr_backbone   : LR for pretrained audio backbone (Wav2Vec2)
-      - train.lr_pooling    : LR for AttentionPooling
-      - train.lr_classifier : LR for ClassificationHead
-      - train.lr            : fallback LR if any key is missing
-      - train.weight_decay  : weight decay for decay groups
-
-    Backward-compatible fallbacks:
-      - loss.lr_downstream                  → lr_pooling / lr_classifier
-
-    Bias / LayerNorm / norm parameters always use weight_decay=0.0.
-    """
+    """Read optimizer hyperparameters with backward-compatible fallbacks."""
     train_cfg = config.get("train", {})
     model_cfg = config.get("model", {}).get("backbone", {})
-    loss_cfg  = config.get("loss", {})
+    loss_cfg = config.get("loss", {})
 
     fallback_lr = train_cfg.get("lr", 1e-5)
     backbone_lr = train_cfg.get(
-        "lr_backbone", fallback_lr
+        "lr_backbone", model_cfg.get("lr_audio_encoder", fallback_lr)
     )
-    # lr_downstream used as fallback for both pooling and classifier
     downstream_fallback = loss_cfg.get("lr_downstream", fallback_lr)
-    pooling_lr    = train_cfg.get("lr_pooling",    downstream_fallback)
+    encoder_lr = train_cfg.get("lr_encoder", downstream_fallback)
     classifier_lr = train_cfg.get("lr_classifier", downstream_fallback)
-
-    # Important: if weight_decay is not explicitly passed in YAML, use 0.0.
-    weight_decay  = train_cfg.get("weight_decay", 0.0)
+    global_lr = train_cfg.get(
+        "lr_global", train_cfg.get("lr_pooling", downstream_fallback)
+    )
+    weight_decay = train_cfg.get("weight_decay", 0.0)
 
     return {
-        "backbone_lr":   float(backbone_lr),
-        "pooling_lr": float(pooling_lr),
+        "backbone_lr": float(backbone_lr),
+        "encoder_lr": float(encoder_lr),
         "classifier_lr": float(classifier_lr),
+        "global_lr": float(global_lr),
         "weight_decay": float(weight_decay),
     }
 
 
 def build_optimizer(model, config, logger=None):
-    """
-    Build AdamW optimizer with 6 parameter groups:
-      1. backbone_decay       : pretrained backbone params with weight decay
-      2. backbone_no_decay    : pretrained backbone bias/norm params, no weight decay
-      3. pooling_decay       : AttentionPooling params with weight decay
-      4. pooling_no_decay    : AttentionPooling bias/norm params, no weight decay
-      5. classifier_decay    : ClassificationHead params with weight decay
-      6. classifier_no_decay : ClassificationHead bias/norm params, no weight decay
-
-    In AudioMultiHeadClassifier:
-      - self.backbone    → "backbone.*"  parameters
-      - self.pooling     → "pooling.*"  parameters
-      - self.classifier  → everything else ("classifier.*")
-    """
+    """Build AdamW with backbone, encoder, classifier, and global groups."""
     hparams = get_optimizer_hparams(config)
     backbone_lr = hparams["backbone_lr"]
-    pooling_lr = hparams["pooling_lr"]
+    encoder_lr = hparams["encoder_lr"]
     classifier_lr = hparams["classifier_lr"]
+    global_lr = hparams["global_lr"]
     weight_decay = hparams["weight_decay"]
 
     buckets = {
-        "backbone_decay": [],
-        "backbone_no_decay": [],
-        "pooling_decay": [],
-        "pooling_no_decay": [],
-        "classifier_decay": [],
-        "classifier_no_decay": [],
+        f"{group}_{decay}": []
+        for group in ("backbone", "encoder", "classifier", "global")
+        for decay in ("decay", "no_decay")
     }
 
     for name, param in model.named_parameters():
@@ -333,29 +305,33 @@ def build_optimizer(model, config, logger=None):
             continue
 
         is_no_decay = _is_no_decay_param(name)
-
         if name.startswith("backbone."):
-            bucket = "backbone_no_decay" if is_no_decay else "backbone_decay"
-        elif name.startswith("pooling."):
-            bucket = "pooling_no_decay" if is_no_decay else "pooling_decay"
+            group = "backbone"
+        elif name.startswith("encoder.") or name.startswith("norm."):
+            group = "encoder"
+        elif name.startswith("classifier."):
+            group = "classifier"
         else:
-            bucket = "classifier_no_decay" if is_no_decay else "classifier_decay"
+            group = "global"
 
-        buckets[bucket].append(param)
+        decay = "no_decay" if is_no_decay else "decay"
+        buckets[f"{group}_{decay}"].append(param)
 
     group_specs = [
-        ("backbone_decay",     backbone_lr,   weight_decay),
-        ("backbone_no_decay",  backbone_lr,   0.0),
-        ("pooling_decay", pooling_lr, weight_decay),
-        ("pooling_no_decay", pooling_lr, 0.0),
+        ("backbone_decay", backbone_lr, weight_decay),
+        ("backbone_no_decay", backbone_lr, 0.0),
+        ("encoder_decay", encoder_lr, weight_decay),
+        ("encoder_no_decay", encoder_lr, 0.0),
         ("classifier_decay", classifier_lr, weight_decay),
         ("classifier_no_decay", classifier_lr, 0.0),
+        ("global_decay", global_lr, weight_decay),
+        ("global_no_decay", global_lr, 0.0),
     ]
 
     param_groups = []
     for group_name, lr, wd in group_specs:
         params = buckets[group_name]
-        if len(params) == 0:
+        if not params:
             continue
         param_groups.append({
             "name": group_name,
@@ -364,8 +340,10 @@ def build_optimizer(model, config, logger=None):
             "weight_decay": wd,
         })
 
-    if len(param_groups) == 0:
-        raise ValueError("No trainable parameters found. Check freeze settings and requires_grad flags.")
+    if not param_groups:
+        raise ValueError(
+            "No trainable parameters found. Check freeze settings and requires_grad flags."
+        )
 
     if logger is not None:
         for group in param_groups:
@@ -533,6 +511,8 @@ def main():
     config = load_config(args.config)
     train_cfg = config.get("train", {})
     model_cfg = config.get("model", {}).get("backbone", {})
+    encoder_cfg = config.get("model", {}).get("encoder", {})
+    data_cfg = config.get("data", {})
     classification_task = config.get("data", {}).get("classification_task", "") or ""
     grad_clip = train_cfg.get("grad_clip", 0.5)
 
@@ -584,6 +564,12 @@ def main():
             clf_hidden_dim=model_cfg.get("clf_hidden_dim", 256),
             dropout=model_cfg.get("dropout", 0.1),
             classification_task=classification_task,
+            encoder_type=encoder_cfg.get("encoder_type", "attention"),
+            conformer_layers=encoder_cfg.get("conformer_layers", 2),
+            conformer_heads=encoder_cfg.get("conformer_heads", 8),
+            conv_kernel_size=encoder_cfg.get("conv_kernel_size", 17),
+            audio_window_sec=data_cfg.get("audio_window_sec", 0.06667),
+            sample_rate=data_cfg.get("audio_sample_rate", 16000),
         ).to(device)
 
         # ---- loss & optimizer & scheduler ----
@@ -625,14 +611,16 @@ def main():
                 for group in optimizer.param_groups
             }
 
+
             logger.log_metrics(
                 fold_id=fold_id,
                 epoch=epoch,
                 phase="training",
                 metrics=train_log,
                 lr_backbone=_lr_lookup.get("backbone_decay", _lr_lookup.get("backbone_no_decay", 0.0)),
-                lr_pooling=_lr_lookup.get("pooling_decay", _lr_lookup.get("pooling_no_decay", 0.0)),
+                lr_encoder=_lr_lookup.get("encoder_decay", _lr_lookup.get("encoder_no_decay", 0.0)),
                 lr_classifier=_lr_lookup.get("classifier_decay", _lr_lookup.get("classifier_no_decay", 0.0)),
+                lr_global=_lr_lookup.get("global_decay", _lr_lookup.get("global_no_decay", 0.0)),
                 classification_task=classification_task,
                 log_to_console=False,
             )
@@ -670,8 +658,9 @@ def main():
                     phase="validation",
                     metrics=val_log,
                     lr_backbone=_lr_lookup.get("backbone_decay", _lr_lookup.get("backbone_no_decay", 0.0)),
-                    lr_pooling=_lr_lookup.get("pooling_decay", _lr_lookup.get("pooling_no_decay", 0.0)),
+                    lr_encoder=_lr_lookup.get("encoder_decay", _lr_lookup.get("encoder_no_decay", 0.0)),
                     lr_classifier=_lr_lookup.get("classifier_decay", _lr_lookup.get("classifier_no_decay", 0.0)),
+                    lr_global=_lr_lookup.get("global_decay", _lr_lookup.get("global_no_decay", 0.0)),
                     classification_task=classification_task,
                     log_to_console=False,
                 )
