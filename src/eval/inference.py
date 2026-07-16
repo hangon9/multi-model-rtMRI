@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 
 from src.models.contrastive_model import AudioVisionContrastiveModel
-from src.models.audio_only_model import Wav2Vec2MultiHeadClassifier
+from src.models.audio_only_model import AudioMultiHeadClassifier
 from data.splits import make_train_test_split, create_dataloader
 
 
@@ -196,10 +196,12 @@ def _build_wav2vec2_model(
     config: dict[str, Any],
     classification_task: str,
     device: torch.device,
-) -> Wav2Vec2MultiHeadClassifier:
+) -> AudioMultiHeadClassifier:
     model_cfg = config.get("model", {}).get("backbone", {})
+    encoder_cfg = config.get("model", {}).get("encoder", {})
+    data_cfg = config.get("data", {})
 
-    return Wav2Vec2MultiHeadClassifier(
+    return AudioMultiHeadClassifier(
         num_classes=NUM_CLASSES[classification_task],
         model_name=model_cfg.get("model_name", "facebook/wav2vec2-base"),
         freeze_feature_extractor=model_cfg.get("freeze_feature_extractor", True),
@@ -208,6 +210,12 @@ def _build_wav2vec2_model(
         clf_hidden_dim=model_cfg.get("clf_hidden_dim", 256),
         dropout=model_cfg.get("dropout", 0.1),
         classification_task=classification_task,
+        encoder_type=encoder_cfg.get("encoder_type", "attention"),
+        conformer_layers=encoder_cfg.get("conformer_layers", 2),
+        conformer_heads=encoder_cfg.get("conformer_heads", 8),
+        conv_kernel_size=encoder_cfg.get("conv_kernel_size", 17),
+        audio_window_sec=data_cfg.get("audio_window_sec", 0.06667),
+        sample_rate=data_cfg.get("audio_sample_rate", 16000),
     ).to(device)
 
 
