@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from src.models.attention_pooling import AttentionPooling
+from src.models.attention_pooling import AttentionPooling, CenterBiasedAttentionPooling, center_context_pooling
 from src.models.audio_ssl_encoder import AudioSSLEncoder
 from src.models.classifier import ClassificationHead
 from src.models.conformer_encoder import ConformerEncoder
@@ -51,8 +51,14 @@ class AudioMultiHeadClassifier(nn.Module):
                 conv_kernel_size=conv_kernel_size,
                 dropout=dropout,
             )
-            detected_t = self._detect_num_tokens(audio_window_sec, sample_rate)
-            classifier_input_dim = detected_t * self.backbone.hidden_size
+            self.norm2 = nn.LayerNorm(self.backbone.hidden_size)
+            self.pooling = CenterBiasedAttentionPooling(
+                hidden_size=self.backbone.hidden_size,
+                attention_dim=attn_dim,
+                dropout=dropout,
+            )
+            # Center attention pooling returns a single [B, D] embedding.
+            classifier_input_dim = self.backbone.hidden_size
         else:
             self.pooling = AttentionPooling(
                 self.backbone.hidden_size, attn_dim, dropout
@@ -99,9 +105,9 @@ class AudioMultiHeadClassifier(nn.Module):
 
         if self.encoder_type == "conformer":
             x = self.norm(hidden)
-            x = self.encoder(x)
-            pooled = x.flatten(1)
-            attn_weights = None
+            x = self.encoder(x, padding_mask=attention_mask)
+            x = self.norm2(x)
+            pooled, attn_weights = self.pooling(x, padding_mask=attention_mask)
         else:
             pooled, attn_weights = self.pooling(hidden)
 
