@@ -111,6 +111,7 @@ def create_dataloader(
     num_workers = cfg_train.get("num_workers", 4)
     fps = cfg_data.get("fps", 15)
     audio_window_sec = cfg_data.get("audio_window_sec", 0.06667)
+    data_augment = cfg_train.get("data_augment", False)
 
     if cfg_data["dataset"] == "USC-annot-16":
         dataset = USCAnnot16Dataset(
@@ -124,6 +125,7 @@ def create_dataloader(
         label_columns=None,
         cache_audio=True,
         train=train,
+        data_augment=data_augment,
         )
     
 

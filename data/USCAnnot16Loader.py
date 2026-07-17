@@ -1,4 +1,6 @@
 import os
+import re
+import random
 import pandas as pd
 import numpy as np
 
@@ -31,6 +33,7 @@ class USCAnnot16Dataset(Dataset):
         train=True,
         label_columns=None,
         cache_audio=True,
+        data_augment=False,
     ):
         self.df = dataframe.reset_index(drop=True)
         self.image_size = image_size
@@ -40,7 +43,8 @@ class USCAnnot16Dataset(Dataset):
         self.train = train
         self.cache_audio = cache_audio
         self.audio_cache = {}
-        self.data_root = None  
+        self.data_root = None
+        self.data_augment = data_augment and train  # augmentation only in training mode  
 
         # ------------------------------------------------------------------
         # 2. Validate required columns
@@ -77,9 +81,15 @@ class USCAnnot16Dataset(Dataset):
                 raise ValueError(f"Label column '{col}' not found in DataFrame")
 
         # ------------------------------------------------------------------
-        # 5. Transforms & sanity check
+        # 5. Transforms, per-subject-task max frame index & sanity check
         # ------------------------------------------------------------------
-        self.image_transform = self._build_image_transform(train)
+        self.image_transform = self._build_image_transform(train, self.data_augment)
+
+        # Precompute max frame_idx per (subject, task) for clamping random shift
+        self._max_frame = {}
+        if self.data_augment:
+            grouped = self.df.groupby(["subject", "task"])["frame_idx"]
+            self._max_frame = grouped.max().to_dict()
 
         if len(self.df) == 0:
             raise RuntimeError(
@@ -88,10 +98,10 @@ class USCAnnot16Dataset(Dataset):
             )
 
     # ------------------------------------------------------------------
-    # Image transform (unchanged)
+    # Image transform
     # ------------------------------------------------------------------
-    def _build_image_transform(self, train):
-        if train:
+    def _build_image_transform(self, train, data_augment=False):
+        if train and data_augment:
             return T.Compose([
                 T.Resize((self.image_size, self.image_size)),
                 T.RandomAffine(degrees=3, translate=(0.02, 0.02), scale=(0.98, 1.02)),
@@ -151,6 +161,40 @@ class USCAnnot16Dataset(Dataset):
         return segment
 
     # ------------------------------------------------------------------
+    # Random time shift (image + audio)
+    # ------------------------------------------------------------------
+    def _apply_random_shift(self, row, audio_segment):
+        """Randomly shift both image (by loading adjacent frame) and audio (by roll).
+        Returns (image_path, audio_segment) potentially modified."""
+        max_shift_frames = 2
+        delta_t = random.randint(-max_shift_frames, max_shift_frames)
+
+        if delta_t == 0:
+            return row["image_path"], audio_segment
+
+        frame_idx = int(row["frame_idx"])
+        subject = row["subject"]
+        task = row["task"]
+
+        # --- Image shift: load neighboring frame ---
+        new_frame_idx = frame_idx + delta_t
+        max_f = self._max_frame.get((subject, task), frame_idx)
+        new_frame_idx = max(0, min(new_frame_idx, max_f))
+
+        # Replace frame index in image path (pattern: _XXXX_image.png)
+        shifted_path = re.sub(
+            r"_(\d{4})_image\.png$",
+            f"_{new_frame_idx:04d}_image.png",
+            row["image_path"],
+        )
+
+        # --- Audio shift: roll the waveform ---
+        shift_samples = int(round(delta_t * self.target_sample_rate / self.fps))
+        audio_segment = torch.roll(audio_segment, shifts=shift_samples)
+
+        return shifted_path, audio_segment
+
+    # ------------------------------------------------------------------
     # Dataset protocol
     # ------------------------------------------------------------------
     def __len__(self):
@@ -163,8 +207,13 @@ class USCAnnot16Dataset(Dataset):
         audio_path = row["audio_path"]
         frame_idx = int(row["frame_idx"])
 
-        image = self._load_image(image_path)
         audio_segment = self._load_audio_segment(audio_path, frame_idx)
+
+        # ── Random time shift augmentation (image + audio) ──
+        if self.data_augment:
+            image_path, audio_segment = self._apply_random_shift(row, audio_segment)
+
+        image = self._load_image(image_path)
 
         vals = row[self.label_columns].values.astype(np.float32)
 
