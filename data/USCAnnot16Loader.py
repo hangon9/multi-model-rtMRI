@@ -44,7 +44,19 @@ class USCAnnot16Dataset(Dataset):
         self.cache_audio = cache_audio
         self.audio_cache = {}
         self.data_root = None
-        self.data_augment = data_augment and train  # augmentation only in training mode  
+
+        # Normalize aug config: bool → dict for backward compat
+        if isinstance(data_augment, bool):
+            self.aug_cfg = {
+                "Random_Affine": data_augment,
+                "random_time_shift": 2 if data_augment else 0,
+                "VTLP": False,
+                "pitch_shift": False,
+            } if (data_augment and train) else {}
+        elif data_augment and train:
+            self.aug_cfg = data_augment
+        else:
+            self.aug_cfg = {}  
 
         # ------------------------------------------------------------------
         # 2. Validate required columns
@@ -83,11 +95,13 @@ class USCAnnot16Dataset(Dataset):
         # ------------------------------------------------------------------
         # 5. Transforms, per-subject-task max frame index & sanity check
         # ------------------------------------------------------------------
-        self.image_transform = self._build_image_transform(train, self.data_augment)
+        self.image_transform = self._build_image_transform(
+            train, self.aug_cfg.get("Random_Affine", False)
+        )
 
         # Precompute max frame_idx per (subject, task) for clamping random shift
         self._max_frame = {}
-        if self.data_augment:
+        if self.aug_cfg.get("random_time_shift", 0) > 0:
             grouped = self.df.groupby(["subject", "task"])["frame_idx"]
             self._max_frame = grouped.max().to_dict()
 
@@ -166,7 +180,10 @@ class USCAnnot16Dataset(Dataset):
     def _apply_random_shift(self, row, audio_segment):
         """Randomly shift both image (by loading adjacent frame) and audio (by roll).
         Returns (image_path, audio_segment) potentially modified."""
-        max_shift_frames = 2
+        max_shift_frames = self.aug_cfg.get("random_time_shift", 0)
+        if max_shift_frames <= 0:
+            return row["image_path"], audio_segment
+
         delta_t = random.randint(-max_shift_frames, max_shift_frames)
 
         if delta_t == 0:
@@ -195,6 +212,65 @@ class USCAnnot16Dataset(Dataset):
         return shifted_path, audio_segment
 
     # ------------------------------------------------------------------
+    # VTLP: Vocal Tract Length Perturbation
+    # ------------------------------------------------------------------
+    VTLP_PROB = 0.3          # probability of applying VTLP
+    VTLP_ALPHA_MIN = 0.95    # min warping factor
+    VTLP_ALPHA_MAX = 1.05    # max warping factor
+
+    def _apply_vtlp(self, audio_segment):
+        """Apply VTLP by resampling: sr → alpha*sr → sr, then pad/trim to original length."""
+        if not self.aug_cfg.get("VTLP", False):
+            return audio_segment
+        if random.random() > self.VTLP_PROB:
+            return audio_segment
+
+        alpha = random.uniform(self.VTLP_ALPHA_MIN, self.VTLP_ALPHA_MAX)
+        orig_len = audio_segment.shape[-1]
+        sr = self.target_sample_rate
+
+        # Step 1: resample to alpha * sr (stretches/compresses waveform)
+        resampler1 = torchaudio.transforms.Resample(
+            orig_freq=sr, new_freq=int(sr * alpha)
+        )
+        warped = resampler1(audio_segment.unsqueeze(0)).squeeze(0)
+
+        # Step 2: resample back to original sr
+        resampler2 = torchaudio.transforms.Resample(
+            orig_freq=int(sr * alpha), new_freq=sr
+        )
+        warped = resampler2(warped.unsqueeze(0)).squeeze(0)
+
+        # Pad or trim to match original length
+        if warped.shape[-1] < orig_len:
+            warped = torch.nn.functional.pad(warped, (0, orig_len - warped.shape[-1]))
+        elif warped.shape[-1] > orig_len:
+            warped = warped[:orig_len]
+
+        return warped
+
+    # ------------------------------------------------------------------
+    # Pitch shift
+    # ------------------------------------------------------------------
+    PITCH_PROB = 0.25         # probability of applying pitch shift
+    PITCH_SEMITONES = 1.0     # ± semitones range
+
+    def _apply_pitch_shift(self, audio_segment):
+        """Apply random pitch shift within ±1 semitone."""
+        if not self.aug_cfg.get("pitch_shift", False):
+            return audio_segment
+        if random.random() > self.PITCH_PROB:
+            return audio_segment
+
+        n_steps = random.uniform(-self.PITCH_SEMITONES, self.PITCH_SEMITONES)
+        shifted = torchaudio.functional.pitch_shift(
+            audio_segment.unsqueeze(0),
+            sample_rate=self.target_sample_rate,
+            n_steps=n_steps,
+        ).squeeze(0)
+        return shifted
+
+    # ------------------------------------------------------------------
     # Dataset protocol
     # ------------------------------------------------------------------
     def __len__(self):
@@ -209,9 +285,12 @@ class USCAnnot16Dataset(Dataset):
 
         audio_segment = self._load_audio_segment(audio_path, frame_idx)
 
+        # ── Audio augmentations (VTLP → pitch_shift) ──
+        audio_segment = self._apply_vtlp(audio_segment)
+        audio_segment = self._apply_pitch_shift(audio_segment)
+
         # ── Random time shift augmentation (image + audio) ──
-        if self.data_augment:
-            image_path, audio_segment = self._apply_random_shift(row, audio_segment)
+        image_path, audio_segment = self._apply_random_shift(row, audio_segment)
 
         image = self._load_image(image_path)
 
