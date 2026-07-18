@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
-from sklearn.metrics import confusion_matrix
+from sklearn.metrics import confusion_matrix, multilabel_confusion_matrix
 
 from src.eval.inference import TASKS, run_inference
 from src.eval.metrics import compute_metrics
@@ -48,6 +48,7 @@ from src.eval.visualize import (
     plot_all_folds_val_loss,
     plot_task_prf1,
     plot_task_confusion,
+    plot_task_multilabel_confusion,
 )
 
 
@@ -59,11 +60,11 @@ CLASS_NAMES: Dict[str, List[str]] = {
         "Silence", "Stop", "Nasal", "Fricative", "Approximant", "Vowel",
     ],
     "place": [
-        "Silence", "Labial", "Dental", "Alveolar", "Postalveolar",
+        "Labial", "Dental", "Alveolar", "Postalveolar",
         "Palatal", "Velar", "Glottal",
     ],
     "voicing": [
-        "Silence", "Voiced", "Voiceless",
+        "Voiced", "Voiceless",
     ],
     "vowel_backness": [
         "Front", "Central", "Back",
@@ -266,6 +267,7 @@ def _build_report_obj(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     class_names: List[str],
+    multilabel: bool = False,
 ) -> Dict[str, Any]:
     metrics = compute_metrics(y_true, y_pred, class_names)
 
@@ -278,18 +280,24 @@ def _build_report_obj(
                 "f1":        float(metrics["per_class"][name]["f1"]),
             }
 
-    cm = confusion_matrix(y_true, y_pred, labels=range(len(class_names)))
-
-    return {
+    result: Dict[str, Any] = {
         "per_class": per_class,
         "macro avg": {
             "precision": float(metrics["macro_precision"]),
             "recall":    float(metrics["macro_recall"]),
             "f1":        float(metrics["macro_f1"]),
         },
-        "confusion_matrix": cm.tolist(),
         "class_names": class_names,
     }
+
+    if multilabel:
+        mcm = multilabel_confusion_matrix(y_true, y_pred)
+        result["multilabel_confusion_matrix"] = mcm.tolist()
+    else:
+        cm = confusion_matrix(y_true, y_pred, labels=range(len(class_names)))
+        result["confusion_matrix"] = cm.tolist()
+
+    return result
 
 
 def _save_metrics_json(
@@ -347,8 +355,11 @@ def _generate_task_plots(
 ) -> None:
     for task in results:
         if task == "vowel_backness":
-            print("[evaluate] Skipping vowel_backness metrics (multi-label BCE, "
-                  "not yet supported in the integer-label pipeline).")
+            report_obj = _build_report_obj(y_true, y_pred, CLASS_NAMES[task], multilabel=True)
+            _save_metrics_json(report_obj, task, metrics_dir)
+            plot_task_prf1(report_obj, task, figures_dir)
+            plot_task_multilabel_confusion(report_obj, task, figures_dir)
+            print(f"[evaluate] Saved PRF1 & multilabel confusion plots for task={task}")
             continue
         y_true = results[task]["labels"]
         y_pred = results[task]["preds"]

@@ -18,8 +18,9 @@ from data.splits import make_train_test_split, create_dataloader
 NUM_CLASSES: dict[str, int] = {
     "": 18,
     "manner": 6,
-    "place": 8,
-    "voicing": 3,
+    "place": 7,
+    "voicing": 2,
+    "vowel_backness": 3,
 }
 
 TASKS: tuple[str, ...] = ("manner", "place", "voicing", "vowel_backness")
@@ -368,10 +369,12 @@ def run_inference(
     # ── Inference loop ───────────────────────────────────────────────────────
     preds_by_task:  dict[str, list[torch.Tensor]] = {t: [] for t in active_tasks}
     labels_by_task: dict[str, list[torch.Tensor]] = {t: [] for t in active_tasks}
+    manner_chunks:  list[torch.Tensor] = []
 
     with torch.no_grad():
         for batch in test_loader:
             output = _forward(model, batch, model_family, device_obj)
+            manner_chunks.append(_extract_labels(batch, "manner").detach().cpu())
 
             for task in active_tasks:
                 logits = _extract_logits(output, task, active_tasks)
@@ -385,13 +388,22 @@ def run_inference(
                 preds_by_task[task].append(preds.detach().cpu())
                 labels_by_task[task].append(labels.detach().cpu())
 
-    results: dict[str, dict[str, np.ndarray]] = {
-        task: {
-            "preds":  torch.cat(preds_by_task[task],  dim=0).numpy(),
-            "labels": torch.cat(labels_by_task[task], dim=0).numpy(),
-        }
-        for task in active_tasks
-    }
+    # ── Gate by manner class ─────────────────────────────────────────────────
+    manner_all = torch.cat(manner_chunks, dim=0).numpy()
+    cons_mask  = (manner_all >= 1) & (manner_all <= 4)   # Stop/Nasal/Fricative/Approximant
+    vowel_mask = manner_all == 5
+
+    results: dict[str, dict[str, np.ndarray]] = {}
+    for task in active_tasks:
+        preds  = torch.cat(preds_by_task[task],  dim=0).numpy()
+        labels = torch.cat(labels_by_task[task], dim=0).numpy()
+        if task in ("place", "voicing"):
+            mask = cons_mask
+        elif task == "vowel_backness":
+            mask = vowel_mask
+        else:  # manner
+            mask = np.ones_like(manner_all, dtype=bool)
+        results[task] = {"preds": preds[mask], "labels": labels[mask]}
 
     meta = {
         "fold":                ckpt.get("fold"),

@@ -53,6 +53,8 @@ except Exception:  # pragma: no cover
     ConfusionMatrixDisplay = None
 
 # Prefer your project's canonical class names if available.
+try:
+    from src.eval.evaluate import CLASS_NAMES as PROJECT_CLASS_NAMES
 except Exception:  # pragma: no cover
     PROJECT_CLASS_NAMES = None
 
@@ -470,6 +472,32 @@ def plot_task_confusion(report_obj: Mapping[str, Any], task: str, out_dir: Path)
     ax.set_xlabel("Predicted Label")
     ax.set_ylabel("True Label")
     plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
+    fig.tight_layout()
+    fig.savefig(out_dir / f"{task}_confusion.png", dpi=200)
+    plt.close(fig)
+
+
+def plot_task_multilabel_confusion(
+    report_obj: Mapping[str, Any],
+    task: str,
+    out_dir: Path,
+) -> None:
+    """Plot per-label 2×2 confusion matrices for multilabel tasks (e.g. vowel_backness)."""
+    mcm = np.asarray(report_obj.get("multilabel_confusion_matrix"))
+    labels = report_obj.get("class_names", [])
+    if mcm.size == 0 or not labels:
+        print(f"[WARN] No multilabel_confusion_matrix for task={task}; skip.")
+        return
+
+    fig, axes = plt.subplots(1, len(labels), figsize=(3.2 * len(labels), 3.2))
+    for ax, name, cm in zip(np.atleast_1d(axes), labels, mcm):
+        cm_norm = row_normalize(cm.astype(float))
+        if ConfusionMatrixDisplay is not None:
+            ConfusionMatrixDisplay(cm_norm, display_labels=["Neg", "Pos"]).plot(
+                ax=ax, cmap="Blues", values_format=".2f", colorbar=False
+            )
+        ax.set_title(name)
+    fig.suptitle(f"{task.capitalize()} Per-label Confusion (row-normalized)")
     fig.tight_layout()
     fig.savefig(out_dir / f"{task}_confusion.png", dpi=200)
     plt.close(fig)
