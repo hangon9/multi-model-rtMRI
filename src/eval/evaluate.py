@@ -49,6 +49,7 @@ from src.eval.visualize import (
     plot_task_prf1,
     plot_task_confusion,
     plot_task_multilabel_confusion,
+    plot_task_prf1_fold_comparison,
 )
 
 
@@ -182,8 +183,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-dir",
         type=str,
-        required=True,
-        help="Directory to store all evaluation outputs",
+        default=None,
+        help=(
+            "Directory to store all evaluation outputs. If omitted, the "
+            "explicit or auto-detected log directory is used."
+        ),
     )
     parser.add_argument(
         "--device",
@@ -202,6 +206,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-inference",
         action="store_true",
         help="Skip re-running inference; load cached results from raw/results.pkl",
+    )
+    parser.add_argument(
+        "--eval-folds",
+        action="store_true",
+        help="Run fold-comparison evaluation for best_model_fold_*.pt checkpoints",
     )
     return parser
 
@@ -313,6 +322,155 @@ def _save_metrics_json(
     print(f"[evaluate] Saved metrics → {out}")
 
 
+def _aggregate_fold_metrics(
+    per_fold_reports: dict[int, dict],
+    class_names: list[str],
+) -> dict[str, dict]:
+    """Aggregate per-fold precision/recall/F1 into mean/std summaries."""
+    def _summary(values_by_fold: dict[int, float]) -> Dict[str, Any]:
+        ordered_folds = dict(sorted(values_by_fold.items()))
+        values = np.asarray(list(ordered_folds.values()), dtype=float)
+        return {
+            "folds": ordered_folds,
+            "mean": float(values.mean()) if values.size else float("nan"),
+            "std": float(values.std(ddof=0)) if values.size else float("nan"),
+        }
+
+    def _collect_metric(source_key: str, metric_name: str) -> dict[int, float]:
+        collected: dict[int, float] = {}
+        for fold_id, report_obj in sorted(per_fold_reports.items()):
+            source = report_obj.get(source_key)
+            if not isinstance(source, dict):
+                continue
+            metric_block = source.get(metric_name)
+            if metric_block is None:
+                continue
+            try:
+                collected[fold_id] = float(metric_block)
+            except Exception:
+                continue
+        return collected
+
+    aggregated: dict[str, dict] = {}
+    per_class_source = {fold_id: report.get("per_class", {}) for fold_id, report in per_fold_reports.items()}
+
+    for class_name in class_names:
+        class_metrics: dict[str, Dict[str, Any]] = {}
+        for metric_name in ("precision", "recall", "f1"):
+            values_by_fold: dict[int, float] = {}
+            for fold_id, per_class in sorted(per_class_source.items()):
+                if not isinstance(per_class, dict):
+                    continue
+                metric_block = per_class.get(class_name, {})
+                if not isinstance(metric_block, dict) or metric_name not in metric_block:
+                    continue
+                try:
+                    values_by_fold[fold_id] = float(metric_block[metric_name])
+                except Exception:
+                    continue
+            class_metrics[metric_name] = _summary(values_by_fold)
+        aggregated[class_name] = class_metrics
+
+    macro_metrics: dict[str, Dict[str, Any]] = {}
+    for metric_name in ("precision", "recall", "f1"):
+        values_by_fold: dict[int, float] = {}
+        for fold_id, report_obj in sorted(per_fold_reports.items()):
+            macro = report_obj.get("macro avg", {})
+            if not isinstance(macro, dict) or metric_name not in macro:
+                continue
+            try:
+                values_by_fold[fold_id] = float(macro[metric_name])
+            except Exception:
+                continue
+        macro_metrics[metric_name] = _summary(values_by_fold)
+    aggregated["Macro Avg"] = macro_metrics
+
+    return aggregated
+
+
+def _save_fold_comparison_json(report_obj: Dict[str, Any], task: str, metrics_dir: Path) -> None:
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    out = metrics_dir / f"{task}_fold_comparison.json"
+    with out.open("w", encoding="utf-8") as f:
+        json.dump(report_obj, f, indent=2, ensure_ascii=False)
+    print(f"[evaluate] Saved fold-comparison metrics → {out}")
+
+
+def _run_fold_comparison(
+    checkpoint_dir: str | Path,
+    device: str,
+    eval_mode: str,
+    out_dir: Path,
+    skip_inference: bool = False,
+) -> None:
+    from src.eval.inference import discover_fold_checkpoints, run_inference_all_folds
+
+    checkpoint_dir = Path(checkpoint_dir)
+    figures_dir = out_dir / "figures"
+    metrics_dir = out_dir / "metrics"
+    raw_dir = out_dir / "raw"
+
+    ensure_dir(figures_dir)
+    ensure_dir(metrics_dir)
+    ensure_dir(raw_dir)
+
+    fold_checkpoints = discover_fold_checkpoints(checkpoint_dir)
+    if not fold_checkpoints:
+        print(f"[evaluate] No best_model_fold_*.pt files found in {checkpoint_dir}; skipping fold comparison.")
+        return
+
+    per_fold: Dict[int, Tuple[Dict[str, Dict[str, np.ndarray]], Dict[str, Any]]] = {}
+    if skip_inference:
+        missing_folds: list[int] = []
+        for fold_id in fold_checkpoints:
+            cache_path = raw_dir / f"results_fold{fold_id}.pkl"
+            if cache_path.exists():
+                print(f"[evaluate] Loading cached fold results from {cache_path}")
+                with cache_path.open("rb") as f:
+                    per_fold[fold_id] = pickle.load(f)
+            else:
+                missing_folds.append(fold_id)
+
+        if missing_folds:
+            print(f"[evaluate] Running inference for missing folds: {missing_folds}")
+            fresh = run_inference_all_folds(checkpoint_dir, device=device, eval_mode=eval_mode)
+            for fold_id, value in fresh.items():
+                cache_path = raw_dir / f"results_fold{fold_id}.pkl"
+                with cache_path.open("wb") as f:
+                    pickle.dump(value, f)
+                per_fold[fold_id] = value
+    else:
+        print("[evaluate] Running fold-comparison inference ...")
+        per_fold = run_inference_all_folds(checkpoint_dir, device=device, eval_mode=eval_mode)
+        for fold_id, value in per_fold.items():
+            cache_path = raw_dir / f"results_fold{fold_id}.pkl"
+            with cache_path.open("wb") as f:
+                pickle.dump(value, f)
+            print(f"[evaluate] Cached fold {fold_id} results to {cache_path}")
+
+    for task in TASKS:
+        per_fold_reports: dict[int, dict] = {}
+        for fold_id, (results, meta) in sorted(per_fold.items()):
+            if task not in results:
+                print(f"[evaluate] WARNING: fold {fold_id} missing task={task}; skipping fold.")
+                continue
+            per_fold_reports[fold_id] = _build_report_obj(
+                results[task]["labels"],
+                results[task]["preds"],
+                CLASS_NAMES[task],
+                multilabel=(task == "vowel_backness"),
+            )
+
+        if not per_fold_reports:
+            print(f"[evaluate] WARNING: no fold reports available for task={task}; skipping.")
+            continue
+
+        agg = _aggregate_fold_metrics(per_fold_reports, CLASS_NAMES[task])
+        _save_fold_comparison_json(agg, task, metrics_dir)
+        plot_task_prf1_fold_comparison(agg, task, figures_dir)
+        print(f"[evaluate] Saved fold-comparison PRF1 plot for task={task}")
+
+
 # ---------------------------------------------------------------------------
 # Visualisation helpers
 # ---------------------------------------------------------------------------
@@ -354,19 +512,20 @@ def _generate_task_plots(
     metrics_dir: Path,
 ) -> None:
     for task in results:
-        if task == "vowel_backness":
-            report_obj = _build_report_obj(y_true, y_pred, CLASS_NAMES[task], multilabel=True)
-            _save_metrics_json(report_obj, task, metrics_dir)
-            plot_task_prf1(report_obj, task, figures_dir)
-            plot_task_multilabel_confusion(report_obj, task, figures_dir)
-            print(f"[evaluate] Saved PRF1 & multilabel confusion plots for task={task}")
-            continue
         y_true = results[task]["labels"]
         y_pred = results[task]["preds"]
         class_names = CLASS_NAMES.get(task, [])
 
         if not class_names:
             print(f"[evaluate] WARNING: no class names for task={task}, skipping plots")
+            continue
+
+        if task == "vowel_backness":
+            report_obj = _build_report_obj(y_true, y_pred, class_names, multilabel=True)
+            _save_metrics_json(report_obj, task, metrics_dir)
+            plot_task_prf1(report_obj, task, figures_dir)
+            plot_task_multilabel_confusion(report_obj, task, figures_dir)
+            print(f"[evaluate] Saved PRF1 & multilabel confusion plots for task={task}")
             continue
 
         n_expected = len(class_names)
@@ -392,25 +551,42 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    # ── Resolve paths ────────────────────────────────────────────────────────
+    
     print("[evaluate] Resolving paths ...")
     checkpoint_path = str(Path(args.checkpoint).resolve())
-    output_dir  = Path(args.output_dir).resolve()
-    figures_dir = output_dir / "figures"
-    raw_dir     = output_dir / "raw"
-    metrics_dir = output_dir / "metrics"
+    # ── Resolve log directory ────────────────────────────────────────────────
+    # Priority: --log-dir > --runs-dir auto-discovery > None (skip curves)
+    log_dir: Path | None = Path(args.log_dir).resolve() if args.log_dir else None
+
+    if log_dir is None and args.runs_dir is not None:
+        log_dir = find_latest_run_dir(
+            args.runs_dir, prefix=args.run_prefix
+        ).resolve()
+        print(f"[evaluate] Auto-detected latest run: {log_dir.name}  ({log_dir})")
+
+    # If --output-dir is omitted, use the explicit or auto-detected log_dir.
+    if args.output_dir is not None:
+        output_dir = Path(args.output_dir).resolve()
+    elif log_dir is not None:
+        output_dir = log_dir
+        print(f"[evaluate] No --output-dir provided; using log directory: {output_dir}")
+    else:
+        parser.error(
+            "--output-dir is required when neither --log-dir nor --runs-dir "
+            "provides a log directory"
+        )
+
+    # ── Resolve paths ────────────────────────────────────────────────────────
+    eval_dir    = output_dir / "eval"
+    figures_dir = eval_dir / "figures"
+    raw_dir     = eval_dir / "raw"
+    metrics_dir = eval_dir / "metrics"
+    fold_comparison_dir = eval_dir / "fold_comparison"
 
     ensure_dir(figures_dir)
     ensure_dir(raw_dir)
 
-    # ── Resolve log directory ────────────────────────────────────────────────
-    # Priority: --log-dir > --runs-dir auto-discovery > None (skip curves)
-    log_dir: str | None = args.log_dir
 
-    if log_dir is None and args.runs_dir is not None:
-        latest_run = find_latest_run_dir(args.runs_dir, prefix=args.run_prefix)
-        log_dir = str(latest_run)
-        print(f"[evaluate] Auto-detected latest run: {latest_run.name}  ({latest_run})")
 
     # ── 1. Training loss plots (optional) ───────────────────────────────────
     if log_dir is not None:
@@ -459,6 +635,15 @@ def main() -> None:
     with meta_path.open("w", encoding="utf-8") as f:
         json.dump(meta_serialisable, f, indent=2, ensure_ascii=False)
     print(f"[evaluate] Saved meta → {meta_path}")
+
+    if args.eval_folds:
+        _run_fold_comparison(
+            checkpoint_dir=Path(args.checkpoint).resolve().parent,
+            device=device,
+            eval_mode=args.eval_mode,
+            out_dir=fold_comparison_dir,
+            skip_inference=args.skip_inference,
+        )
 
     print("[evaluate] Done.")
 

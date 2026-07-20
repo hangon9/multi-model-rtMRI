@@ -407,9 +407,13 @@ def plot_task_prf1(report_obj: Mapping[str, Any], task: str, out_dir: Path) -> N
     width = 0.25
     fig_width = max(9.0, 0.65 * len(labels) + 3)
     fig, ax = plt.subplots(figsize=(fig_width, 5.5))
-    ax.bar(x - width, precision, width, label="Precision")
-    ax.bar(x, recall, width, label="Recall")
-    ax.bar(x + width, f1, width, label="F1")
+    precision_bars = ax.bar(x - width, precision, width, label="Precision")
+    recall_bars = ax.bar(x, recall, width, label="Recall")
+    f1_bars = ax.bar(x + width, f1, width, label="F1")
+
+    ax.bar_label(precision_bars, fmt="%.2f", padding=2)
+    ax.bar_label(recall_bars, fmt="%.2f", padding=2)
+    ax.bar_label(f1_bars, fmt="%.2f", padding=2)
 
     ref = PAPER_MACRO_F1.get(task)
     if ref is not None:
@@ -425,6 +429,60 @@ def plot_task_prf1(report_obj: Mapping[str, Any], task: str, out_dir: Path) -> N
     ax.legend()
     fig.tight_layout()
     fig.savefig(out_dir / f"{task}_prf1.png", dpi=200)
+    plt.close(fig)
+
+
+def plot_task_prf1_fold_comparison(agg: Mapping[str, Any], task: str, out_dir: Path) -> None:
+    """Plot N-fold mean ± std precision/recall/F1 with per-bar labels."""
+    labels = [key for key in agg.keys() if key != "Macro Avg"]
+    if "Macro Avg" in agg:
+        labels.append("Macro Avg")
+    if not labels:
+        print(f"[WARN] No fold-comparison labels found for task={task}; skip prf1 plot.")
+        return
+
+    metric_names = ("precision", "recall", "f1")
+    x = np.arange(len(labels))
+    width = 0.25
+    fig_width = max(9.0, 0.65 * len(labels) + 3)
+    fig, ax = plt.subplots(figsize=(fig_width, 5.5))
+
+    for offset, metric_name in zip((-width, 0.0, width), metric_names):
+        means = [float(agg[label][metric_name]["mean"]) for label in labels]
+        stds = [float(agg[label][metric_name]["std"]) for label in labels]
+        bars = ax.bar(
+            x + offset,
+            means,
+            width,
+            yerr=stds,
+            capsize=4,
+            label=metric_name.capitalize(),
+        )
+        ax.bar_label(bars, fmt="%.2f", padding=2)
+
+    ref = PAPER_MACRO_F1.get(task)
+    if ref is not None:
+        ax.axhline(ref, linestyle="--", linewidth=1.2, color="gray", label=f"Paper macro F1={ref:.2f}")
+
+    n_folds = 0
+    first_label = labels[0]
+    first_metric = agg[first_label].get("precision", {})
+    if isinstance(first_metric, Mapping):
+        folds = first_metric.get("folds", {})
+        if isinstance(folds, Mapping):
+            n_folds = len(folds)
+
+    title_suffix = f"({n_folds}-fold mean ± std)" if n_folds else "(mean ± std)"
+    ax.set_title(f"{task.capitalize()} Per-class Precision / Recall / F1 {title_suffix}")
+    ax.set_xlabel("Class")
+    ax.set_ylabel("Score")
+    ax.set_ylim(0, 1.05)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=45, ha="right")
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_dir / f"{task}_prf1_fold_comparison.png", dpi=200)
     plt.close(fig)
 
 

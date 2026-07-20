@@ -314,6 +314,44 @@ def _forward(
 
 
 # ---------------------------------------------------------------------------
+# Fold checkpoint discovery
+# ---------------------------------------------------------------------------
+
+def discover_fold_checkpoints(checkpoint_dir: Path) -> dict[int, Path]:
+    """Return {fold_id: checkpoint_path} for best_model_fold_*.pt files."""
+    checkpoint_dir = Path(checkpoint_dir)
+    pattern = re.compile(r"^best_model_fold_(\d+)\.pt$")
+
+    discovered: list[tuple[int, Path]] = []
+    for path in checkpoint_dir.glob("best_model_fold_*.pt"):
+        match = pattern.match(path.name)
+        if match:
+            discovered.append((int(match.group(1)), path))
+
+    discovered.sort(key=lambda item: item[0])
+    return {fold_id: path for fold_id, path in discovered}
+
+
+def run_inference_all_folds(
+    checkpoint_dir: str | Path,
+    device: str = "cuda",
+    eval_mode: str = "default",
+) -> dict[int, tuple[dict, dict]]:
+    """Run run_inference() for every discovered fold checkpoint."""
+    checkpoint_dir = Path(checkpoint_dir)
+    fold_checkpoints = discover_fold_checkpoints(checkpoint_dir)
+
+    results: dict[int, tuple[dict, dict]] = {}
+    for fold_id, checkpoint_path in fold_checkpoints.items():
+        results[fold_id] = run_inference(
+            checkpoint_path=checkpoint_path,
+            device=device,
+            eval_mode=eval_mode,
+        )
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
