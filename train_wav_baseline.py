@@ -18,6 +18,7 @@ from pathlib import Path
 
 import yaml
 import torch
+import numpy as np
 from torch.optim import AdamW
 from tqdm import tqdm
 from sklearn.model_selection import GroupKFold
@@ -87,7 +88,7 @@ def get_class_weights(train_df, config):
         return None
 
     def _balanced_weights(class_indices, n_classes: int):
-        import numpy as np
+        
         N = len(class_indices)
         weights = np.zeros(n_classes, dtype=np.float32)
         for c in range(n_classes):
@@ -529,6 +530,10 @@ def main():
 
     # ---- data ----
     train_val_df, _ = make_train_test_split(config)
+    logger.info(
+            f"unseen_speakers={data_cfg.get('unseen_speakers')} "
+            f"unseen_task_types={data_cfg.get('unseen_task_types')}"
+        )
 
     n_splits = config["data"].get("n_splits", 5)
     num_epochs = train_cfg.get("epochs", 10)

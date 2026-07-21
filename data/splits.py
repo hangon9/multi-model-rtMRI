@@ -1,7 +1,6 @@
 import pandas as pd
 from pathlib import Path
 
-from sklearn.model_selection import GroupShuffleSplit
 from torch.utils.data import DataLoader
 
 from data.annot_16_prepare import build_dataframe_annot_16
@@ -50,46 +49,51 @@ def create_dataframe(config):
 
     return df
 
-def make_train_test_split(config):
+def _add_task_type(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize task names by stripping a trailing repetition index,
+    e.g. 'topic1'/'topic2' -> 'topic', 'vcv1'/'vcv3' -> 'vcv'."""
+    df = df.copy()
+    df["task_type"] = df["task"].str.replace(r"\d+$", "", regex=True)
+    return df
+
+DEFAULT_UNSEEN_SPEAKERS = ["sub023", "sub028", "sub043", "sub061"]
+DEFAULT_UNSEEN_TASK_TYPES = ["vcv"]
+
+def make_train_test_split(config: dict):
     """
-    按 subject 分组：
-    先划分出 10% subjects 作为 test set。
-    剩余 subjects 用于 5-fold cross validation。
+    Grouped by speaker x task：
+
     """
 
     df = create_dataframe(config)
-
     data_cfg = config["data"]
 
-    group_col = "subject"
-    test_ratio = data_cfg.get("test_ratio", 0.1)
-    seed = data_cfg.get("seed", 42)
+    df = _add_task_type(df)
 
-    if group_col not in df.columns:
-        raise ValueError(
-            f"Group column '{group_col}' not found in DataFrame. "
-            f"Available columns: {df.columns.tolist()}"
-        )
+    unseen_speakers = data_cfg.get("unseen_speakers", DEFAULT_UNSEEN_SPEAKERS)
+    unseen_task_types = data_cfg.get("unseen_task_types", DEFAULT_UNSEEN_TASK_TYPES)
 
-    groups = df[group_col]
+    is_unseen_spk = df["subject"].isin(unseen_speakers)
+    is_unseen_tsk = df["task_type"].isin(unseen_task_types)
 
-    splitter = GroupShuffleSplit(
-        n_splits=1,
-        test_size=test_ratio,
-        random_state=seed
-    )
+    train_val_df = df[~is_unseen_spk & ~is_unseen_tsk].reset_index(drop=True)
 
-    train_val_idx, test_idx = next(
-        splitter.split(
-            df,
-            groups=groups
-        )
-    )
+    test_sets = {
+        "unseen_speaker": df[is_unseen_spk & ~is_unseen_tsk].reset_index(drop=True),
+        "unseen_task":    df[~is_unseen_spk & is_unseen_tsk].reset_index(drop=True),
+        "unseen_both":    df[is_unseen_spk & is_unseen_tsk].reset_index(drop=True),
+    }
 
-    train_val_df = df.iloc[train_val_idx].reset_index(drop=True)
-    test_df = df.iloc[test_idx].reset_index(drop=True)
+    for name, tdf in test_sets.items():
+        if len(tdf) == 0:
+            raise RuntimeError(
+                f"Speaker-task split produced an empty test set: '{name}'. "
+                f"Check unseen_speakers={unseen_speakers} / "
+                f"unseen_task_types={unseen_task_types} against the dataset's "
+                f"subject x task_type coverage."
+            )
 
-    return train_val_df, test_df
+    return train_val_df, test_sets
 
 def create_dataloader(
     dataframe,
