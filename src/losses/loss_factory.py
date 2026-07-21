@@ -76,6 +76,7 @@ class BuildLoss(nn.Module):
                 weight=class_weights,
                 ignore_index=self.ce_ignore_index,
                 reduction="sum",
+                label_smoothing=0.03
             )
             self.ce_losses = None
             self.bce_loss = None
@@ -118,6 +119,7 @@ class BuildLoss(nn.Module):
                     weight=class_weights.get(task),
                     ignore_index=ignore_map[task],
                     reduction="sum",
+                    label_smoothing=0.03
                 )
                 for task in ce_tasks
             })
@@ -126,6 +128,7 @@ class BuildLoss(nn.Module):
                 task: nn.CrossEntropyLoss(
                     ignore_index=ignore_map[task],
                     reduction="sum",
+                    label_smoothing=0.03
                 )
                 for task in ce_tasks
             })
