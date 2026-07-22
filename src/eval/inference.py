@@ -139,13 +139,14 @@ def _resolve_model_family(config: dict, checkpoint_path: Path) -> str:
 # ---------------------------------------------------------------------------
 # Test-set helper
 # ---------------------------------------------------------------------------
+_SPEAKER_TASK_MODES = ("unseen_speaker", "unseen_task", "unseen_both")
 
-def _get_test_dataframe(config: dict[str, Any], eval_mode: str) -> pd.DataFrame:
+def _get_test_dataframe(config: dict[str, Any], mode: str) -> pd.DataFrame:
     """Rebuild the held-out test set from config."""
-    if eval_mode == "default":
-        _, test_df = make_train_test_split(config)
-        return test_df
-    raise ValueError(f"Unknown eval_mode: {eval_mode}")
+    if mode in _SPEAKER_TASK_MODES:
+        _, test_sets = make_train_test_split(config)
+        return test_sets[mode]
+    raise ValueError(f"Unknown mode: {mode}")
 
 
 # ---------------------------------------------------------------------------
@@ -335,7 +336,7 @@ def discover_fold_checkpoints(checkpoint_dir: Path) -> dict[int, Path]:
 def run_inference_all_folds(
     checkpoint_dir: str | Path,
     device: str = "cuda",
-    eval_mode: str = "default",
+    mode: str = "default",
 ) -> dict[int, tuple[dict, dict]]:
     """Run run_inference() for every discovered fold checkpoint."""
     checkpoint_dir = Path(checkpoint_dir)
@@ -346,7 +347,7 @@ def run_inference_all_folds(
         results[fold_id] = run_inference(
             checkpoint_path=checkpoint_path,
             device=device,
-            eval_mode=eval_mode,
+            mode=mode,
         )
     return results
 
@@ -358,7 +359,7 @@ def run_inference_all_folds(
 def run_inference(
     checkpoint_path: str | Path,
     device: str = "cuda",
-    eval_mode: str = "default",
+    mode: str = "default",
 ) -> tuple[dict, dict]:
     """
     Load a checkpoint, auto-detect model type from its YAML config, run
@@ -401,7 +402,7 @@ def run_inference(
     model.eval()
 
     # ── Test data ────────────────────────────────────────────────────────────
-    test_df = _get_test_dataframe(config, eval_mode)
+    test_df = _get_test_dataframe(config, mode)
     test_loader = create_dataloader(test_df, config, train=False)
 
     # ── Inference loop ───────────────────────────────────────────────────────

@@ -241,7 +241,7 @@ def _active_tasks_from_meta(meta: Dict[str, Any]) -> Tuple[str, ...]:
 def _run_or_load_inference(
     checkpoint_path: str,
     device: str,
-    eval_mode: str,
+    mode: str,
     skip_inference: bool,
     raw_dir: Path,
 ) -> Tuple[Dict[str, Dict[str, np.ndarray]], Dict[str, Any]]:
@@ -257,7 +257,7 @@ def _run_or_load_inference(
     results, meta = run_inference(
         checkpoint_path=checkpoint_path,
         device=device,
-        eval_mode=eval_mode,
+        mode=mode,
     )
 
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -399,7 +399,7 @@ def _save_fold_comparison_json(report_obj: Dict[str, Any], task: str, metrics_di
 def _run_fold_comparison(
     checkpoint_dir: str | Path,
     device: str,
-    eval_mode: str,
+    mode: str,
     out_dir: Path,
     skip_inference: bool = False,
 ) -> None:
@@ -433,7 +433,7 @@ def _run_fold_comparison(
 
         if missing_folds:
             print(f"[evaluate] Running inference for missing folds: {missing_folds}")
-            fresh = run_inference_all_folds(checkpoint_dir, device=device, eval_mode=eval_mode)
+            fresh = run_inference_all_folds(checkpoint_dir, device=device, mode=mode)
             for fold_id, value in fresh.items():
                 cache_path = raw_dir / f"results_fold{fold_id}.pkl"
                 with cache_path.open("wb") as f:
@@ -441,7 +441,7 @@ def _run_fold_comparison(
                 per_fold[fold_id] = value
     else:
         print("[evaluate] Running fold-comparison inference ...")
-        per_fold = run_inference_all_folds(checkpoint_dir, device=device, eval_mode=eval_mode)
+        per_fold = run_inference_all_folds(checkpoint_dir, device=device, mode=mode)
         for fold_id, value in per_fold.items():
             cache_path = raw_dir / f"results_fold{fold_id}.pkl"
             with cache_path.open("wb") as f:
@@ -542,6 +542,72 @@ def _generate_task_plots(
         plot_task_confusion(report_obj, task, figures_dir)
         print(f"[evaluate] Saved PRF1 & confusion plots for task={task}")
 
+def _run_eval_for_mode(
+    mode: str,
+    eval_root: Path,
+    checkpoint_path: str,
+    device: str,
+    skip_inference: bool,
+    run_fold_comparison: bool,
+    checkpoint_dir: Path,
+) -> None:
+    """跑一次 inference + per-task 图/metrics + meta,全部写入 eval_root 下。"""
+    figures_dir = eval_root / "figures"
+    raw_dir     = eval_root / "raw"
+    metrics_dir = eval_root / "metrics"
+    fold_comparison_dir = eval_root / "fold_comparison"
+
+    ensure_dir(figures_dir)
+    ensure_dir(raw_dir)
+
+    results, meta = _run_or_load_inference(
+        checkpoint_path=checkpoint_path,
+        device=device,
+        mode=mode,
+        skip_inference=skip_inference,
+        raw_dir=raw_dir,
+    )
+
+    active_tasks = _active_tasks_from_meta(meta)
+    n_samples = len(results[active_tasks[0]]["labels"]) if active_tasks else 0
+    print(
+        f"[evaluate][{mode}] Inference complete — "
+        f"model_family={meta.get('model_family')}, "
+        f"active tasks: {active_tasks}, samples: {n_samples}"
+    )
+
+    metrics_dir.mkdir(parents=True, exist_ok=True)
+    _generate_task_plots(results, figures_dir, metrics_dir)
+
+    meta["mode"] = mode
+    meta["n_samples"] = n_samples
+    meta_path = eval_root / "meta.json"
+    meta_serialisable: Dict[str, Any] = {}
+    for k, v in meta.items():
+        if k == "config":
+            meta_serialisable[k] = str(v) if not isinstance(v, dict) else v
+        elif isinstance(v, np.integer):
+            meta_serialisable[k] = int(v)
+        elif isinstance(v, np.floating):
+            meta_serialisable[k] = float(v)
+        else:
+            try:
+                json.dumps(v)
+                meta_serialisable[k] = v
+            except (TypeError, ValueError):
+                meta_serialisable[k] = str(v)
+    with meta_path.open("w", encoding="utf-8") as f:
+        json.dump(meta_serialisable, f, indent=2, ensure_ascii=False)
+    print(f"[evaluate][{mode}] Saved meta → {meta_path}")
+
+    if run_fold_comparison:
+        _run_fold_comparison(
+            checkpoint_dir=checkpoint_dir,
+            device=device,
+            mode=mode,
+            out_dir=fold_comparison_dir,
+            skip_inference=skip_inference,
+        )
 
 # ---------------------------------------------------------------------------
 # Main
@@ -596,53 +662,18 @@ def main() -> None:
 
     # ── 2. Inference ─────────────────────────────────────────────────────────
     device = _resolve_device(args.device)
-    results, meta = _run_or_load_inference(
-        checkpoint_path=checkpoint_path,
-        device=device,
-        eval_mode=args.eval_mode,
-        skip_inference=args.skip_inference,
-        raw_dir=raw_dir,
-    )
+    checkpoint_dir = Path(args.checkpoint).resolve().parent
 
-    active_tasks = _active_tasks_from_meta(meta)
-    n_samples    = len(results[active_tasks[0]]["labels"]) if active_tasks else 0
-    print(
-        f"[evaluate] Inference complete — model_family={meta.get('model_family')}, "
-        f"active tasks: {active_tasks}, samples: {n_samples}"
-    )
-
-    # ── 3. Per-task metrics & visualisations ─────────────────────────────────
-    metrics_dir.mkdir(parents=True, exist_ok=True)
-    _generate_task_plots(results, figures_dir, metrics_dir)
-
-    # ── 4. Save meta ─────────────────────────────────────────────────────────
-    meta_path = output_dir / "meta.json"
-    meta_serialisable: Dict[str, Any] = {}
-    for k, v in meta.items():
-        if k == "config":
-            meta_serialisable[k] = str(v) if not isinstance(v, dict) else v
-        elif isinstance(v, np.integer):
-            meta_serialisable[k] = int(v)
-        elif isinstance(v, np.floating):
-            meta_serialisable[k] = float(v)
-        else:
-            try:
-                json.dumps(v)
-                meta_serialisable[k] = v
-            except (TypeError, ValueError):
-                meta_serialisable[k] = str(v)
-
-    with meta_path.open("w", encoding="utf-8") as f:
-        json.dump(meta_serialisable, f, indent=2, ensure_ascii=False)
-    print(f"[evaluate] Saved meta → {meta_path}")
-
-    if args.eval_folds:
-        _run_fold_comparison(
-            checkpoint_dir=Path(args.checkpoint).resolve().parent,
+    for mode in ("unseen_speaker", "unseen_task", "unseen_both"):
+        print(f"[evaluate] === Running eval_mode={mode} ===")
+        _run_eval_for_mode(
+            mode=mode,
+            eval_root=eval_dir / mode,
+            checkpoint_path=checkpoint_path,
             device=device,
-            eval_mode=args.eval_mode,
-            out_dir=fold_comparison_dir,
             skip_inference=args.skip_inference,
+            run_fold_comparison=args.eval_folds,
+            checkpoint_dir=checkpoint_dir,
         )
 
     print("[evaluate] Done.")
