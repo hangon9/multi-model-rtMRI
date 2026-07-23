@@ -6,8 +6,8 @@ data:
   root: data/USC-annot-16
   phonemic_table: data/Phonemic_Table.xlsx
   classification_task:  # manner | place | voicing | vowel_backness, set to "" or None for multi-task
-  untrained_subjects: # list of subjects to hold out for testing
-  untrained_tasks: # list of tasks to hold out for testing
+  unseen_speakers: [sub023, sub028, sub043, sub061] # list of unseen speakers for test set
+  unseen_task_types: [vcv]  # list of unseen task types for test set
   test_ratio: 0.1
   n_splits: 5
   fps: 15
@@ -18,22 +18,33 @@ data:
 model:
   image_encoder:
     img_size: 128
-  audio_encoder:
+  backbone:
     model_name: facebook/wav2vec2-large-xlsr-53
     freeze_feature_extractor: true
-    freeze_transformer_layers: 6 # max: 12 for wav2vec2-base, 24 for wav2vec2-large
+    freeze_transformer_layers: 12 # max: 12 for wav2vec2-base, 24 for wav2vec2-large
     attn_dim: 256
     clf_hidden_dim: 256
     dropout: 0.1
+  encoder:
+    encoder_type: "conformer" # "attention" | "conformer"
+    conformer_layers: 2
+    conformer_heads: 8
+    conv_kernel_size: 17
 train:
   epochs: 5
   batch_size: 32
   num_workers: 4
   grad_clip: 0.5
   weight_decay: 0.01
-  lr_encoder: 3.0e-5
-  lr_pooling: 1.0e-4
+  lr_backbone: 3.0e-5
+  lr_encoder: 1.0e-4
   lr_classifier: 3.0e-4
+  lr_global: 1.0e-4
+  data_augment: 
+    Random_Affine: false
+    random_time_shift: 1 # number of frames to shift, set to 0 for no shift
+    VTLP: false
+    pitch_shift: false 
 
 loss:
   lambda_contrast: 0.0
