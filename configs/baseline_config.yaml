@@ -22,6 +22,7 @@ train:
   weight_decay: 0.0005
   num_workers: 4
   device: cuda
+  data_augment: false  # when true, enables RandomAffine on images + random time shift on images & audio
 
 model:
   image_encoder:
@@ -36,7 +37,7 @@ model:
     num_heads: 12
     dropout_rate: 0.1
 
-  audio_encoder:
+  backbone:
     type: wav2vec2
     name: facebook/wav2vec2-base-960h
     freeze: true
