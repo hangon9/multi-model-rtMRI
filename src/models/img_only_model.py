@@ -2,6 +2,7 @@ import torch.nn as nn
 
 from src.models.vit_encoder import MRIViTEncoder
 from src.models.classifier import ClassificationHead
+from src.models.attention_pooling import AttentionPooling
 
 
 class ImageMultiheadClassifier(nn.Module):
@@ -36,6 +37,12 @@ class ImageMultiheadClassifier(nn.Module):
             dropout_rate=dropout,
         )
 
+        self.attention_pooling = AttentionPooling(
+            input_dim=hidden_size,      
+            attn_dim=256,              
+            dropout=dropout,
+)
+
         self.classifier = ClassificationHead(
             input_type="pooled",
             input_dim=hidden_size,
@@ -56,17 +63,17 @@ class ImageMultiheadClassifier(nn.Module):
         Returns:
             dict with keys "logits" and "pooled_embedding".
         """
-        x = self.image_encoder(image)               # (B, 65, 768)
-        cls_feature = x[:, 0, :]                    # (B, 768)
-
+        x = self.image_encoder(image)           # (B, 65, 768)
+        x, _attn_weights = self.attention_pooling(x)  # (B, 768)
+        
         active_task = (
             self.classification_task
             if classification_task is None
             else classification_task
         )
-        logits = self.classifier(cls_feature, classification_task=active_task)
+        logits = self.classifier(x, classification_task=active_task)
 
         return {
             "logits": logits,
-            "pooled_embedding": cls_feature,
+            "pooled_embedding": x,
         }
