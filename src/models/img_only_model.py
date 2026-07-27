@@ -36,6 +36,8 @@ class ImageMultiheadClassifier(nn.Module):
             num_heads=num_heads,
             dropout_rate=dropout,
         )
+        
+        self.norm = nn.LayerNorm(hidden_size)
 
         self.attention_pooling = AttentionPooling(
             input_dim=hidden_size,      
@@ -64,6 +66,7 @@ class ImageMultiheadClassifier(nn.Module):
             dict with keys "logits" and "pooled_embedding".
         """
         x = self.image_encoder(image)           # (B, 65, 768)
+        x = self.norm(x)    # (B, 65, 768)  
         x, _attn_weights = self.attention_pooling(x)  # (B, 768)
         
         active_task = (
