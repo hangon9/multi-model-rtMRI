@@ -439,6 +439,8 @@ def main():
     train_cfg = config.get("train", {})
     model_cfg = config.get("model", {})
     img_cfg = model_cfg.get("image_encoder", {})
+    model_name = img_cfg.get("model_name", "vit")
+    freeze_layers = int(img_cfg.get("freeze_layers", 0))
     clf_cfg = model_cfg.get("classifier", {})
     data_cfg = config.get("data", {})
     classification_task = data_cfg.get("classification_task", "") or ""
@@ -467,6 +469,7 @@ def main():
     checkpoint_dir = Path(config["paths"]["checkpoint_dir"])
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    logger.info(f"Image encoder: {model_name}, freeze_layers: {freeze_layers}")
     logger.info(f"Classification task: {classification_task or 'multi-task'}")
     logger.info(f"Cross-validation: {n_splits} folds, {num_epochs} epochs each")
 
@@ -498,6 +501,9 @@ def main():
             num_heads=img_cfg.get("num_heads", 12),
             dropout=img_cfg.get("dropout", 0.1),
             classification_task=classification_task,
+            model_name=model_name,
+            pretrained=img_cfg.get("pretrained", True),
+            freeze_layers=freeze_layers,
         ).to(device)
 
         # ---- loss & optimizer & scheduler ----

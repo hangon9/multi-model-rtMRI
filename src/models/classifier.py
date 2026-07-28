@@ -26,7 +26,7 @@ class ClassificationHead(nn.Module):
         if input_type not in ("sequential", "pooled"):
             raise ValueError(f"Invalid input_type: {input_type}. Expected 'sequential' or 'pooled'.")
         if input_type == "sequential":
-            input_dim = 31 * 768
+            input_dim = 65 * 768
         elif input_type == "pooled":
             input_dim = input_dim
         self.classification_task = classification_task or ""

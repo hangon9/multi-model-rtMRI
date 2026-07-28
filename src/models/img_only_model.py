@@ -1,14 +1,11 @@
 import torch.nn as nn
 
-from src.models.vit_encoder import MRIViTEncoder
+from src.models.img_encoder import build_image_encoder
 from src.models.classifier import ClassificationHead
 
 
 class ImageMultiheadClassifier(nn.Module):
-    """Image classifier with ViT backbone.
-
-    img -> ViT -> CLS token -> gated 4-head classifier.
-    """
+    """Image encoder followed by a pooled gated classification head."""
 
     def __init__(
         self,
@@ -22,11 +19,16 @@ class ImageMultiheadClassifier(nn.Module):
         num_heads: int = 12,
         dropout: float = 0.1,
         classification_task: str = "",
+        model_name: str = "vit",
+        pretrained: bool = True,
+        freeze_layers: int = 0,
     ):
         super().__init__()
         self.classification_task = classification_task or ""
-
-        self.image_encoder = MRIViTEncoder(
+        self.image_encoder = build_image_encoder(
+            model_name=model_name,
+            pretrained=pretrained,
+            freeze_layers=freeze_layers,
             img_size=img_size,
             patch_size=patch_size,
             hidden_size=hidden_size,
@@ -35,12 +37,11 @@ class ImageMultiheadClassifier(nn.Module):
             num_heads=num_heads,
             dropout_rate=dropout,
         )
-        
-        self.norm = nn.LayerNorm(hidden_size)
-
+        encoder_dim = self.image_encoder.output_dim
+        self.norm = nn.LayerNorm(encoder_dim)
         self.classifier = ClassificationHead(
             input_type="pooled",
-            input_dim=hidden_size,
+            input_dim=encoder_dim,
             hidden_dim=clf_hidden_dim,
             dropout=dropout,
             classification_task=classification_task,
@@ -49,27 +50,11 @@ class ImageMultiheadClassifier(nn.Module):
         )
 
     def forward(self, image, classification_task=None):
-        """Forward pass.
-
-        Args:
-            image: (B, 3, H, W) — grayscale repeated to 3 channels.
-            classification_task: override the task set at init.
-
-        Returns:
-            dict with keys "logits" and "pooled_embedding".
-        """
-        x = self.image_encoder(image)           # (B, 65, 768)
-        cls_token = x[:, 0, :]                    # (B, 768)
-        cls_token = self.norm(cls_token)    # (B, 768)  
-        
+        pooled = self.norm(self.image_encoder(image))
         active_task = (
             self.classification_task
             if classification_task is None
             else classification_task
         )
-        logits = self.classifier(cls_token, classification_task=active_task)
-
-        return {
-            "logits": logits,
-            "pooled_embedding": cls_token,
-        }
+        logits = self.classifier(pooled, classification_task=active_task)
+        return {"logits": logits, "pooled_embedding": pooled}
