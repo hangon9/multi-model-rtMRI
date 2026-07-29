@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from src.models.vit_encoder import MRIViTEncoder
+from src.models.img_encoder import MRIViTEncoder
 from src.models.audio_ssl_encoder import AudioSSLEncoder
 from src.models.projection import TokenProjection, ModalityMLP
 from src.models.classifier import ClassificationHead
