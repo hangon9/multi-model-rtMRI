@@ -220,7 +220,8 @@ def _build_audio_model(
         conformer_layers=encoder_cfg.get("conformer_layers", 2),
         conformer_heads=encoder_cfg.get("conformer_heads", 8),
         conv_kernel_size=encoder_cfg.get("conv_kernel_size", 17),
-        audio_window_sec=data_cfg.get("audio_window_sec", 0.06667),
+        window_frames=data_cfg.get("window_frames", 1),
+        fps=data_cfg.get("fps", 15),
         sample_rate=data_cfg.get("audio_sample_rate", 16000),
     ).to(device)
 

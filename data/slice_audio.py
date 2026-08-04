@@ -1,6 +1,7 @@
 import numpy as np
 
-def extract_audio_segment(audio, frame_idx, fps=15, sr=16000, window_sec=None):
+
+def extract_audio_segment(audio, frame_idx, fps=15, sr=16000, window_frames=1):
     """
     根据 MRI frame index，从同步音频中提取对应的居中 speech segment。
 
@@ -14,9 +15,9 @@ def extract_audio_segment(audio, frame_idx, fps=15, sr=16000, window_sec=None):
         MRI frame rate after resampling, default 15 fps
     sr : int
         audio sampling rate, default 16000 Hz
-    window_sec : float or None
-        audio window length in seconds.
-        If None, use 1 / fps, i.e., 66.67 ms for 15 fps.
+    window_frames : int
+        音频窗口覆盖的 MRI frame 数量。
+        例如 5 表示以当前 frame 为中心，取 5 帧长度的音频。
 
     Returns
     -------
@@ -24,10 +25,8 @@ def extract_audio_segment(audio, frame_idx, fps=15, sr=16000, window_sec=None):
         Fixed-length audio segment
     """
 
-    if window_sec is None:
-        window_sec = 1.0 / fps  # 66.67 ms when fps=15
-
-    window_samples = int(round(window_sec * sr))
+    window_frames = max(int(window_frames), 1)
+    window_samples = int(round(window_frames * sr / fps))
 
     # MRI frame 的时间戳
     center_time = frame_idx / fps

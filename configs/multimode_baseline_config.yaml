@@ -12,7 +12,7 @@ data:
   n_splits: 5
   fps: 15
   audio_sample_rate: 16000
-  audio_window_sec: 0.06667
+  window_frames: 1
   seed: 42
 
 train:
@@ -54,7 +54,7 @@ model:
     dropout: 0.1
 
 loss:
-  contrast_loss: cosine # options: cosine | infonce
+  contrast_loss: None # options: cosine | infonce
   lambda: 0.1
   use_class_weights: true
 

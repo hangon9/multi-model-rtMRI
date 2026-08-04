@@ -6,6 +6,13 @@ from torch.utils.data import DataLoader
 from data.annot_16_prepare import build_dataframe_annot_16
 from data.USCAnnot16Loader import USCAnnot16Dataset
 
+
+def _get_window_frames(data_cfg: dict) -> int:
+    if "window_frames" in data_cfg and data_cfg["window_frames"] is not None:
+        return max(int(data_cfg["window_frames"]), 1)
+
+    return 1
+
 def create_dataframe_annot_16(config: dict) -> pd.DataFrame:
     """
     Build a DataFrame for the USC-annot-16 dataset if it doesn't exist.
@@ -114,7 +121,7 @@ def create_dataloader(
     batch_size = cfg_train.get("batch_size", 16)
     num_workers = cfg_train.get("num_workers", 4)
     fps = cfg_data.get("fps", 15)
-    audio_window_sec = cfg_data.get("audio_window_sec", 0.06667)
+    window_frames = _get_window_frames(cfg_data)
     aug_raw = cfg_train.get("data_augment", False)
 
     # Normalize data_augment: accept bool (backward compat) or dict (new format)
@@ -136,7 +143,7 @@ def create_dataloader(
         image_size=image_size,
         target_sample_rate=target_sample_rate,
         fps=fps,
-        audio_window_sec=audio_window_sec,
+        window_frames=window_frames,
         label_columns=None,
         cache_audio=True,
         train=train,

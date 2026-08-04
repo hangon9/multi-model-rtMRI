@@ -29,17 +29,17 @@ class USCAnnot16Dataset(Dataset):
         image_size=128,
         target_sample_rate=16000,
         fps=15,
-        audio_window_sec=None,
+        window_frames=1,
         train=True,
         label_columns=None,
         cache_audio=True,
-        data_augment=False,
+        data_augment: bool | dict | None = False,
     ):
         self.df = dataframe.reset_index(drop=True)
         self.image_size = image_size
         self.target_sample_rate = target_sample_rate
         self.fps = fps
-        self.audio_window_sec = audio_window_sec
+        self.window_frames = max(int(window_frames), 1)
         self.train = train
         self.cache_audio = cache_audio
         self.audio_cache = {}
@@ -169,7 +169,7 @@ class USCAnnot16Dataset(Dataset):
             frame_idx=frame_idx,
             fps=self.fps,
             sr=self.target_sample_rate,
-            window_sec=self.audio_window_sec,
+            window_frames=self.window_frames,
         )
         segment = torch.tensor(segment, dtype=torch.float32)
         return segment
@@ -262,7 +262,7 @@ class USCAnnot16Dataset(Dataset):
         if random.random() > self.PITCH_PROB:
             return audio_segment
 
-        n_steps = random.uniform(-self.PITCH_SEMITONES, self.PITCH_SEMITONES)
+        n_steps = int(round(random.uniform(-self.PITCH_SEMITONES, self.PITCH_SEMITONES)))
         shifted = torchaudio.functional.pitch_shift(
             audio_segment.unsqueeze(0),
             sample_rate=self.target_sample_rate,
