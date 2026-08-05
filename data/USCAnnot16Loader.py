@@ -100,10 +100,24 @@ class USCAnnot16Dataset(Dataset):
         )
 
         # Precompute max frame_idx per (subject, task) for clamping random shift
+        # and for dropping boundary samples of the multi-frame image window.
+        self._half = (self.window_frames - 1) // 2  # 0 for single frame
         self._max_frame = {}
-        if self.aug_cfg.get("random_time_shift", 0) > 0:
+        if self.aug_cfg.get("random_time_shift", 0) > 0 or self.window_frames > 1:
             grouped = self.df.groupby(["subject", "task"])["frame_idx"]
             self._max_frame = grouped.max().to_dict()
+
+        # Drop boundary samples so a full image window always fits in [0, max_frame].
+        if self.window_frames > 1:
+            half = self._half
+            keys = list(zip(self.df["subject"], self.df["task"]))
+            max_vals = np.array([
+                self._max_frame.get(k, fi)
+                for k, fi in zip(keys, self.df["frame_idx"].tolist())
+            ])
+            frame = self.df["frame_idx"].to_numpy()
+            keep = (frame >= half) & (frame <= max_vals - half)
+            self.df = self.df[keep].reset_index(drop=True)
 
         if len(self.df) == 0:
             raise RuntimeError(
@@ -135,6 +149,23 @@ class USCAnnot16Dataset(Dataset):
     def _load_image(self, image_path):
         image = Image.open(image_path).convert("L")
         return self.image_transform(image)
+
+    def _load_image_window(self, row, center_idx):
+        """Load T frames centered at center_idx -> [T, C, H, W] (or [C, H, W] for T=1)."""
+        if self.window_frames <= 1:
+            return self._load_image(row["image_path"])
+
+        half = self._half
+        frames = []
+        for offset in range(-half, half + 1):
+            fidx = center_idx + offset
+            path = re.sub(
+                r"_(\d{4})_image\.png$",
+                f"_{fidx:04d}_image.png",
+                row["image_path"],
+            )
+            frames.append(self._load_image(path))
+        return torch.stack(frames, dim=0)
 
     # ------------------------------------------------------------------
     # Audio loading (unchanged)
@@ -178,38 +209,29 @@ class USCAnnot16Dataset(Dataset):
     # Random time shift (image + audio)
     # ------------------------------------------------------------------
     def _apply_random_shift(self, row, audio_segment):
-        """Randomly shift both image (by loading adjacent frame) and audio (by roll).
-        Returns (image_path, audio_segment) potentially modified."""
+        """Randomly shift the whole window (image window center + audio by roll).
+        Returns (shifted_center_frame_idx, audio_segment)."""
+        frame_idx = int(row["frame_idx"])
+        max_f = self._max_frame.get((row["subject"], row["task"]), frame_idx)
+        half = self._half
+        lo = half
+        hi = max_f - half
+
         max_shift_frames = self.aug_cfg.get("random_time_shift", 0)
         if max_shift_frames <= 0:
-            return row["image_path"], audio_segment
+            return frame_idx, audio_segment
 
         delta_t = random.randint(-max_shift_frames, max_shift_frames)
+        new_frame_idx = min(max(frame_idx + delta_t, lo), hi)
+        if new_frame_idx == frame_idx:
+            return frame_idx, audio_segment
 
-        if delta_t == 0:
-            return row["image_path"], audio_segment
-
-        frame_idx = int(row["frame_idx"])
-        subject = row["subject"]
-        task = row["task"]
-
-        # --- Image shift: load neighboring frame ---
-        new_frame_idx = frame_idx + delta_t
-        max_f = self._max_frame.get((subject, task), frame_idx)
-        new_frame_idx = max(0, min(new_frame_idx, max_f))
-
-        # Replace frame index in image path (pattern: _XXXX_image.png)
-        shifted_path = re.sub(
-            r"_(\d{4})_image\.png$",
-            f"_{new_frame_idx:04d}_image.png",
-            row["image_path"],
-        )
-
-        # --- Audio shift: roll the waveform ---
-        shift_samples = int(round(delta_t * self.target_sample_rate / self.fps))
+        # --- Audio shift: roll the waveform by the applied frame shift ---
+        applied = new_frame_idx - frame_idx
+        shift_samples = int(round(applied * self.target_sample_rate / self.fps))
         audio_segment = torch.roll(audio_segment, shifts=shift_samples)
 
-        return shifted_path, audio_segment
+        return new_frame_idx, audio_segment
 
     # ------------------------------------------------------------------
     # VTLP: Vocal Tract Length Perturbation
@@ -290,9 +312,9 @@ class USCAnnot16Dataset(Dataset):
         audio_segment = self._apply_pitch_shift(audio_segment)
 
         # ── Random time shift augmentation (image + audio) ──
-        image_path, audio_segment = self._apply_random_shift(row, audio_segment)
+        center_idx, audio_segment = self._apply_random_shift(row, audio_segment)
 
-        image = self._load_image(image_path)
+        image = self._load_image_window(row, center_idx)
 
         vals = row[self.label_columns].values.astype(np.float32)
 

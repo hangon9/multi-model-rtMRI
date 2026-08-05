@@ -234,6 +234,7 @@ def _build_image_model(
     data_cfg = config.get("data", {})
     img_cfg = model_cfg.get("image_encoder", {})
     clf_cfg = model_cfg.get("classifier", {})
+    temporal_cfg = model_cfg.get("temporal", {})
 
     return ImageMultiheadClassifier(
             num_classes=NUM_CLASSES[classification_task],
@@ -249,6 +250,10 @@ def _build_image_model(
             model_name=img_cfg.get("model_name", "vit"),
             pretrained=img_cfg.get("pretrained", True),
             freeze_layers=int(img_cfg.get("freeze_layers", 0)),
+            temporal_type=temporal_cfg.get("temporal_type", "none"),
+            conformer_layers=temporal_cfg.get("conformer_layers", 2),
+            conformer_heads=temporal_cfg.get("conformer_heads", 8),
+            conv_kernel_size=temporal_cfg.get("conv_kernel_size", 5),
     ).to(device)
 
 

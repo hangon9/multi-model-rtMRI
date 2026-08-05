@@ -227,9 +227,11 @@ def build_optimizer(model, config, logger=None):
     classifier_lr = float(train_cfg.get("lr_classifier", 1e-4))
     weight_decay = float(train_cfg.get("weight_decay", 0.0))
 
+    temporal_lr = float(train_cfg.get("lr_temporal", encoder_lr))
+
     buckets = {
         f"{group}_{decay}": []
-        for group in ("encoder", "classifier")
+        for group in ("encoder", "temporal", "classifier")
         for decay in ("decay", "no_decay")
     }
 
@@ -240,6 +242,8 @@ def build_optimizer(model, config, logger=None):
         is_no_decay = _is_no_decay_param(name)
         if name.startswith("image_encoder."):
             group = "encoder"
+        elif name.startswith("temporal."):
+            group = "temporal"
         elif name.startswith("classifier."):
             group = "classifier"
         else:
@@ -251,6 +255,8 @@ def build_optimizer(model, config, logger=None):
     group_specs = [
         ("encoder_decay", encoder_lr, weight_decay),
         ("encoder_no_decay", encoder_lr, 0.0),
+        ("temporal_decay", temporal_lr, weight_decay),
+        ("temporal_no_decay", temporal_lr, 0.0),
         ("classifier_decay", classifier_lr, weight_decay),
         ("classifier_no_decay", classifier_lr, 0.0),
     ]
@@ -440,6 +446,7 @@ def main():
     model_cfg = config.get("model", {})
     img_cfg = model_cfg.get("image_encoder", {})
     model_name = img_cfg.get("model_name", "vit")
+    temporal_cfg = model_cfg.get("temporal", {})
     freeze_layers = int(img_cfg.get("freeze_layers", 0))
     clf_cfg = model_cfg.get("classifier", {})
     data_cfg = config.get("data", {})
@@ -470,6 +477,7 @@ def main():
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"Image encoder: {model_name}, freeze_layers: {freeze_layers}")
+    logger.info(f"Temporal encoder: {temporal_cfg.get('temporal_type', 'none')}")
     logger.info(f"Classification task: {classification_task or 'multi-task'}")
     logger.info(f"Cross-validation: {n_splits} folds, {num_epochs} epochs each")
 
@@ -490,6 +498,7 @@ def main():
         val_loader = create_dataloader(val_df, config, train=False)
 
         # ---- model ----
+        
         model = ImageMultiheadClassifier(
             num_classes=NUM_CLASSES[classification_task],
             img_size=img_cfg.get("img_size", 128),
@@ -504,6 +513,10 @@ def main():
             model_name=model_name,
             pretrained=img_cfg.get("pretrained", True),
             freeze_layers=freeze_layers,
+            temporal_type=temporal_cfg.get("temporal_type", "none"),
+            conformer_layers=temporal_cfg.get("conformer_layers", 2),
+            conformer_heads=temporal_cfg.get("conformer_heads", 8),
+            conv_kernel_size=temporal_cfg.get("conv_kernel_size", 5),
         ).to(device)
 
         # ---- loss & optimizer & scheduler ----
@@ -547,6 +560,7 @@ def main():
                 phase="training",
                 metrics=train_log,
                 lr_encoder=_lr_lookup.get("encoder_decay", _lr_lookup.get("encoder_no_decay", 0.0)),
+                lr_pooling=_lr_lookup.get("temporal_decay", _lr_lookup.get("temporal_no_decay", 0.0)),
                 lr_classifier=_lr_lookup.get("classifier_decay", _lr_lookup.get("classifier_no_decay", 0.0)),
                 classification_task=classification_task,
                 log_to_console=False,
@@ -574,6 +588,7 @@ def main():
                     phase="validation",
                     metrics=val_log,
                     lr_encoder=_lr_lookup.get("encoder_decay", _lr_lookup.get("encoder_no_decay", 0.0)),
+                    lr_pooling=_lr_lookup.get("temporal_decay", _lr_lookup.get("temporal_no_decay", 0.0)),
                     lr_classifier=_lr_lookup.get("classifier_decay", _lr_lookup.get("classifier_no_decay", 0.0)),
                     classification_task=classification_task,
                     log_to_console=False,
