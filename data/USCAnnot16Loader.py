@@ -9,6 +9,7 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset
 import torchvision.transforms as T
+import torchvision.transforms.functional as F
 import torchaudio
 
 from data.slice_audio import extract_audio_segment
@@ -129,33 +130,65 @@ class USCAnnot16Dataset(Dataset):
     # Image transform
     # ------------------------------------------------------------------
     def _build_image_transform(self, train, data_augment=False):
+        # Base spatial + pixel transform (no randomness).
+        base = [
+            T.Resize((self.image_size, self.image_size)),
+            T.Grayscale(num_output_channels=3),
+            T.ToTensor(),
+        ]
+        # Random affine is kept separate so a multi-frame window can share ONE
+        # sampled transform across all frames (window-consistent aug); the
+        # single-frame path still applies it per-frame (unchanged behavior).
+        self._random_affine = None
         if train and data_augment:
-            return T.Compose([
-                T.Resize((self.image_size, self.image_size)),
-                T.RandomAffine(degrees=3, translate=(0.02, 0.02), scale=(0.98, 1.02)),
-                T.Grayscale(num_output_channels=3),
-                T.ToTensor(),
-            ])
-        else:
-            return T.Compose([
-                T.Resize((self.image_size, self.image_size)),
-                T.Grayscale(num_output_channels=3),
-                T.ToTensor(),
-            ])
+            self._random_affine = T.RandomAffine(
+                degrees=3, translate=(0.02, 0.02), scale=(0.98, 1.02)
+            )
+        return T.Compose(base)
 
     # ------------------------------------------------------------------
     # Image loading
     # ------------------------------------------------------------------
     def _load_image(self, image_path):
         image = Image.open(image_path).convert("L")
-        return self.image_transform(image)
+        image = self.image_transform(image)  # base -> [C, H, W]
+        if self._random_affine is not None:
+            image = self._random_affine(image)  # per-frame affine (single-frame path)
+        return image
+
+    def _sample_window_affine(self):
+        """Sample one random affine transform shared by all frames in a window.
+        Returns None when Random_Affine is disabled."""
+        ra = self._random_affine
+        if ra is None:
+            return None
+        angle = random.uniform(*ra.degrees)
+        scale = random.uniform(*ra.scale) if ra.scale is not None else 1.0
+        if ra.translate is not None:
+            tx = random.uniform(-ra.translate[0], ra.translate[0]) * self.image_size
+            ty = random.uniform(-ra.translate[1], ra.translate[1]) * self.image_size
+            translate = [round(tx), round(ty)]  # ints, matches RandomAffine sampling
+        else:
+            translate = [0, 0]
+        shear = [0.0, 0.0]  # config uses no shear
+        return angle, translate, scale, shear
 
     def _load_image_window(self, row, center_idx):
         """Load T frames centered at center_idx -> [T, C, H, W] (or [C, H, W] for T=1)."""
         if self.window_frames <= 1:
-            return self._load_image(row["image_path"])
+            if center_idx == int(row["frame_idx"]):
+                return self._load_image(row["image_path"])
+            # With random_time_shift the center moved; load the shifted frame
+            # so T=1 keeps the same image-shift augmentation as before.
+            path = re.sub(
+                r"_(\d{4})_image\.png$",
+                f"_{center_idx:04d}_image.png",
+                row["image_path"],
+            )
+            return self._load_image(path)
 
         half = self._half
+        affine_params = self._sample_window_affine()
         frames = []
         for offset in range(-half, half + 1):
             fidx = center_idx + offset
@@ -164,7 +197,12 @@ class USCAnnot16Dataset(Dataset):
                 f"_{fidx:04d}_image.png",
                 row["image_path"],
             )
-            frames.append(self._load_image(path))
+            img = torch.as_tensor(self.image_transform(Image.open(path).convert("L")))
+            if affine_params is not None:
+                # Apply the SAME affine to every frame of the window.
+                angle, translate, scale, shear = affine_params
+                img = F.affine(img, angle, translate, scale, shear)
+            frames.append(img)
         return torch.stack(frames, dim=0)
 
     # ------------------------------------------------------------------
