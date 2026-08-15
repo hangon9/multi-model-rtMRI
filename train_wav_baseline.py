@@ -386,6 +386,32 @@ def get_fold_indices(train_val_df, config):
     return splitter.split(train_val_df, groups=groups)
 
 
+def resolve_train_folds(data_cfg, n_splits):
+    """解析 data.train_fold：留空/None → 返回 None（跑全部折）；否则校验并返回要跑的折集合。"""
+    raw = data_cfg.get("train_fold")
+    if not raw:
+        return None
+    if not isinstance(raw, (list, tuple)):
+        raise ValueError(
+            f"data.train_fold 必须是折号列表（如 [2, 3, 5]），留空表示全部折，"
+            f"实际得到: {raw!r}"
+        )
+    folds = []
+    for item in raw:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ValueError(
+                f"data.train_fold 中的元素必须是整数折号，实际得到: {item!r}"
+            )
+        if item < 1 or item > n_splits:
+            raise ValueError(
+                f"data.train_fold 中的折号超出范围 [1, {n_splits}]，实际得到: {item}"
+            )
+        if item in folds:
+            raise ValueError(f"data.train_fold 中存在重复折号: {item}")
+        folds.append(item)
+    return set(folds)
+
+
 # ---------------------------------------------------------------------------
 # training / evaluation loops
 # ---------------------------------------------------------------------------
@@ -535,19 +561,26 @@ def main():
             f"unseen_task_types={data_cfg.get('unseen_task_types')}"
         )
 
-    n_splits = config["data"].get("n_splits", 5)
+    n_splits = data_cfg.get("n_splits", 5)
+    train_folds = resolve_train_folds(data_cfg, n_splits)
     num_epochs = train_cfg.get("epochs", 10)
     checkpoint_dir = Path(config["paths"]["checkpoint_dir"])
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"Classification task: {classification_task or 'multi-task'}")
     logger.info(f"Cross-validation: {n_splits} folds, {num_epochs} epochs each")
+    if train_folds is None:
+        logger.info(f"train_fold: 留空，跑全部 {n_splits} 折")
+    else:
+        logger.info(f"train_fold: 只跑折 {sorted(train_folds)}（共 {n_splits} 折）")
 
     global_best_val_loss = float("inf")
     global_best_ckpt_path = None
 
     for fold, (train_idx, val_idx) in enumerate(get_fold_indices(train_val_df, config)):
         fold_id = fold + 1
+        if train_folds is not None and fold_id not in train_folds:
+            continue
         logger.info(f"{'='*60}")
         logger.info(f"Fold {fold_id}/{n_splits}")
         logger.info(f"{'='*60}")
