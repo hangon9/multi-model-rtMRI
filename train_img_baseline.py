@@ -1,19 +1,17 @@
-
 """
-Train audio-only baseline with GroupKFold cross-validation.
+Train img only baseline model.
 
 This script trains:
-    audio segment -> Wav2Vec2 -> AttentionPooling -> MultiHeadClassificationMLP
-for three heads: manner / place / voicing (or single-task).
+    img -> ViT -> CLS token -> gated 4-head classifier
+for four heads: manner / place / voicing / vowel_backness (or single-task).
 
-Cross-validation follows the same pattern as train.py:
+Cross-validation follows the same pattern as train_wav_baseline.py:
 - GroupKFold on train_val subjects
 - OneCycleLR scheduler
 - Validate every 5 epochs, save best checkpoint globally across folds
 """
 
 import argparse
-import importlib
 from pathlib import Path
 
 import yaml
@@ -24,7 +22,7 @@ from tqdm import tqdm
 from sklearn.model_selection import GroupKFold
 
 from data.splits import make_train_test_split, create_dataloader
-from src.models.audio_only_model import AudioMultiHeadClassifier
+from src.models.img_only_model import ImageMultiheadClassifier
 from src.losses.loss_factory import BuildLoss
 from utils.logger import TrainingLogger
 
@@ -54,19 +52,21 @@ _VOWEL_MANNER = 5
 # ---------------------------------------------------------------------------
 
 def _derive_class_indices(df, task: str):
-    """Derive targets for class-weight computation with the same gating as the dataset."""
+    """Derive targets for class-weight computation with the same gating as
+    the dataset.
+    """
     if task == "manner":
         return df[_MANNER_COLS].values.argmax(axis=1)
 
     elif task == "place":
-        # Consonants use 0..6; silence and vowels are ignored by CE(ignore_index=-100).
+        # Consonants use 0..6; silence and vowels are ignored by CE.
         idx = df[_PLACE_COLS].values.argmax(axis=1)
         nonspeech = (df["Silence"].values == 1.0) | (df["Vowel"].values == 1.0)
         idx[nonspeech] = -100
         return idx
 
     elif task == "voicing":
-        # Consonants use 0..1; silence and vowels are ignored by CE(ignore_index=-100).
+        # Consonants use 0..1; silence and vowels are ignored by CE.
         idx = df[_VOICING_COLS].values.argmax(axis=1)
         nonspeech = (df["Silence"].values == 1.0) | (df["Vowel"].values == 1.0)
         idx[nonspeech] = -100
@@ -80,7 +80,7 @@ def _derive_class_indices(df, task: str):
 
 
 def get_class_weights(train_df, config):
-    """Compute balanced CE class weights on valid samples only."""
+    """Compute balanced CE class weights on valid (non-ignored) samples only."""
     use_class_weights = config["loss"].get("use_class_weights", False)
     classification_task = config["data"]["classification_task"] or ""
 
@@ -88,7 +88,6 @@ def get_class_weights(train_df, config):
         return None
 
     def _balanced_weights(class_indices, n_classes: int):
-        
         N = len(class_indices)
         weights = np.zeros(n_classes, dtype=np.float32)
         for c in range(n_classes):
@@ -111,13 +110,11 @@ def get_class_weights(train_df, config):
     return _weights_for(classification_task)
 
 
-
 def get_bce_pos_weight(train_df, config):
     """Compute BCE pos_weight for vowel_backness on vowel samples only."""
     if not config["loss"].get("bce_pos_weight", False):
         return None
 
-    import numpy as np
     vowel_mask = train_df["Vowel"].values == 1.0
     multi_hot = train_df.loc[vowel_mask, _VOWEL_BACKNESS_COLS].values.astype("float32")
     N = len(multi_hot)
@@ -128,42 +125,11 @@ def get_bce_pos_weight(train_df, config):
 
 
 # ---------------------------------------------------------------------------
-# utility: dynamic imports
-# ---------------------------------------------------------------------------
-
-def import_from_possible_paths(module_names, attr_name):
-    """Try several import paths to tolerate different project layouts."""
-    last_err = None
-    for module_name in module_names:
-        try:
-            mod = importlib.import_module(module_name)
-            return getattr(mod, attr_name)
-        except Exception as e:
-            last_err = e
-    raise ImportError(
-        f"Cannot import {attr_name} from {module_names}. Last error: {last_err}"
-    )
-
-
-def load_config(path: str) -> dict:
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
-
-
-# ---------------------------------------------------------------------------
 # data helpers
 # ---------------------------------------------------------------------------
 
 def move_labels_to_device(labels, device):
-    if not isinstance(labels, dict):
-        raise ValueError("Expected labels to be a dict with keys: manner/place/voicing/vowel_backness")
     return {k: v.to(device, non_blocking=True) for k, v in labels.items() if k in TASKS}
-
-
-def get_audio_from_batch(batch):
-    if "audio" not in batch:
-        raise KeyError(f"Batch missing 'audio'. Keys: {list(batch.keys())}")
-    return batch["audio"]
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +175,7 @@ def compute_accuracy(logits, labels, classification_task=""):
         acc["mean"] = sum(acc.values()) / max(len(acc), 1)
         return acc
 
-    # Single-task mode is intentionally unchanged: no gating here.
+    # Single-task mode
     pred = logits.argmax(dim=-1)
     acc_val = (pred == labels).float().mean().item()
     return {classification_task: acc_val, "mean": acc_val}
@@ -220,8 +186,7 @@ def compute_accuracy(logits, labels, classification_task=""):
 # ---------------------------------------------------------------------------
 
 def build_loss_from_config(config, device, class_weights=None, bce_pos_weight=None):
-    """Build BuildLoss from config, supporting multi-task and single-task."""
-
+    """Build BuildLoss from config (wav-style keys)."""
     loss_cfg = config.get("loss", {})
     classification_task = config["data"].get("classification_task", "") or ""
 
@@ -241,14 +206,10 @@ def build_loss_from_config(config, device, class_weights=None, bce_pos_weight=No
 
 
 # ---------------------------------------------------------------------------
-# optimizer helpers: config-compatible parameter groups
+# optimizer: 2-group (ViT encoder + classifier)
 # ---------------------------------------------------------------------------
 
 def _is_no_decay_param(name: str) -> bool:
-    """
-    Return True for parameters that usually should NOT receive weight decay:
-    bias terms and normalization scale parameters.
-    """
     name_lower = name.lower()
     no_decay_keywords = (
         "bias",
@@ -259,46 +220,18 @@ def _is_no_decay_param(name: str) -> bool:
     return any(keyword in name_lower for keyword in no_decay_keywords)
 
 
-def get_optimizer_hparams(config):
-    """Read optimizer hyperparameters with backward-compatible fallbacks."""
-    train_cfg = config.get("train", {})
-    model_root = config.get("model", {})
-    model_cfg = model_root.get("audio_backbone", {})
-    loss_cfg = config.get("loss", {})
-
-    fallback_lr = train_cfg.get("lr", 1e-5)
-    backbone_lr = train_cfg.get(
-        "lr_backbone", model_cfg.get("lr_audio_encoder", fallback_lr)
-    )
-    downstream_fallback = loss_cfg.get("lr_downstream", fallback_lr)
-    encoder_lr = train_cfg.get("lr_encoder", downstream_fallback)
-    classifier_lr = train_cfg.get("lr_classifier", downstream_fallback)
-    global_lr = train_cfg.get(
-        "lr_global", train_cfg.get("lr_pooling", downstream_fallback)
-    )
-    weight_decay = train_cfg.get("weight_decay", 0.0)
-
-    return {
-        "backbone_lr": float(backbone_lr),
-        "encoder_lr": float(encoder_lr),
-        "classifier_lr": float(classifier_lr),
-        "global_lr": float(global_lr),
-        "weight_decay": float(weight_decay),
-    }
-
-
 def build_optimizer(model, config, logger=None):
-    """Build AdamW with backbone, encoder, classifier, and global groups."""
-    hparams = get_optimizer_hparams(config)
-    backbone_lr = hparams["backbone_lr"]
-    encoder_lr = hparams["encoder_lr"]
-    classifier_lr = hparams["classifier_lr"]
-    global_lr = hparams["global_lr"]
-    weight_decay = hparams["weight_decay"]
+    """Build AdamW with separate LR for image_encoder and classifier."""
+    train_cfg = config.get("train", {})
+    encoder_lr = float(train_cfg.get("lr_encoder", 1e-4))
+    classifier_lr = float(train_cfg.get("lr_classifier", 1e-4))
+    weight_decay = float(train_cfg.get("weight_decay", 0.0))
+
+    temporal_lr = float(train_cfg.get("lr_temporal", encoder_lr))
 
     buckets = {
         f"{group}_{decay}": []
-        for group in ("backbone", "encoder", "classifier", "global")
+        for group in ("encoder", "temporal", "classifier")
         for decay in ("decay", "no_decay")
     }
 
@@ -307,27 +240,25 @@ def build_optimizer(model, config, logger=None):
             continue
 
         is_no_decay = _is_no_decay_param(name)
-        if name.startswith("backbone."):
-            group = "backbone"
-        elif name.startswith("encoder.") or name.startswith("norm."):
+        if name.startswith("image_encoder."):
             group = "encoder"
+        elif name.startswith("temporal."):
+            group = "temporal"
         elif name.startswith("classifier."):
             group = "classifier"
         else:
-            group = "global"
+            group = "encoder"  # fallback
 
         decay = "no_decay" if is_no_decay else "decay"
         buckets[f"{group}_{decay}"].append(param)
 
     group_specs = [
-        ("backbone_decay", backbone_lr, weight_decay),
-        ("backbone_no_decay", backbone_lr, 0.0),
         ("encoder_decay", encoder_lr, weight_decay),
         ("encoder_no_decay", encoder_lr, 0.0),
+        ("temporal_decay", temporal_lr, weight_decay),
+        ("temporal_no_decay", temporal_lr, 0.0),
         ("classifier_decay", classifier_lr, weight_decay),
         ("classifier_no_decay", classifier_lr, 0.0),
-        ("global_decay", global_lr, weight_decay),
-        ("global_no_decay", global_lr, 0.0),
     ]
 
     param_groups = []
@@ -343,16 +274,14 @@ def build_optimizer(model, config, logger=None):
         })
 
     if not param_groups:
-        raise ValueError(
-            "No trainable parameters found. Check freeze settings and requires_grad flags."
-        )
+        raise ValueError("No trainable parameters found.")
 
     if logger is not None:
         for group in param_groups:
             n_params = sum(p.numel() for p in group["params"])
             logger.info(
-                "Optimizer group "
-                f"{group['name']}: tensors={len(group['params'])}, params={n_params}, "
+                f"Optimizer group {group['name']}: "
+                f"tensors={len(group['params'])}, params={n_params}, "
                 f"lr={group['lr']}, weight_decay={group['weight_decay']}"
             )
 
@@ -428,12 +357,12 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device,
     n = 0
 
     for batch in tqdm(loader, desc="train", leave=False):
-        audio = get_audio_from_batch(batch).to(device, non_blocking=True)
+        image = batch["image"].to(device, non_blocking=True)
         labels = move_labels_to_device(batch["labels"], device)
 
         optimizer.zero_grad(set_to_none=True)
 
-        outputs = model(audio, classification_task=classification_task)
+        outputs = model(image, classification_task=classification_task)
         logits = outputs["logits"]
 
         loss_dict = criterion(
@@ -459,7 +388,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device,
         if scheduler is not None:
             scheduler.step()
 
-        bs = audio.size(0)
+        bs = image.size(0)
         total_loss += loss.item() * bs
         total_cls_loss += loss_dict.get("cls_loss", torch.tensor(0.0)).item() * bs
         for k in _TASK_LOSS_KEYS:
@@ -491,10 +420,10 @@ def evaluate(model, loader, criterion, device, classification_task="", name="val
     n = 0
 
     for batch in tqdm(loader, desc=name, leave=False):
-        audio = get_audio_from_batch(batch).to(device, non_blocking=True)
+        image = batch["image"].to(device, non_blocking=True)
         labels = move_labels_to_device(batch["labels"], device)
 
-        outputs = model(audio, classification_task=classification_task)
+        outputs = model(image, classification_task=classification_task)
         logits = outputs["logits"]
 
         loss_dict = criterion(
@@ -506,7 +435,7 @@ def evaluate(model, loader, criterion, device, classification_task="", name="val
         )
         loss = loss_dict["loss"]
 
-        bs = audio.size(0)
+        bs = image.size(0)
         total_loss += loss.item() * bs
         total_cls_loss += loss_dict.get("cls_loss", torch.tensor(0.0)).item() * bs
         for k in _TASK_LOSS_KEYS:
@@ -533,16 +462,21 @@ def evaluate(model, loader, criterion, device, classification_task="", name="val
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/wav_baseline_config.yaml")
+    parser.add_argument("--config", type=str, default="configs/img_baseline_config.yaml")
     args = parser.parse_args()
 
-    config = load_config(args.config)
+    with open(args.config, "r", encoding="utf-8") as f:
+        config = yaml.safe_load(f)
+
     train_cfg = config.get("train", {})
-    model_root = config.get("model", {})
-    model_cfg = model_root.get("audio_backbone", {})
-    encoder_cfg = model_root.get("audio_encoder", {})
+    model_cfg = config.get("model", {})
+    img_cfg = model_cfg.get("image_encoder", {})
+    model_name = img_cfg.get("model_name", "vit")
+    temporal_cfg = model_cfg.get("image_temporal", {})
+    freeze_layers = int(img_cfg.get("freeze_layers", 0))
+    clf_cfg = model_cfg.get("classifier", {})
     data_cfg = config.get("data", {})
-    classification_task = config.get("data", {}).get("classification_task", "") or ""
+    classification_task = data_cfg.get("classification_task", "") or ""
     grad_clip = train_cfg.get("grad_clip", 0.5)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -557,11 +491,11 @@ def main():
     logger.info(f"Using device: {device}")
 
     # ---- data ----
-    train_val_df, _ = make_train_test_split(config)
+    train_val_df, _test_sets = make_train_test_split(config)
     logger.info(
-            f"unseen_speakers={data_cfg.get('unseen_speakers')} "
-            f"unseen_task_types={data_cfg.get('unseen_task_types')}"
-        )
+        f"unseen_speakers={data_cfg.get('unseen_speakers')} "
+        f"unseen_task_types={data_cfg.get('unseen_task_types')}"
+    )
 
     n_splits = data_cfg.get("n_splits", 5)
     train_folds = resolve_train_folds(data_cfg, n_splits)
@@ -569,6 +503,8 @@ def main():
     checkpoint_dir = Path(config["paths"]["checkpoint_dir"])
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
+    logger.info(f"Image encoder: {model_name}, freeze_layers: {freeze_layers}")
+    logger.info(f"Temporal encoder: {temporal_cfg.get('temporal_type', 'none')}")
     logger.info(f"Classification task: {classification_task or 'multi-task'}")
     logger.info(f"Cross-validation: {n_splits} folds, {num_epochs} epochs each")
     if train_folds is None:
@@ -583,9 +519,9 @@ def main():
         fold_id = fold + 1
         if train_folds is not None and fold_id not in train_folds:
             continue
-        logger.info(f"{'='*60}")
+        logger.info(f"{'=' * 60}")
         logger.info(f"Fold {fold_id}/{n_splits}")
-        logger.info(f"{'='*60}")
+        logger.info(f"{'=' * 60}")
 
         train_df = train_val_df.iloc[train_idx].reset_index(drop=True)
         val_df = train_val_df.iloc[val_idx].reset_index(drop=True)
@@ -595,34 +531,36 @@ def main():
         val_loader = create_dataloader(val_df, config, train=False)
 
         # ---- model ----
-        model = AudioMultiHeadClassifier(
+        
+        model = ImageMultiheadClassifier(
             num_classes=NUM_CLASSES[classification_task],
-            model_name=model_cfg.get("model_name", "facebook/wav2vec2-base"),
-            freeze_feature_extractor=model_cfg.get("freeze_feature_extractor", True),
-            freeze_transformer_layers=model_cfg.get("freeze_transformer_layers", 0),
-            attn_dim=model_cfg.get("attn_dim", 256),
-            clf_hidden_dim=model_cfg.get("clf_hidden_dim", 256),
-            dropout=model_cfg.get("dropout", 0.1),
+            img_size=img_cfg.get("img_size", 128),
+            patch_size=img_cfg.get("patch_size", 16),
+            hidden_size=img_cfg.get("hidden_size", 768),
+            mlp_dim=img_cfg.get("mlp_dim", 3072),
+            clf_hidden_dim=clf_cfg.get("clf_hidden_dim", 256),
+            num_layers=img_cfg.get("num_layers", 12),
+            num_heads=img_cfg.get("num_heads", 12),
+            dropout=img_cfg.get("dropout", 0.1),
             classification_task=classification_task,
-            encoder_type=encoder_cfg.get("encoder_type", "attention"),
-            conformer_layers=encoder_cfg.get("conformer_layers", 2),
-            conformer_heads=encoder_cfg.get("conformer_heads", 8),
-            conv_kernel_size=encoder_cfg.get("conv_kernel_size", 17),
-            window_frames=data_cfg.get("window_frames", 1),
-            fps=data_cfg.get("fps", 15),
-            sample_rate=data_cfg.get("audio_sample_rate", 16000),
+            model_name=model_name,
+            pretrained=img_cfg.get("pretrained", True),
+            freeze_layers=freeze_layers,
+            temporal_type=temporal_cfg.get("temporal_type", "none"),
+            conformer_layers=temporal_cfg.get("conformer_layers", 2),
+            conformer_heads=temporal_cfg.get("conformer_heads", 8),
+            conv_kernel_size=temporal_cfg.get("conv_kernel_size", 5),
         ).to(device)
 
         # ---- loss & optimizer & scheduler ----
         class_weights = get_class_weights(train_df, config)
         bce_pos_weight = get_bce_pos_weight(train_df, config)
-        criterion = build_loss_from_config(config, device, class_weights=class_weights,
-                                           bce_pos_weight=bce_pos_weight)
+        criterion = build_loss_from_config(
+            config, device, class_weights=class_weights, bce_pos_weight=bce_pos_weight,
+        )
 
-        
         optimizer = build_optimizer(model, config, logger=logger)
 
-        # Save the intended peak LR before OneCycleLR modifies optimizer group LRs.
         max_lrs = [group["lr"] for group in optimizer.param_groups]
 
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -632,11 +570,8 @@ def main():
             steps_per_epoch=len(train_loader),
             pct_start=0.3,
             anneal_strategy="cos",
-)
+        )
 
-
-        # Track and save the best checkpoint within the current fold.
-        # This is independent from the global best checkpoint across all folds.
         fold_best_val_loss = float("inf")
         fold_best_ckpt_path = checkpoint_dir / f"best_model_fold_{fold_id}.pt"
 
@@ -644,7 +579,7 @@ def main():
         for epoch in range(num_epochs):
             train_log = train_one_epoch(
                 model, train_loader, criterion, optimizer, scheduler, device,
-                classification_task=classification_task, grad_clip=grad_clip
+                classification_task=classification_task, grad_clip=grad_clip,
             )
 
             _lr_lookup = {
@@ -652,29 +587,17 @@ def main():
                 for group in optimizer.param_groups
             }
 
-
             logger.log_metrics(
                 fold_id=fold_id,
                 epoch=epoch,
                 phase="training",
                 metrics=train_log,
-                lr_backbone=_lr_lookup.get("backbone_decay", _lr_lookup.get("backbone_no_decay", 0.0)),
                 lr_encoder=_lr_lookup.get("encoder_decay", _lr_lookup.get("encoder_no_decay", 0.0)),
+                lr_pooling=_lr_lookup.get("temporal_decay", _lr_lookup.get("temporal_no_decay", 0.0)),
                 lr_classifier=_lr_lookup.get("classifier_decay", _lr_lookup.get("classifier_no_decay", 0.0)),
-                lr_global=_lr_lookup.get("global_decay", _lr_lookup.get("global_no_decay", 0.0)),
                 classification_task=classification_task,
                 log_to_console=False,
             )
-
-            # Build per-task loss suffix for multi-task mode
-            _task_suffix = ""
-            if "loss_manner" in train_log:
-                _task_suffix = (
-                    f"(m={train_log['loss_manner']:.3f} "
-                    f"p={train_log['loss_place']:.3f} "
-                    f"v={train_log['loss_voicing']:.3f} "
-                    f"vb={train_log['loss_vowel_backness']:.3f})"
-                )
 
             log_msg = (
                 f"Fold {fold_id}, Epoch {epoch + 1}: "
@@ -686,7 +609,6 @@ def main():
                 f"acc={train_log['acc']['mean']:.3f}"
             )
 
-            # validate every 5 epochs and on the last epoch
             if epoch % 5 == 0 or epoch == num_epochs - 1:
                 val_log = evaluate(
                     model, val_loader, criterion, device,
@@ -698,23 +620,12 @@ def main():
                     epoch=epoch,
                     phase="validation",
                     metrics=val_log,
-                    lr_backbone=_lr_lookup.get("backbone_decay", _lr_lookup.get("backbone_no_decay", 0.0)),
                     lr_encoder=_lr_lookup.get("encoder_decay", _lr_lookup.get("encoder_no_decay", 0.0)),
+                    lr_pooling=_lr_lookup.get("temporal_decay", _lr_lookup.get("temporal_no_decay", 0.0)),
                     lr_classifier=_lr_lookup.get("classifier_decay", _lr_lookup.get("classifier_no_decay", 0.0)),
-                    lr_global=_lr_lookup.get("global_decay", _lr_lookup.get("global_no_decay", 0.0)),
                     classification_task=classification_task,
                     log_to_console=False,
                 )
-
-                # Build per-task loss suffix for val (multi-task mode)
-                _val_task_suffix = ""
-                if "loss_manner" in val_log:
-                    _val_task_suffix = (
-                        f"(m={val_log['loss_manner']:.3f} "
-                        f"p={val_log['loss_place']:.3f} "
-                        f"v={val_log['loss_voicing']:.3f} "
-                        f"vb={val_log['loss_vowel_backness']:.3f})"
-                    )
 
                 log_msg += (
                     f" | val L={val_log['loss']:.3f} "
@@ -727,9 +638,6 @@ def main():
 
                 logger.info(log_msg)
 
-                # Save best checkpoint within the current fold.
-                # File name is stable, so a better checkpoint overwrites the previous
-                # best checkpoint of the same fold only, without touching other folds.
                 if val_log["loss"] < fold_best_val_loss:
                     fold_best_val_loss = val_log["loss"]
                     torch.save(
@@ -750,7 +658,6 @@ def main():
                         f"{fold_best_ckpt_path}"
                     )
 
-                # global best checkpoint
                 if val_log["loss"] < global_best_val_loss:
                     global_best_val_loss = val_log["loss"]
                     if global_best_ckpt_path is not None and global_best_ckpt_path.exists():
@@ -776,10 +683,11 @@ def main():
             else:
                 logger.info(log_msg)
 
-    logger.info(f"{'='*60}")
+    logger.info(f"{'=' * 60}")
     logger.info(f"Training finished. Best val_loss across all folds: {global_best_val_loss:.4f}")
     logger.info(f"Best checkpoint: {global_best_ckpt_path}")
 
 
 if __name__ == "__main__":
     main()
+

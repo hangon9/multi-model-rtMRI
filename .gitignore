@@ -22,7 +22,6 @@ wheels/
 MANIFEST
 
 # hpc
-*.yaml
 *.slurm
 *.sh
 

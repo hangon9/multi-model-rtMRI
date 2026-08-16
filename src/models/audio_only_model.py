@@ -24,7 +24,8 @@ class AudioMultiHeadClassifier(nn.Module):
         conformer_layers: int = 2,
         conformer_heads: int = 8,
         conv_kernel_size: int = 17,
-        audio_window_sec: float = 0.06667,
+        window_frames: int = 1,
+        fps: int = 15,
         sample_rate: int = 16000,
     ):
         super().__init__()
@@ -75,12 +76,12 @@ class AudioMultiHeadClassifier(nn.Module):
             gated=True,
         )
 
-    def _detect_num_tokens(self, audio_window_sec: float, sample_rate: int) -> int:
+    def _detect_num_tokens(self, window_frames: int, fps: int, sample_rate: int) -> int:
         """Run a dummy backbone pass to determine the output sequence length."""
-        num_samples = int(round(audio_window_sec * sample_rate))
+        num_samples = int(round(max(int(window_frames), 1) * sample_rate / max(int(fps), 1)))
         if num_samples <= 0:
             raise ValueError(
-                "audio_window_sec and sample_rate must produce at least one sample."
+                "window_frames, fps and sample_rate must produce at least one sample."
             )
 
         was_training = self.backbone.training

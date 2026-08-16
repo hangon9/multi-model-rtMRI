@@ -9,6 +9,7 @@ from PIL import Image
 import torch
 from torch.utils.data import Dataset
 import torchvision.transforms as T
+import torchvision.transforms.functional as F
 import torchaudio
 
 from data.slice_audio import extract_audio_segment
@@ -29,17 +30,17 @@ class USCAnnot16Dataset(Dataset):
         image_size=128,
         target_sample_rate=16000,
         fps=15,
-        audio_window_sec=None,
+        window_frames=1,
         train=True,
         label_columns=None,
         cache_audio=True,
-        data_augment=False,
+        data_augment: bool | dict | None = False,
     ):
         self.df = dataframe.reset_index(drop=True)
         self.image_size = image_size
         self.target_sample_rate = target_sample_rate
         self.fps = fps
-        self.audio_window_sec = audio_window_sec
+        self.window_frames = max(int(window_frames), 1)
         self.train = train
         self.cache_audio = cache_audio
         self.audio_cache = {}
@@ -100,10 +101,24 @@ class USCAnnot16Dataset(Dataset):
         )
 
         # Precompute max frame_idx per (subject, task) for clamping random shift
+        # and for dropping boundary samples of the multi-frame image window.
+        self._half = (self.window_frames - 1) // 2  # 0 for single frame
         self._max_frame = {}
-        if self.aug_cfg.get("random_time_shift", 0) > 0:
+        if self.aug_cfg.get("random_time_shift", 0) > 0 or self.window_frames > 1:
             grouped = self.df.groupby(["subject", "task"])["frame_idx"]
             self._max_frame = grouped.max().to_dict()
+
+        # Drop boundary samples so a full image window always fits in [0, max_frame].
+        if self.window_frames > 1:
+            half = self._half
+            keys = list(zip(self.df["subject"], self.df["task"]))
+            max_vals = np.array([
+                self._max_frame.get(k, fi)
+                for k, fi in zip(keys, self.df["frame_idx"].tolist())
+            ])
+            frame = self.df["frame_idx"].to_numpy()
+            keep = (frame >= half) & (frame <= max_vals - half)
+            self.df = self.df[keep].reset_index(drop=True)
 
         if len(self.df) == 0:
             raise RuntimeError(
@@ -115,26 +130,80 @@ class USCAnnot16Dataset(Dataset):
     # Image transform
     # ------------------------------------------------------------------
     def _build_image_transform(self, train, data_augment=False):
+        # Base spatial + pixel transform (no randomness).
+        base = [
+            T.Resize((self.image_size, self.image_size)),
+            T.Grayscale(num_output_channels=3),
+            T.ToTensor(),
+        ]
+        # Random affine is kept separate so a multi-frame window can share ONE
+        # sampled transform across all frames (window-consistent aug); the
+        # single-frame path still applies it per-frame (unchanged behavior).
+        self._random_affine = None
         if train and data_augment:
-            return T.Compose([
-                T.Resize((self.image_size, self.image_size)),
-                T.RandomAffine(degrees=3, translate=(0.02, 0.02), scale=(0.98, 1.02)),
-                T.Grayscale(num_output_channels=3),
-                T.ToTensor(),
-            ])
-        else:
-            return T.Compose([
-                T.Resize((self.image_size, self.image_size)),
-                T.Grayscale(num_output_channels=3),
-                T.ToTensor(),
-            ])
+            self._random_affine = T.RandomAffine(
+                degrees=3, translate=(0.02, 0.02), scale=(0.98, 1.02)
+            )
+        return T.Compose(base)
 
     # ------------------------------------------------------------------
     # Image loading
     # ------------------------------------------------------------------
     def _load_image(self, image_path):
         image = Image.open(image_path).convert("L")
-        return self.image_transform(image)
+        image = self.image_transform(image)  # base -> [C, H, W]
+        if self._random_affine is not None:
+            image = self._random_affine(image)  # per-frame affine (single-frame path)
+        return image
+
+    def _sample_window_affine(self):
+        """Sample one random affine transform shared by all frames in a window.
+        Returns None when Random_Affine is disabled."""
+        ra = self._random_affine
+        if ra is None:
+            return None
+        angle = random.uniform(*ra.degrees)
+        scale = random.uniform(*ra.scale) if ra.scale is not None else 1.0
+        if ra.translate is not None:
+            tx = random.uniform(-ra.translate[0], ra.translate[0]) * self.image_size
+            ty = random.uniform(-ra.translate[1], ra.translate[1]) * self.image_size
+            translate = [round(tx), round(ty)]  # ints, matches RandomAffine sampling
+        else:
+            translate = [0, 0]
+        shear = [0.0, 0.0]  # config uses no shear
+        return angle, translate, scale, shear
+
+    def _load_image_window(self, row, center_idx):
+        """Load T frames centered at center_idx -> [T, C, H, W] (or [C, H, W] for T=1)."""
+        if self.window_frames <= 1:
+            if center_idx == int(row["frame_idx"]):
+                return self._load_image(row["image_path"])
+            # With random_time_shift the center moved; load the shifted frame
+            # so T=1 keeps the same image-shift augmentation as before.
+            path = re.sub(
+                r"_(\d{4})_image\.png$",
+                f"_{center_idx:04d}_image.png",
+                row["image_path"],
+            )
+            return self._load_image(path)
+
+        half = self._half
+        affine_params = self._sample_window_affine()
+        frames = []
+        for offset in range(-half, half + 1):
+            fidx = center_idx + offset
+            path = re.sub(
+                r"_(\d{4})_image\.png$",
+                f"_{fidx:04d}_image.png",
+                row["image_path"],
+            )
+            img = torch.as_tensor(self.image_transform(Image.open(path).convert("L")))
+            if affine_params is not None:
+                # Apply the SAME affine to every frame of the window.
+                angle, translate, scale, shear = affine_params
+                img = F.affine(img, angle, translate, scale, shear)
+            frames.append(img)
+        return torch.stack(frames, dim=0)
 
     # ------------------------------------------------------------------
     # Audio loading (unchanged)
@@ -169,7 +238,7 @@ class USCAnnot16Dataset(Dataset):
             frame_idx=frame_idx,
             fps=self.fps,
             sr=self.target_sample_rate,
-            window_sec=self.audio_window_sec,
+            window_frames=self.window_frames,
         )
         segment = torch.tensor(segment, dtype=torch.float32)
         return segment
@@ -178,38 +247,29 @@ class USCAnnot16Dataset(Dataset):
     # Random time shift (image + audio)
     # ------------------------------------------------------------------
     def _apply_random_shift(self, row, audio_segment):
-        """Randomly shift both image (by loading adjacent frame) and audio (by roll).
-        Returns (image_path, audio_segment) potentially modified."""
+        """Randomly shift the whole window (image window center + audio by roll).
+        Returns (shifted_center_frame_idx, audio_segment)."""
+        frame_idx = int(row["frame_idx"])
+        max_f = self._max_frame.get((row["subject"], row["task"]), frame_idx)
+        half = self._half
+        lo = half
+        hi = max_f - half
+
         max_shift_frames = self.aug_cfg.get("random_time_shift", 0)
         if max_shift_frames <= 0:
-            return row["image_path"], audio_segment
+            return frame_idx, audio_segment
 
         delta_t = random.randint(-max_shift_frames, max_shift_frames)
+        new_frame_idx = min(max(frame_idx + delta_t, lo), hi)
+        if new_frame_idx == frame_idx:
+            return frame_idx, audio_segment
 
-        if delta_t == 0:
-            return row["image_path"], audio_segment
-
-        frame_idx = int(row["frame_idx"])
-        subject = row["subject"]
-        task = row["task"]
-
-        # --- Image shift: load neighboring frame ---
-        new_frame_idx = frame_idx + delta_t
-        max_f = self._max_frame.get((subject, task), frame_idx)
-        new_frame_idx = max(0, min(new_frame_idx, max_f))
-
-        # Replace frame index in image path (pattern: _XXXX_image.png)
-        shifted_path = re.sub(
-            r"_(\d{4})_image\.png$",
-            f"_{new_frame_idx:04d}_image.png",
-            row["image_path"],
-        )
-
-        # --- Audio shift: roll the waveform ---
-        shift_samples = int(round(delta_t * self.target_sample_rate / self.fps))
+        # --- Audio shift: roll the waveform by the applied frame shift ---
+        applied = new_frame_idx - frame_idx
+        shift_samples = int(round(applied * self.target_sample_rate / self.fps))
         audio_segment = torch.roll(audio_segment, shifts=shift_samples)
 
-        return shifted_path, audio_segment
+        return new_frame_idx, audio_segment
 
     # ------------------------------------------------------------------
     # VTLP: Vocal Tract Length Perturbation
@@ -262,7 +322,7 @@ class USCAnnot16Dataset(Dataset):
         if random.random() > self.PITCH_PROB:
             return audio_segment
 
-        n_steps = random.uniform(-self.PITCH_SEMITONES, self.PITCH_SEMITONES)
+        n_steps = int(round(random.uniform(-self.PITCH_SEMITONES, self.PITCH_SEMITONES)))
         shifted = torchaudio.functional.pitch_shift(
             audio_segment.unsqueeze(0),
             sample_rate=self.target_sample_rate,
@@ -290,9 +350,9 @@ class USCAnnot16Dataset(Dataset):
         audio_segment = self._apply_pitch_shift(audio_segment)
 
         # ── Random time shift augmentation (image + audio) ──
-        image_path, audio_segment = self._apply_random_shift(row, audio_segment)
+        center_idx, audio_segment = self._apply_random_shift(row, audio_segment)
 
-        image = self._load_image(image_path)
+        image = self._load_image_window(row, center_idx)
 
         vals = row[self.label_columns].values.astype(np.float32)
 

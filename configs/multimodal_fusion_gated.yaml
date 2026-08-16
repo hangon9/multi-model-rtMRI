@@ -1,0 +1,86 @@
+experiment_name: multimodal_fusion_gated
+
+data:
+  dataset: USC-annot-16
+  root: data/USC-annot-16
+  phonemic_table: data/Phonemic_Table.xlsx
+  classification_task:
+  unseen_speakers: [sub023, sub028, sub043, sub061]
+  unseen_task_types: [vcv]
+  test_ratio: 0.1
+  n_splits: 5
+  train_fold: []
+  fps: 15
+  audio_sample_rate: 16000
+  window_frames: 11
+  seed: 42
+
+model:
+  image_encoder:
+    model_name: "ViT-Base"
+    pretrained: true
+    img_size: 224
+    freeze_layers: 9
+    patch_size: 16
+    hidden_size: 768
+    mlp_dim: 3072
+    num_layers: 12
+    num_heads: 12
+    dropout: 0.1
+  image_temporal:
+    temporal_type: "conformer"
+    conformer_layers: 2
+    conformer_heads: 8
+    conv_kernel_size: 5
+    dropout: 0.1
+  audio_backbone:
+    model_name: facebook/wav2vec2-large-xlsr-53
+    freeze_feature_extractor: true
+    freeze_transformer_layers: 12
+    attn_dim: 256
+    dropout: 0.1
+  audio_encoder:
+    encoder_type: "conformer"
+    conformer_layers: 2
+    conformer_heads: 8
+    conv_kernel_size: 17
+  fusion:
+    fusion_type: "gated"
+    fusion_dim: 256
+    dropout: 0.1
+  classifier:
+    clf_hidden_dim: 256
+    dropout: 0.1
+
+train:
+  epochs: 5
+  batch_size: 16
+  num_workers: 4
+  lr_image_encoder: 1.0e-5
+  lr_image_temporal: 1.0e-4
+  lr_audio_backbone: 3.0e-5
+  lr_audio_encoder: 1.0e-4
+  lr_fusion: 3.0e-4
+  lr_classifier: 5.0e-4
+  weight_decay: 0.01
+  grad_clip: 0.5
+  data_augment:
+    Random_Affine: false
+    random_time_shift: 0
+    VTLP: false
+    pitch_shift: false
+
+loss:
+  lambda_contrast: 0.0
+  contrast_loss_name: null
+  contrast_loss_kwargs: null
+  use_class_weights: true
+  bce_pos_weight: false
+  lambda_manner: 1.0
+  lambda_place: 1.0
+  lambda_voicing: 1.0
+  lambda_vowel_backness: 1.0
+
+paths:
+  checkpoint_dir: ./checkpoints
+  log_dir: ./logs

@@ -12,6 +12,8 @@ import torch.nn as nn
 
 from src.models.contrastive_model import AudioVisionContrastiveModel
 from src.models.audio_only_model import AudioMultiHeadClassifier
+from src.models.img_only_model import ImageMultiheadClassifier
+from src.models.multimodal_fusion import AudioVisionFusionModel
 from data.splits import make_train_test_split, create_dataloader
 
 
@@ -28,9 +30,13 @@ TASKS: tuple[str, ...] = ("manner", "place", "voicing", "vowel_backness")
 # Maps experiment_name values → model family tag
 _EXPERIMENT_TO_FAMILY: dict[str, str] = {
     "contrast_contrastive":               "contrastive",
-    "wav2vec2-base-960h_baseline":        "wav2vec2",
-    "wav2vec2-xlsr-53-espeak-cv-ft_baseline": "wav2vec2",
-    "hubert_baseline":                    "wav2vec2",   # same forward interface
+    "wav2vec2-base-960h_baseline":        "audio",
+    "wav2vec2-xlsr-53-espeak-cv-ft_baseline": "audio",
+    "hubert_baseline":                    "audio",   # same forward interface
+    "wav_baseline":                       "audio",
+    "img_baseline":                       "image",
+    "multimodal_fusion_concat":           "multimodal_fusion",
+    "multimodal_fusion_gated":            "multimodal_fusion",
 }
 
 
@@ -94,7 +100,7 @@ def discover_experiment_name(checkpoint_path: Path) -> str | None:
 
 def _resolve_model_family(config: dict, checkpoint_path: Path) -> str:
     """
-    Return the model-family tag ("contrastive" | "wav2vec2") for a checkpoint.
+    Return the model-family tag ("contrastive" | "wav2vec2" | "image") for a checkpoint.
 
     Resolution order
     ────────────────
@@ -127,10 +133,14 @@ def _resolve_model_family(config: dict, checkpoint_path: Path) -> str:
         family = _EXPERIMENT_TO_FAMILY.get(experiment_name)
         if family:
             return family
-        # Soft match for partial names (e.g. "wav_baseline" → wav2vec2)
+        # Soft match for partial names (e.g. "wav_baseline" → audio)
         lname = experiment_name.lower()
-        if any(k in lname for k in ("wav2vec", "hubert", "baseline")):
-            return "wav2vec2"
+        if any(k in lname for k in ("img", "resnet", "vit")):
+            return "image"
+        if any(k in lname for k in ("fusion", "multimodal")):
+            return "multimodal_fusion"
+        if any(k in lname for k in ("wav2vec", "hubert", "wav_baseline")):
+            return "audio"
 
     # 4. Default
     return "contrastive"
@@ -194,13 +204,14 @@ def _build_contrastive_model(
     ).to(device)
 
 
-def _build_wav2vec2_model(
+def _build_audio_model(
     config: dict[str, Any],
     classification_task: str,
     device: torch.device,
 ) -> AudioMultiHeadClassifier:
-    model_cfg = config.get("model", {}).get("backbone", {})
-    encoder_cfg = config.get("model", {}).get("encoder", {})
+    model_root = config.get("model", {})
+    model_cfg = model_root.get("audio_backbone", {})
+    encoder_cfg = model_root.get("audio_encoder", {})
     data_cfg = config.get("data", {})
 
     return AudioMultiHeadClassifier(
@@ -216,8 +227,52 @@ def _build_wav2vec2_model(
         conformer_layers=encoder_cfg.get("conformer_layers", 2),
         conformer_heads=encoder_cfg.get("conformer_heads", 8),
         conv_kernel_size=encoder_cfg.get("conv_kernel_size", 17),
-        audio_window_sec=data_cfg.get("audio_window_sec", 0.06667),
+        window_frames=data_cfg.get("window_frames", 1),
+        fps=data_cfg.get("fps", 15),
         sample_rate=data_cfg.get("audio_sample_rate", 16000),
+    ).to(device)
+
+def _build_image_model(
+    config: dict[str, Any],
+    classification_task: str,
+    device: torch.device,
+) -> ImageMultiheadClassifier:
+    model_cfg = config.get("model", {})
+    data_cfg = config.get("data", {})
+    img_cfg = model_cfg.get("image_encoder", {})
+    clf_cfg = model_cfg.get("classifier", {})
+    temporal_cfg = model_cfg.get("image_temporal", {})
+
+    return ImageMultiheadClassifier(
+            num_classes=NUM_CLASSES[classification_task],
+            img_size=img_cfg.get("img_size", 128),
+            patch_size=img_cfg.get("patch_size", 16),
+            hidden_size=img_cfg.get("hidden_size", 768),
+            mlp_dim=img_cfg.get("mlp_dim", 3072),
+            clf_hidden_dim=clf_cfg.get("clf_hidden_dim", 256),
+            num_layers=img_cfg.get("num_layers", 12),
+            num_heads=img_cfg.get("num_heads", 12),
+            dropout=img_cfg.get("dropout", 0.1),
+            classification_task=classification_task,
+            model_name=img_cfg.get("model_name", "vit"),
+            pretrained=img_cfg.get("pretrained", True),
+            freeze_layers=int(img_cfg.get("freeze_layers", 0)),
+            temporal_type=temporal_cfg.get("temporal_type", "none"),
+            conformer_layers=temporal_cfg.get("conformer_layers", 2),
+            conformer_heads=temporal_cfg.get("conformer_heads", 8),
+            conv_kernel_size=temporal_cfg.get("conv_kernel_size", 5),
+    ).to(device)
+
+
+def _build_multimodal_model(
+    config: dict[str, Any],
+    classification_task: str,
+    device: torch.device,
+) -> AudioVisionFusionModel:
+    return AudioVisionFusionModel(
+        num_classes=NUM_CLASSES[classification_task],
+        model_cfg=config.get("model", {}),
+        classification_task=classification_task,
     ).to(device)
 
 
@@ -230,8 +285,12 @@ def _build_model(
     """Dispatch to the appropriate model constructor."""
     if model_family == "contrastive":
         return _build_contrastive_model(config, classification_task, device)
-    if model_family == "wav2vec2":
-        return _build_wav2vec2_model(config, classification_task, device)
+    if model_family == "audio":
+        return _build_audio_model(config, classification_task, device)
+    if model_family == "image":
+        return _build_image_model(config, classification_task, device)
+    if model_family == "multimodal_fusion":
+        return _build_multimodal_model(config, classification_task, device)
     raise ValueError(f"Unknown model_family: {model_family!r}")
 
 
@@ -304,12 +363,24 @@ def _forward(
         image = batch["image"].to(device)
         return model(image=image, audio=None)
 
-    if model_family == "wav2vec2":
+    if model_family == "audio":
         audio = batch["audio"].to(device)
         attn_mask = batch.get("attention_mask")
         if attn_mask is not None:
             attn_mask = attn_mask.to(device)
         return model(audio=audio, attention_mask=attn_mask)
+
+    if model_family == "image":
+        image = batch["image"].to(device)
+        return model(image=image)
+
+    if model_family == "multimodal_fusion":
+        image = batch["image"].to(device)
+        audio = batch["audio"].to(device)
+        attn_mask = batch.get("attention_mask")
+        if attn_mask is not None:
+            attn_mask = attn_mask.to(device)
+        return model(image=image, audio=audio, attention_mask=attn_mask)
 
     raise ValueError(f"Unknown model_family: {model_family!r}")
 
@@ -375,7 +446,9 @@ def run_inference(
     Supported families
     ──────────────────
     • "contrastive"  → AudioVisionContrastiveModel   (image branch only)
-    • "wav2vec2"     → Wav2Vec2MultiHeadClassifier   (audio branch)
+    • "audio"        → AudioMultiHeadClassifier      (audio branch)
+    • "image"        → ImageMultiheadClassifier      (image branch)
+    • "multimodal_fusion" → AudioVisionFusionModel   (image + audio)
 
     Returns
     ───────
