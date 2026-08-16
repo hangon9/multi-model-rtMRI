@@ -1,5 +1,7 @@
 # AGENTS.md
 
+Read the [Research plan](Research_plan.md) first — it contains the core project guide, dataset description, architecture overview, and evaluation plan. This document is a quick reference for the codebase.
+
 Multi-modal real-time MRI (rtMRI) speech articulography research project — frame-level phonological feature classification from rtMRI video. Audio (Wav2Vec2) is used as a training-time teacher only; **inference uses only the image branch**. Master's thesis project.
 
 ## Quick start
