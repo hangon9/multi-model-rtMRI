@@ -1,98 +1,86 @@
-"""
-Train img only baseline model.
+"""训练多模态融合基线（Phase 1: concat / gated）。
 
-This script trains:
-    img -> ViT -> CLS token -> gated 4-head classifier
-for four heads: manner / place / voicing / vowel_backness (or single-task).
+训练路径：
+    image + audio -> AudioVisionFusionModel -> gated 四头分类
 
-Cross-validation follows the same pattern as train_wav_baseline.py:
-- GroupKFold on train_val subjects
-- OneCycleLR scheduler
-- Validate every 5 epochs, save best checkpoint globally across folds
+脚本行为与现有 img/wav baseline 对齐：
+- GroupKFold 按 subject 做交叉验证
+- OneCycleLR 调度
+- 每 5 轮 + 最后一轮验证
+- 保存每折最佳与全局最佳 checkpoint
 """
 
 import argparse
 from pathlib import Path
 
-import yaml
-import torch
 import numpy as np
+import torch
+import yaml
+from sklearn.model_selection import GroupKFold
 from torch.optim import AdamW
 from tqdm import tqdm
-from sklearn.model_selection import GroupKFold
 
-from data.splits import make_train_test_split, create_dataloader
-from src.models.img_only_model import ImageMultiheadClassifier
+from data.splits import create_dataloader, make_train_test_split
 from src.losses.loss_factory import BuildLoss
+from src.models.multimodal_fusion import AudioVisionFusionModel
 from utils.logger import TrainingLogger
 
 NUM_CLASSES = {
     "": 18,
     "manner": 6,
-    "place": 7,       # consonant place only; silence/vowel are gated out
-    "voicing": 2,     # consonant voicing only; silence/vowel are gated out
+    "place": 7,
+    "voicing": 2,
     "vowel_backness": 3,
 }
 TASKS = ("manner", "place", "voicing", "vowel_backness")
 
-_MANNER_COLS  = ["Silence", "Stop", "Nasal", "Fricative", "Approximant", "Vowel"]
-_PLACE_COLS   = ["Labial", "Dental", "Alveolar", "Postalveolar",
-                 "Palatal", "Velar", "Glottal"]
+_MANNER_COLS = ["Silence", "Stop", "Nasal", "Fricative", "Approximant", "Vowel"]
+_PLACE_COLS = ["Labial", "Dental", "Alveolar", "Postalveolar", "Palatal", "Velar", "Glottal"]
 _VOICING_COLS = ["Voiced", "Voiceless"]
 _VOWEL_BACKNESS_COLS = ["Front", "Central", "Back"]
 
-# Manner indices from _MANNER_COLS: Stop/Nasal/Fricative/Approximant are consonants.
 _CONSONANT_MANNER_MIN = 1
 _CONSONANT_MANNER_MAX = 4
 _VOWEL_MANNER = 5
 
 
-# ---------------------------------------------------------------------------
-# utility: class-weight helpers
-# ---------------------------------------------------------------------------
-
 def _derive_class_indices(df, task: str):
-    """Derive targets for class-weight computation with the same gating as
-    the dataset.
-    """
+    """按数据集同样的 gating 规则导出类别索引，用于类权重计算。"""
     if task == "manner":
         return df[_MANNER_COLS].values.argmax(axis=1)
 
-    elif task == "place":
-        # Consonants use 0..6; silence and vowels are ignored by CE.
+    if task == "place":
         idx = df[_PLACE_COLS].values.argmax(axis=1)
         nonspeech = (df["Silence"].values == 1.0) | (df["Vowel"].values == 1.0)
         idx[nonspeech] = -100
         return idx
 
-    elif task == "voicing":
-        # Consonants use 0..1; silence and vowels are ignored by CE.
+    if task == "voicing":
         idx = df[_VOICING_COLS].values.argmax(axis=1)
         nonspeech = (df["Silence"].values == 1.0) | (df["Vowel"].values == 1.0)
         idx[nonspeech] = -100
         return idx
 
-    elif task == "vowel_backness":
+    if task == "vowel_backness":
         return df[_VOWEL_BACKNESS_COLS].values.astype("float32")
 
-    else:
-        raise ValueError(f"Unknown task for weight derivation: {task}")
+    raise ValueError(f"Unknown task for weight derivation: {task}")
 
 
 def get_class_weights(train_df, config):
-    """Compute balanced CE class weights on valid (non-ignored) samples only."""
+    """计算 CE 任务的平衡类权重。"""
     use_class_weights = config["loss"].get("use_class_weights", False)
-    classification_task = config["data"]["classification_task"] or ""
+    classification_task = config["data"].get("classification_task", "") or ""
 
     if not use_class_weights:
         return None
 
     def _balanced_weights(class_indices, n_classes: int):
-        N = len(class_indices)
+        n_samples = len(class_indices)
         weights = np.zeros(n_classes, dtype=np.float32)
-        for c in range(n_classes):
-            count = (class_indices == c).sum()
-            weights[c] = N / (n_classes * count) if count > 0 else 0.0
+        for cls_id in range(n_classes):
+            count = (class_indices == cls_id).sum()
+            weights[cls_id] = n_samples / (n_classes * count) if count > 0 else 0.0
         if (weights == 0).any():
             max_w = weights[weights > 0].max() if (weights > 0).any() else 1.0
             weights[weights == 0] = max_w
@@ -111,42 +99,34 @@ def get_class_weights(train_df, config):
 
 
 def get_bce_pos_weight(train_df, config):
-    """Compute BCE pos_weight for vowel_backness on vowel samples only."""
+    """计算 vowel_backness 的 BCE pos_weight（仅在元音帧上统计）。"""
     if not config["loss"].get("bce_pos_weight", False):
         return None
 
     vowel_mask = train_df["Vowel"].values == 1.0
     multi_hot = train_df.loc[vowel_mask, _VOWEL_BACKNESS_COLS].values.astype("float32")
-    N = len(multi_hot)
+    n_rows = len(multi_hot)
     n_pos = multi_hot.sum(axis=0)
-    n_neg = N - n_pos
+    n_neg = n_rows - n_pos
     pos_weight = n_neg / np.maximum(n_pos, 1.0)
     return torch.tensor(pos_weight, dtype=torch.float32)
 
 
-# ---------------------------------------------------------------------------
-# data helpers
-# ---------------------------------------------------------------------------
-
 def move_labels_to_device(labels, device):
+    """将四头标签移动到 device。"""
     return {k: v.to(device, non_blocking=True) for k, v in labels.items() if k in TASKS}
 
 
-# ---------------------------------------------------------------------------
-# metrics
-# ---------------------------------------------------------------------------
-
 def compute_accuracy(logits, labels, classification_task=""):
-    """Compute per-task accuracy; in multi-task mode apply phonetic gates."""
+    """多任务时按 manner 做门控，仅在有效帧上计算对应任务精度。"""
     if classification_task == "":
         acc = {}
         if "manner" not in labels:
             return {"mean": 0.0}
 
         manner_labels = labels["manner"]
-        cons_mask = (
-            (manner_labels >= _CONSONANT_MANNER_MIN)
-            & (manner_labels <= _CONSONANT_MANNER_MAX)
+        cons_mask = (manner_labels >= _CONSONANT_MANNER_MIN) & (
+            manner_labels <= _CONSONANT_MANNER_MAX
         )
         vowel_mask = manner_labels == _VOWEL_MANNER
 
@@ -157,14 +137,18 @@ def compute_accuracy(logits, labels, classification_task=""):
             if task in ("place", "voicing"):
                 if cons_mask.any():
                     pred = logits[task].argmax(dim=-1)
-                    acc[task] = (pred[cons_mask] == labels[task][cons_mask]).float().mean().item()
+                    acc[task] = (
+                        (pred[cons_mask] == labels[task][cons_mask]).float().mean().item()
+                    )
                 else:
                     acc[task] = 0.0
 
             elif task == "vowel_backness":
                 if vowel_mask.any():
                     pred = (torch.sigmoid(logits[task]) >= 0.5).float()
-                    acc[task] = (pred[vowel_mask] == labels[task][vowel_mask]).float().mean().item()
+                    acc[task] = (
+                        (pred[vowel_mask] == labels[task][vowel_mask]).float().mean().item()
+                    )
                 else:
                     acc[task] = 0.0
 
@@ -175,18 +159,13 @@ def compute_accuracy(logits, labels, classification_task=""):
         acc["mean"] = sum(acc.values()) / max(len(acc), 1)
         return acc
 
-    # Single-task mode
     pred = logits.argmax(dim=-1)
     acc_val = (pred == labels).float().mean().item()
     return {classification_task: acc_val, "mean": acc_val}
 
 
-# ---------------------------------------------------------------------------
-# loss builder
-# ---------------------------------------------------------------------------
-
 def build_loss_from_config(config, device, class_weights=None, bce_pos_weight=None):
-    """Build BuildLoss from config (wav-style keys)."""
+    """按配置构建损失函数；Phase 1 默认不启用 contrast。"""
     loss_cfg = config.get("loss", {})
     classification_task = config["data"].get("classification_task", "") or ""
 
@@ -205,33 +184,35 @@ def build_loss_from_config(config, device, class_weights=None, bce_pos_weight=No
     return criterion.to(device)
 
 
-# ---------------------------------------------------------------------------
-# optimizer: 2-group (ViT encoder + classifier)
-# ---------------------------------------------------------------------------
-
 def _is_no_decay_param(name: str) -> bool:
+    """偏置和归一化参数不使用 weight decay。"""
     name_lower = name.lower()
-    no_decay_keywords = (
-        "bias",
-        "layernorm.weight",
-        "layer_norm.weight",
-        "norm.weight",
-    )
+    no_decay_keywords = ("bias", "layernorm.weight", "layer_norm.weight", "norm.weight")
     return any(keyword in name_lower for keyword in no_decay_keywords)
 
 
 def build_optimizer(model, config, logger=None):
-    """Build AdamW with separate LR for image_encoder and classifier."""
+    """构建分组 AdamW，分别设置 image/audio/fusion/classifier 的学习率。"""
     train_cfg = config.get("train", {})
-    encoder_lr = float(train_cfg.get("lr_encoder", 1e-4))
-    classifier_lr = float(train_cfg.get("lr_classifier", 1e-4))
-    weight_decay = float(train_cfg.get("weight_decay", 0.0))
 
-    temporal_lr = float(train_cfg.get("lr_temporal", encoder_lr))
+    lr_image_encoder = float(train_cfg.get("lr_image_encoder", 1e-5))
+    lr_image_temporal = float(train_cfg.get("lr_image_temporal", 1e-4))
+    lr_audio_backbone = float(train_cfg.get("lr_audio_backbone", 3e-5))
+    lr_audio_encoder = float(train_cfg.get("lr_audio_encoder", 1e-4))
+    lr_fusion = float(train_cfg.get("lr_fusion", 3e-4))
+    lr_classifier = float(train_cfg.get("lr_classifier", 5e-4))
+    weight_decay = float(train_cfg.get("weight_decay", 0.0))
 
     buckets = {
         f"{group}_{decay}": []
-        for group in ("encoder", "temporal", "classifier")
+        for group in (
+            "image_encoder",
+            "image_temporal",
+            "audio_backbone",
+            "audio_encoder",
+            "fusion",
+            "classifier",
+        )
         for decay in ("decay", "no_decay")
     }
 
@@ -239,26 +220,37 @@ def build_optimizer(model, config, logger=None):
         if not param.requires_grad:
             continue
 
-        is_no_decay = _is_no_decay_param(name)
-        if name.startswith("image_encoder."):
-            group = "encoder"
-        elif name.startswith("temporal."):
-            group = "temporal"
+        if name.startswith("image_branch.image_encoder."):
+            group = "image_encoder"
+        elif name.startswith("image_branch."):
+            group = "image_temporal"
+        elif name.startswith("audio_branch.backbone."):
+            group = "audio_backbone"
+        elif name.startswith("audio_branch."):
+            group = "audio_encoder"
+        elif name.startswith("fusion."):
+            group = "fusion"
         elif name.startswith("classifier."):
             group = "classifier"
         else:
-            group = "encoder"  # fallback
+            group = "fusion"
 
-        decay = "no_decay" if is_no_decay else "decay"
+        decay = "no_decay" if _is_no_decay_param(name) else "decay"
         buckets[f"{group}_{decay}"].append(param)
 
     group_specs = [
-        ("encoder_decay", encoder_lr, weight_decay),
-        ("encoder_no_decay", encoder_lr, 0.0),
-        ("temporal_decay", temporal_lr, weight_decay),
-        ("temporal_no_decay", temporal_lr, 0.0),
-        ("classifier_decay", classifier_lr, weight_decay),
-        ("classifier_no_decay", classifier_lr, 0.0),
+        ("image_encoder_decay", lr_image_encoder, weight_decay),
+        ("image_encoder_no_decay", lr_image_encoder, 0.0),
+        ("image_temporal_decay", lr_image_temporal, weight_decay),
+        ("image_temporal_no_decay", lr_image_temporal, 0.0),
+        ("audio_backbone_decay", lr_audio_backbone, weight_decay),
+        ("audio_backbone_no_decay", lr_audio_backbone, 0.0),
+        ("audio_encoder_decay", lr_audio_encoder, weight_decay),
+        ("audio_encoder_no_decay", lr_audio_encoder, 0.0),
+        ("fusion_decay", lr_fusion, weight_decay),
+        ("fusion_no_decay", lr_fusion, 0.0),
+        ("classifier_decay", lr_classifier, weight_decay),
+        ("classifier_no_decay", lr_classifier, 0.0),
     ]
 
     param_groups = []
@@ -266,12 +258,14 @@ def build_optimizer(model, config, logger=None):
         params = buckets[group_name]
         if not params:
             continue
-        param_groups.append({
-            "name": group_name,
-            "params": params,
-            "lr": lr,
-            "weight_decay": wd,
-        })
+        param_groups.append(
+            {
+                "name": group_name,
+                "params": params,
+                "lr": lr,
+                "weight_decay": wd,
+            }
+        )
 
     if not param_groups:
         raise ValueError("No trainable parameters found.")
@@ -280,35 +274,29 @@ def build_optimizer(model, config, logger=None):
         for group in param_groups:
             n_params = sum(p.numel() for p in group["params"])
             logger.info(
-                f"Optimizer group {group['name']}: "
-                f"tensors={len(group['params'])}, params={n_params}, "
-                f"lr={group['lr']}, weight_decay={group['weight_decay']}"
+                f"Optimizer group {group['name']}: tensors={len(group['params'])}, "
+                f"params={n_params}, lr={group['lr']}, weight_decay={group['weight_decay']}"
             )
 
     return AdamW(param_groups)
 
 
-# ---------------------------------------------------------------------------
-# CV split helper
-# ---------------------------------------------------------------------------
-
 def get_fold_indices(train_val_df, config):
-    """GroupKFold on train_val_df, grouped by subject."""
+    """按 subject 做 GroupKFold 划分。"""
     data_cfg = config["data"]
-    group_col = "subject"
     n_splits = data_cfg.get("n_splits", 5)
 
-    if group_col not in train_val_df.columns:
+    if "subject" not in train_val_df.columns:
         raise ValueError(
-            f"Group column '{group_col}' not found. "
+            "Group column 'subject' not found. "
             f"Available: {train_val_df.columns.tolist()}"
         )
 
-    groups = train_val_df[group_col]
+    groups = train_val_df["subject"]
     num_groups = groups.nunique()
     if num_groups < n_splits:
         raise ValueError(
-            f"GroupKFold needs >= n_splits unique groups. "
+            "GroupKFold needs >= n_splits unique groups. "
             f"Got {num_groups}, n_splits={n_splits}."
         )
 
@@ -317,21 +305,20 @@ def get_fold_indices(train_val_df, config):
 
 
 def resolve_train_folds(data_cfg, n_splits):
-    """解析 data.train_fold：留空/None → 返回 None（跑全部折）；否则校验并返回要跑的折集合。"""
+    """解析 data.train_fold：为空时跑全部折，否则仅跑指定折。"""
     raw = data_cfg.get("train_fold")
     if not raw:
         return None
     if not isinstance(raw, (list, tuple)):
         raise ValueError(
-            f"data.train_fold 必须是折号列表（如 [2, 3, 5]），留空表示全部折，"
+            "data.train_fold 必须是折号列表（如 [2, 3, 5]），留空表示全部折，"
             f"实际得到: {raw!r}"
         )
+
     folds = []
     for item in raw:
         if isinstance(item, bool) or not isinstance(item, int):
-            raise ValueError(
-                f"data.train_fold 中的元素必须是整数折号，实际得到: {item!r}"
-            )
+            raise ValueError(f"data.train_fold 中的元素必须是整数折号，实际得到: {item!r}")
         if item < 1 or item > n_splits:
             raise ValueError(
                 f"data.train_fold 中的折号超出范围 [1, {n_splits}]，实际得到: {item}"
@@ -339,36 +326,43 @@ def resolve_train_folds(data_cfg, n_splits):
         if item in folds:
             raise ValueError(f"data.train_fold 中存在重复折号: {item}")
         folds.append(item)
+
     return set(folds)
 
 
-# ---------------------------------------------------------------------------
-# training / evaluation loops
-# ---------------------------------------------------------------------------
-
-def train_one_epoch(model, loader, criterion, optimizer, scheduler, device,
-                    classification_task="", grad_clip=0.5):
+def train_one_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer,
+    scheduler,
+    device,
+    classification_task="",
+    grad_clip=0.5,
+):
+    """单轮训练，返回 loss 与准确率统计。"""
     model.train()
     total_loss = 0.0
     total_cls_loss = 0.0
-    _TASK_LOSS_KEYS = ("loss_manner", "loss_place", "loss_voicing", "loss_vowel_backness")
-    total_task_loss = {k: 0.0 for k in _TASK_LOSS_KEYS}
+    task_loss_keys = ("loss_manner", "loss_place", "loss_voicing", "loss_vowel_backness")
+    total_task_loss = {k: 0.0 for k in task_loss_keys}
     total_acc = {"mean": 0.0}
-    n = 0
+    n_samples = 0
 
     for batch in tqdm(loader, desc="train", leave=False):
         image = batch["image"].to(device, non_blocking=True)
+        audio = batch["audio"].to(device, non_blocking=True)
         labels = move_labels_to_device(batch["labels"], device)
 
         optimizer.zero_grad(set_to_none=True)
 
-        outputs = model(image, classification_task=classification_task)
+        outputs = model(image=image, audio=audio, classification_task=classification_task)
         logits = outputs["logits"]
 
         loss_dict = criterion(
             logits=logits,
             labels=labels,
-            visual_flat=outputs.get("pooled_embedding"),
+            visual_flat=outputs.get("fused_embedding"),
             audio_flat=None,
             classification_task=classification_task,
         )
@@ -391,45 +385,49 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device,
         bs = image.size(0)
         total_loss += loss.item() * bs
         total_cls_loss += loss_dict.get("cls_loss", torch.tensor(0.0)).item() * bs
-        for k in _TASK_LOSS_KEYS:
-            if k in loss_dict:
-                total_task_loss[k] += loss_dict[k].item() * bs
+        for key in task_loss_keys:
+            if key in loss_dict:
+                total_task_loss[key] += loss_dict[key].item() * bs
+
         batch_acc = compute_accuracy(logits, labels, classification_task)
-        for k in batch_acc:
-            total_acc.setdefault(k, 0.0)
-            total_acc[k] += batch_acc[k] * bs
-        n += bs
+        for key in batch_acc:
+            total_acc.setdefault(key, 0.0)
+            total_acc[key] += batch_acc[key] * bs
+
+        n_samples += bs
 
     result = {
-        "loss": total_loss / n,
-        "cls_loss": total_cls_loss / n,
-        "acc": {k: v / n for k, v in total_acc.items()},
+        "loss": total_loss / n_samples,
+        "cls_loss": total_cls_loss / n_samples,
+        "acc": {k: v / n_samples for k, v in total_acc.items()},
     }
-    result.update({k: v / n for k, v in total_task_loss.items()})
+    result.update({k: v / n_samples for k, v in total_task_loss.items()})
     return result
 
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, device, classification_task="", name="val"):
+    """验证循环，计算与训练一致的统计指标。"""
     model.eval()
     total_loss = 0.0
     total_cls_loss = 0.0
-    _TASK_LOSS_KEYS = ("loss_manner", "loss_place", "loss_voicing", "loss_vowel_backness")
-    total_task_loss = {k: 0.0 for k in _TASK_LOSS_KEYS}
+    task_loss_keys = ("loss_manner", "loss_place", "loss_voicing", "loss_vowel_backness")
+    total_task_loss = {k: 0.0 for k in task_loss_keys}
     total_acc = {"mean": 0.0}
-    n = 0
+    n_samples = 0
 
     for batch in tqdm(loader, desc=name, leave=False):
         image = batch["image"].to(device, non_blocking=True)
+        audio = batch["audio"].to(device, non_blocking=True)
         labels = move_labels_to_device(batch["labels"], device)
 
-        outputs = model(image, classification_task=classification_task)
+        outputs = model(image=image, audio=audio, classification_task=classification_task)
         logits = outputs["logits"]
 
         loss_dict = criterion(
             logits=logits,
             labels=labels,
-            visual_flat=outputs.get("pooled_embedding"),
+            visual_flat=outputs.get("fused_embedding"),
             audio_flat=None,
             classification_task=classification_task,
         )
@@ -438,31 +436,30 @@ def evaluate(model, loader, criterion, device, classification_task="", name="val
         bs = image.size(0)
         total_loss += loss.item() * bs
         total_cls_loss += loss_dict.get("cls_loss", torch.tensor(0.0)).item() * bs
-        for k in _TASK_LOSS_KEYS:
-            if k in loss_dict:
-                total_task_loss[k] += loss_dict[k].item() * bs
+        for key in task_loss_keys:
+            if key in loss_dict:
+                total_task_loss[key] += loss_dict[key].item() * bs
+
         batch_acc = compute_accuracy(logits, labels, classification_task)
-        for k in batch_acc:
-            total_acc.setdefault(k, 0.0)
-            total_acc[k] += batch_acc[k] * bs
-        n += bs
+        for key in batch_acc:
+            total_acc.setdefault(key, 0.0)
+            total_acc[key] += batch_acc[key] * bs
+
+        n_samples += bs
 
     result = {
-        "loss": total_loss / n,
-        "cls_loss": total_cls_loss / n,
-        "acc": {k: v / n for k, v in total_acc.items()},
+        "loss": total_loss / n_samples,
+        "cls_loss": total_cls_loss / n_samples,
+        "acc": {k: v / n_samples for k, v in total_acc.items()},
     }
-    result.update({k: v / n for k, v in total_task_loss.items()})
+    result.update({k: v / n_samples for k, v in total_task_loss.items()})
     return result
 
 
-# ---------------------------------------------------------------------------
-# main
-# ---------------------------------------------------------------------------
-
 def main():
+    """训练入口。"""
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/img_baseline_config.yaml")
+    parser.add_argument("--config", type=str, default="configs/multimodal_fusion_concat.yaml")
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -470,18 +467,12 @@ def main():
 
     train_cfg = config.get("train", {})
     model_cfg = config.get("model", {})
-    img_cfg = model_cfg.get("image_encoder", {})
-    model_name = img_cfg.get("model_name", "vit")
-    temporal_cfg = model_cfg.get("image_temporal", {})
-    freeze_layers = int(img_cfg.get("freeze_layers", 0))
-    clf_cfg = model_cfg.get("classifier", {})
     data_cfg = config.get("data", {})
     classification_task = data_cfg.get("classification_task", "") or ""
     grad_clip = train_cfg.get("grad_clip", 0.5)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # ---- logger ----
     logger = TrainingLogger(
         log_dir=config["paths"]["log_dir"],
         config=config,
@@ -490,7 +481,6 @@ def main():
     logger.info(f"Config loaded from {args.config}")
     logger.info(f"Using device: {device}")
 
-    # ---- data ----
     train_val_df, _test_sets = make_train_test_split(config)
     logger.info(
         f"unseen_speakers={data_cfg.get('unseen_speakers')} "
@@ -503,8 +493,7 @@ def main():
     checkpoint_dir = Path(config["paths"]["checkpoint_dir"])
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Image encoder: {model_name}, freeze_layers: {freeze_layers}")
-    logger.info(f"Temporal encoder: {temporal_cfg.get('temporal_type', 'none')}")
+    logger.info(f"Fusion type: {model_cfg.get('fusion', {}).get('fusion_type', 'concat')}")
     logger.info(f"Classification task: {classification_task or 'multi-task'}")
     logger.info(f"Cross-validation: {n_splits} folds, {num_epochs} epochs each")
     if train_folds is None:
@@ -519,6 +508,7 @@ def main():
         fold_id = fold + 1
         if train_folds is not None and fold_id not in train_folds:
             continue
+
         logger.info(f"{'=' * 60}")
         logger.info(f"Fold {fold_id}/{n_splits}")
         logger.info(f"{'=' * 60}")
@@ -530,37 +520,22 @@ def main():
         train_loader = create_dataloader(train_df, config, train=True)
         val_loader = create_dataloader(val_df, config, train=False)
 
-        # ---- model ----
-        
-        model = ImageMultiheadClassifier(
+        model = AudioVisionFusionModel(
             num_classes=NUM_CLASSES[classification_task],
-            img_size=img_cfg.get("img_size", 128),
-            patch_size=img_cfg.get("patch_size", 16),
-            hidden_size=img_cfg.get("hidden_size", 768),
-            mlp_dim=img_cfg.get("mlp_dim", 3072),
-            clf_hidden_dim=clf_cfg.get("clf_hidden_dim", 256),
-            num_layers=img_cfg.get("num_layers", 12),
-            num_heads=img_cfg.get("num_heads", 12),
-            dropout=img_cfg.get("dropout", 0.1),
+            model_cfg=model_cfg,
             classification_task=classification_task,
-            model_name=model_name,
-            pretrained=img_cfg.get("pretrained", True),
-            freeze_layers=freeze_layers,
-            temporal_type=temporal_cfg.get("temporal_type", "none"),
-            conformer_layers=temporal_cfg.get("conformer_layers", 2),
-            conformer_heads=temporal_cfg.get("conformer_heads", 8),
-            conv_kernel_size=temporal_cfg.get("conv_kernel_size", 5),
         ).to(device)
 
-        # ---- loss & optimizer & scheduler ----
         class_weights = get_class_weights(train_df, config)
         bce_pos_weight = get_bce_pos_weight(train_df, config)
         criterion = build_loss_from_config(
-            config, device, class_weights=class_weights, bce_pos_weight=bce_pos_weight,
+            config,
+            device,
+            class_weights=class_weights,
+            bce_pos_weight=bce_pos_weight,
         )
 
         optimizer = build_optimizer(model, config, logger=logger)
-
         max_lrs = [group["lr"] for group in optimizer.param_groups]
 
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -575,26 +550,31 @@ def main():
         fold_best_val_loss = float("inf")
         fold_best_ckpt_path = checkpoint_dir / f"best_model_fold_{fold_id}.pt"
 
-        # ---- training loop ----
         for epoch in range(num_epochs):
             train_log = train_one_epoch(
-                model, train_loader, criterion, optimizer, scheduler, device,
-                classification_task=classification_task, grad_clip=grad_clip,
+                model,
+                train_loader,
+                criterion,
+                optimizer,
+                scheduler,
+                device,
+                classification_task=classification_task,
+                grad_clip=grad_clip,
             )
 
-            _lr_lookup = {
-                group["name"]: group["lr"]
-                for group in optimizer.param_groups
-            }
+            lr_lookup = {group["name"]: group["lr"] for group in optimizer.param_groups}
 
             logger.log_metrics(
                 fold_id=fold_id,
                 epoch=epoch,
                 phase="training",
                 metrics=train_log,
-                lr_encoder=_lr_lookup.get("encoder_decay", _lr_lookup.get("encoder_no_decay", 0.0)),
-                lr_pooling=_lr_lookup.get("temporal_decay", _lr_lookup.get("temporal_no_decay", 0.0)),
-                lr_classifier=_lr_lookup.get("classifier_decay", _lr_lookup.get("classifier_no_decay", 0.0)),
+                lr_backbone=lr_lookup.get("audio_backbone_decay", lr_lookup.get("audio_backbone_no_decay", 0.0)),
+                lr_encoder=lr_lookup.get("audio_encoder_decay", lr_lookup.get("audio_encoder_no_decay", 0.0)),
+                lr_pooling=lr_lookup.get("image_temporal_decay", lr_lookup.get("image_temporal_no_decay", 0.0)),
+                lr_downstream=lr_lookup.get("image_encoder_decay", lr_lookup.get("image_encoder_no_decay", 0.0)),
+                lr_global=lr_lookup.get("fusion_decay", lr_lookup.get("fusion_no_decay", 0.0)),
+                lr_classifier=lr_lookup.get("classifier_decay", lr_lookup.get("classifier_no_decay", 0.0)),
                 classification_task=classification_task,
                 log_to_console=False,
             )
@@ -611,8 +591,12 @@ def main():
 
             if epoch % 5 == 0 or epoch == num_epochs - 1:
                 val_log = evaluate(
-                    model, val_loader, criterion, device,
-                    classification_task=classification_task, name="val",
+                    model,
+                    val_loader,
+                    criterion,
+                    device,
+                    classification_task=classification_task,
+                    name="val",
                 )
 
                 logger.log_metrics(
@@ -620,9 +604,12 @@ def main():
                     epoch=epoch,
                     phase="validation",
                     metrics=val_log,
-                    lr_encoder=_lr_lookup.get("encoder_decay", _lr_lookup.get("encoder_no_decay", 0.0)),
-                    lr_pooling=_lr_lookup.get("temporal_decay", _lr_lookup.get("temporal_no_decay", 0.0)),
-                    lr_classifier=_lr_lookup.get("classifier_decay", _lr_lookup.get("classifier_no_decay", 0.0)),
+                    lr_backbone=lr_lookup.get("audio_backbone_decay", lr_lookup.get("audio_backbone_no_decay", 0.0)),
+                    lr_encoder=lr_lookup.get("audio_encoder_decay", lr_lookup.get("audio_encoder_no_decay", 0.0)),
+                    lr_pooling=lr_lookup.get("image_temporal_decay", lr_lookup.get("image_temporal_no_decay", 0.0)),
+                    lr_downstream=lr_lookup.get("image_encoder_decay", lr_lookup.get("image_encoder_no_decay", 0.0)),
+                    lr_global=lr_lookup.get("fusion_decay", lr_lookup.get("fusion_no_decay", 0.0)),
+                    lr_classifier=lr_lookup.get("classifier_decay", lr_lookup.get("classifier_no_decay", 0.0)),
                     classification_task=classification_task,
                     log_to_console=False,
                 )
@@ -635,7 +622,6 @@ def main():
                     f"vb={val_log.get('loss_vowel_backness', 0):.3f}) "
                     f"acc={val_log['acc']['mean']:.3f}"
                 )
-
                 logger.info(log_msg)
 
                 if val_log["loss"] < fold_best_val_loss:
@@ -653,9 +639,8 @@ def main():
                         fold_best_ckpt_path,
                     )
                     logger.info(
-                        f"Fold best checkpoint saved (Fold {fold_id}, "
-                        f"Epoch {epoch + 1}, val_loss={fold_best_val_loss:.4f}): "
-                        f"{fold_best_ckpt_path}"
+                        f"Fold best checkpoint saved (Fold {fold_id}, Epoch {epoch + 1}, "
+                        f"val_loss={fold_best_val_loss:.4f}): {fold_best_ckpt_path}"
                     )
 
                 if val_log["loss"] < global_best_val_loss:
@@ -677,17 +662,18 @@ def main():
                         ckpt_path,
                     )
                     logger.info(
-                        f"Global best checkpoint saved (Fold {fold_id}, "
-                        f"Epoch {epoch + 1}, val_loss={global_best_val_loss:.4f}): {ckpt_path}"
+                        f"Global best checkpoint saved (Fold {fold_id}, Epoch {epoch + 1}, "
+                        f"val_loss={global_best_val_loss:.4f}): {ckpt_path}"
                     )
             else:
                 logger.info(log_msg)
 
     logger.info(f"{'=' * 60}")
-    logger.info(f"Training finished. Best val_loss across all folds: {global_best_val_loss:.4f}")
+    logger.info(
+        f"Training finished. Best val_loss across all folds: {global_best_val_loss:.4f}"
+    )
     logger.info(f"Best checkpoint: {global_best_ckpt_path}")
 
 
 if __name__ == "__main__":
     main()
-

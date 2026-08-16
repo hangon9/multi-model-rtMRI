@@ -262,7 +262,8 @@ def _is_no_decay_param(name: str) -> bool:
 def get_optimizer_hparams(config):
     """Read optimizer hyperparameters with backward-compatible fallbacks."""
     train_cfg = config.get("train", {})
-    model_cfg = config.get("model", {}).get("backbone", {})
+    model_root = config.get("model", {})
+    model_cfg = model_root.get("audio_backbone", {})
     loss_cfg = config.get("loss", {})
 
     fallback_lr = train_cfg.get("lr", 1e-5)
@@ -537,8 +538,9 @@ def main():
 
     config = load_config(args.config)
     train_cfg = config.get("train", {})
-    model_cfg = config.get("model", {}).get("backbone", {})
-    encoder_cfg = config.get("model", {}).get("encoder", {})
+    model_root = config.get("model", {})
+    model_cfg = model_root.get("audio_backbone", {})
+    encoder_cfg = model_root.get("audio_encoder", {})
     data_cfg = config.get("data", {})
     classification_task = config.get("data", {}).get("classification_task", "") or ""
     grad_clip = train_cfg.get("grad_clip", 0.5)

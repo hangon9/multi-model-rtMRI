@@ -13,6 +13,7 @@ import torch.nn as nn
 from src.models.contrastive_model import AudioVisionContrastiveModel
 from src.models.audio_only_model import AudioMultiHeadClassifier
 from src.models.img_only_model import ImageMultiheadClassifier
+from src.models.multimodal_fusion import AudioVisionFusionModel
 from data.splits import make_train_test_split, create_dataloader
 
 
@@ -29,10 +30,13 @@ TASKS: tuple[str, ...] = ("manner", "place", "voicing", "vowel_backness")
 # Maps experiment_name values → model family tag
 _EXPERIMENT_TO_FAMILY: dict[str, str] = {
     "contrast_contrastive":               "contrastive",
-    "wav2vec2-base-960h_baseline":        "wav2vec2",
-    "wav2vec2-xlsr-53-espeak-cv-ft_baseline": "wav2vec2",
-    "hubert_baseline":                    "wav2vec2",   # same forward interface
+    "wav2vec2-base-960h_baseline":        "audio",
+    "wav2vec2-xlsr-53-espeak-cv-ft_baseline": "audio",
+    "hubert_baseline":                    "audio",   # same forward interface
+    "wav_baseline":                       "audio",
     "img_baseline":                       "image",
+    "multimodal_fusion_concat":           "multimodal_fusion",
+    "multimodal_fusion_gated":            "multimodal_fusion",
 }
 
 
@@ -131,9 +135,11 @@ def _resolve_model_family(config: dict, checkpoint_path: Path) -> str:
             return family
         # Soft match for partial names (e.g. "wav_baseline" → audio)
         lname = experiment_name.lower()
-        if any(k in lname for k in ("img", "ResNet", "ViT")):
+        if any(k in lname for k in ("img", "resnet", "vit")):
             return "image"
-        if any(k in lname for k in ("wav2vec", "hubert", "baseline")):
+        if any(k in lname for k in ("fusion", "multimodal")):
+            return "multimodal_fusion"
+        if any(k in lname for k in ("wav2vec", "hubert", "wav_baseline")):
             return "audio"
 
     # 4. Default
@@ -203,8 +209,9 @@ def _build_audio_model(
     classification_task: str,
     device: torch.device,
 ) -> AudioMultiHeadClassifier:
-    model_cfg = config.get("model", {}).get("backbone", {})
-    encoder_cfg = config.get("model", {}).get("encoder", {})
+    model_root = config.get("model", {})
+    model_cfg = model_root.get("audio_backbone", {})
+    encoder_cfg = model_root.get("audio_encoder", {})
     data_cfg = config.get("data", {})
 
     return AudioMultiHeadClassifier(
@@ -234,7 +241,7 @@ def _build_image_model(
     data_cfg = config.get("data", {})
     img_cfg = model_cfg.get("image_encoder", {})
     clf_cfg = model_cfg.get("classifier", {})
-    temporal_cfg = model_cfg.get("temporal", {})
+    temporal_cfg = model_cfg.get("image_temporal", {})
 
     return ImageMultiheadClassifier(
             num_classes=NUM_CLASSES[classification_task],
@@ -257,6 +264,18 @@ def _build_image_model(
     ).to(device)
 
 
+def _build_multimodal_model(
+    config: dict[str, Any],
+    classification_task: str,
+    device: torch.device,
+) -> AudioVisionFusionModel:
+    return AudioVisionFusionModel(
+        num_classes=NUM_CLASSES[classification_task],
+        model_cfg=config.get("model", {}),
+        classification_task=classification_task,
+    ).to(device)
+
+
 def _build_model(
     config: dict[str, Any],
     classification_task: str,
@@ -270,6 +289,8 @@ def _build_model(
         return _build_audio_model(config, classification_task, device)
     if model_family == "image":
         return _build_image_model(config, classification_task, device)
+    if model_family == "multimodal_fusion":
+        return _build_multimodal_model(config, classification_task, device)
     raise ValueError(f"Unknown model_family: {model_family!r}")
 
 
@@ -353,6 +374,14 @@ def _forward(
         image = batch["image"].to(device)
         return model(image=image)
 
+    if model_family == "multimodal_fusion":
+        image = batch["image"].to(device)
+        audio = batch["audio"].to(device)
+        attn_mask = batch.get("attention_mask")
+        if attn_mask is not None:
+            attn_mask = attn_mask.to(device)
+        return model(image=image, audio=audio, attention_mask=attn_mask)
+
     raise ValueError(f"Unknown model_family: {model_family!r}")
 
 
@@ -418,7 +447,8 @@ def run_inference(
     ──────────────────
     • "contrastive"  → AudioVisionContrastiveModel   (image branch only)
     • "audio"        → AudioMultiHeadClassifier      (audio branch)
-    • "image"        → ImageMultiheadClassifier       (image branch)
+    • "image"        → ImageMultiheadClassifier      (image branch)
+    • "multimodal_fusion" → AudioVisionFusionModel   (image + audio)
 
     Returns
     ───────
