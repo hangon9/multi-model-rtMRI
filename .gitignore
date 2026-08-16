@@ -105,3 +105,6 @@ old/*
 
 # Results
 eval_output/*
+
+# Configs
+configs/*.yaml
