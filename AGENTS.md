@@ -13,6 +13,7 @@ Multi-modal real-time MRI (rtMRI) speech articulography research project — fra
 - Train contrastive model: `python train_contrast.py --config configs/multimode_baseline_config.yaml`
 - Evaluate: `python -m src.eval.evaluate --checkpoint checkpoints/best_model.pt --log-dir logs/<experiment>_<YYYYMMDD_HHMMSS>`
   - `--eval-folds`: compare per-fold checkpoints (`checkpoints/best_model_fold_{1..5}.pt`).
+  - `--eval-folds` 只对比 `data.train_fold` 中列出的折（未列出时对比全部已发现折），避免历史遗留折 checkpoint 干扰。
   - `--skip-inference`: reuse cached `raw/results.pkl` instead of re-running inference.
   - All three test modes (`unseen_speaker`/`unseen_task`/`unseen_both`) run automatically.
 
@@ -35,9 +36,9 @@ Shared across all pipelines:
 - `data.classification_task`: `""` = multi-task (all 4 heads); otherwise one of `manner|place|voicing|vowel_backness`.
 - `data.window_frames`: `1` = single-frame; `5` = multi-frame (image + audio share the window; must be odd).
 - `data.phonemic_table` must point to `data/Phonemic_Table.xlsx`.
-- Image model: `model.image_encoder.model_name` ∈ {vit, ViT-Base, ResNet50}; `model.temporal.temporal_type` ∈ {none, conformer}.
+- Image model: `model.image_encoder.model_name` ∈ {vit, ViT-Base, ResNet50}; `model.image_temporal.temporal_type` ∈ {none, conformer}.
 - Audio model: `model.backbone.model_name` (HF id); `model.encoder.encoder_type` ∈ {attention, conformer}.
-- LR groups: img → `lr_encoder`/`lr_temporal`/`lr_classifier`; wav → `lr_backbone`/`lr_encoder`/`lr_classifier`/`lr_global`.
+- LR groups: img → `lr_image_encoder`/`lr_image_temporal`/`lr_classifier`; wav → `lr_backbone`/`lr_encoder`/`lr_classifier`/`lr_global`.
 - Loss: `loss.lambda_*` per task; `loss.contrast_loss_name` ∈ {null, cosine, infonce}; `loss.use_class_weights: true`.
 - **Pitfall**: the older `configs/multimode_baseline_config.yaml` uses different keys (`model.image_encoder.type`, `loss.contrast_loss`, `train.lr`) than the img/wav configs — don't assume shared structure.
 
@@ -67,3 +68,6 @@ Shared across all pipelines:
 | `docs/test_plan.md` | Shape/overfit test plan. |
 | `docs/problems0613.md` | Historical bug-diagnosis report (mostly fixed in current scripts). |
 | `docs/meeting0601_note.txt` | Meeting notes / roadmap context. |
+
+## Results clearfication
+Every result in the 'hpc' folder are the results of the experiments conducted on the HPC cluster. Other results outside the 'hpc' folder are the results of the experiments conducted on the local machine. DO NOT cofuse them.

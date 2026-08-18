@@ -402,7 +402,24 @@ def _run_fold_comparison(
     mode: str,
     out_dir: Path,
     skip_inference: bool = False,
+    allowed_folds: set[int] | None = None,
 ) -> None:
+    """对每个训练折 checkpoint 推理并输出折间对比指标与图。
+
+    若 allowed_folds 非空，只比较其中的折号，避免目录中历史遗留的旧折
+    checkpoint（不属于本次训练）干扰对比。
+
+    Args:
+        checkpoint_dir: 存放 best_model.pt 与 best_model_fold_*.pt 的目录。
+        device: 推理设备。
+        mode: 测试模式名。
+        out_dir: 折间对比输出目录。
+        skip_inference: True 时优先复用 raw/results_fold{fold}.pkl 缓存。
+        allowed_folds: 仅比较这些折；None 表示全部已发现折。
+
+    Returns:
+        None；指标 JSON 与图写入 out_dir。
+    """
     from src.eval.inference import discover_fold_checkpoints, run_inference_all_folds
 
     checkpoint_dir = Path(checkpoint_dir)
@@ -415,8 +432,20 @@ def _run_fold_comparison(
     ensure_dir(raw_dir)
 
     fold_checkpoints = discover_fold_checkpoints(checkpoint_dir)
+    if allowed_folds is not None:
+        fold_checkpoints = {
+            fold_id: path
+            for fold_id, path in fold_checkpoints.items()
+            if fold_id in allowed_folds
+        }
     if not fold_checkpoints:
-        print(f"[evaluate] No best_model_fold_*.pt files found in {checkpoint_dir}; skipping fold comparison.")
+        folds_text = (
+            f" for folds {sorted(allowed_folds)}" if allowed_folds is not None else ""
+        )
+        print(
+            f"[evaluate] No best_model_fold_*.pt files{folds_text} "
+            f"found in {checkpoint_dir}; skipping fold comparison."
+        )
         return
 
     per_fold: Dict[int, Tuple[Dict[str, Dict[str, np.ndarray]], Dict[str, Any]]] = {}
@@ -433,7 +462,12 @@ def _run_fold_comparison(
 
         if missing_folds:
             print(f"[evaluate] Running inference for missing folds: {missing_folds}")
-            fresh = run_inference_all_folds(checkpoint_dir, device=device, mode=mode)
+            fresh = run_inference_all_folds(
+                checkpoint_dir,
+                device=device,
+                mode=mode,
+                allowed_folds=allowed_folds,
+            )
             for fold_id, value in fresh.items():
                 cache_path = raw_dir / f"results_fold{fold_id}.pkl"
                 with cache_path.open("wb") as f:
@@ -441,7 +475,12 @@ def _run_fold_comparison(
                 per_fold[fold_id] = value
     else:
         print("[evaluate] Running fold-comparison inference ...")
-        per_fold = run_inference_all_folds(checkpoint_dir, device=device, mode=mode)
+        per_fold = run_inference_all_folds(
+            checkpoint_dir,
+            device=device,
+            mode=mode,
+            allowed_folds=allowed_folds,
+        )
         for fold_id, value in per_fold.items():
             cache_path = raw_dir / f"results_fold{fold_id}.pkl"
             with cache_path.open("wb") as f:
@@ -551,7 +590,20 @@ def _run_eval_for_mode(
     run_fold_comparison: bool,
     checkpoint_dir: Path,
 ) -> None:
-    """跑一次 inference + per-task 图/metrics + meta,全部写入 eval_root 下。"""
+    """对单个测试模式执行推理、per-task 指标与图，并可选做折间对比。
+
+    Args:
+        mode: 测试模式名（unseen_speaker/unseen_task/unseen_both）。
+        eval_root: 本模式的输出根目录。
+        checkpoint_path: 全局最优 checkpoint 路径（best_model.pt）。
+        device: 推理设备。
+        skip_inference: True 时复用缓存的 results.pkl。
+        run_fold_comparison: 是否继续执行折间对比。
+        checkpoint_dir: 存放 best_model_fold_*.pt 的目录。
+
+    Returns:
+        None；结果写入 eval_root 下的 figures/metrics/raw/fold_comparison。
+    """
     figures_dir = eval_root / "figures"
     raw_dir     = eval_root / "raw"
     metrics_dir = eval_root / "metrics"
@@ -601,12 +653,22 @@ def _run_eval_for_mode(
     print(f"[evaluate][{mode}] Saved meta → {meta_path}")
 
     if run_fold_comparison:
+        # 只对比本次训练实际跑过的折（data.train_fold），跳过目录中的历史遗留 checkpoint
+        data_cfg = (meta.get("config") or {}).get("data", {})
+        train_fold = data_cfg.get("train_fold")
+        if isinstance(train_fold, int):
+            allowed_folds = {train_fold}
+        elif train_fold:
+            allowed_folds = {int(fold) for fold in train_fold}
+        else:
+            allowed_folds = None
         _run_fold_comparison(
             checkpoint_dir=checkpoint_dir,
             device=device,
             mode=mode,
             out_dir=fold_comparison_dir,
             skip_inference=skip_inference,
+            allowed_folds=allowed_folds,
         )
 
 # ---------------------------------------------------------------------------

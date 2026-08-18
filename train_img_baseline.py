@@ -221,17 +221,30 @@ def _is_no_decay_param(name: str) -> bool:
 
 
 def build_optimizer(model, config, logger=None):
-    """Build AdamW with separate LR for image_encoder and classifier."""
+    """按参数前缀分组构建 AdamW，图像编码器/图像时间编码/分类头使用独立学习率。
+
+    配置键统一为 lr_image_encoder、lr_image_temporal、lr_classifier、
+    weight_decay；参数按模块前缀 image_encoder./temporal./classifier. 分组，
+    每个组再按是否权重衰减拆分为 decay/no_decay 两个子组。
+
+    Args:
+        model: 待优化的 ImageMultiheadClassifier。
+        config: 完整 YAML 配置，读取 train 段的学习率与权重衰减。
+        logger: 可选日志器，用于输出每组参数统计。
+
+    Returns:
+        配置好的 AdamW 优化器。
+    """
     train_cfg = config.get("train", {})
-    encoder_lr = float(train_cfg.get("lr_encoder", 1e-4))
+    encoder_lr = float(train_cfg.get("lr_image_encoder", 1e-4))
     classifier_lr = float(train_cfg.get("lr_classifier", 1e-4))
     weight_decay = float(train_cfg.get("weight_decay", 0.0))
 
-    temporal_lr = float(train_cfg.get("lr_temporal", encoder_lr))
+    temporal_lr = float(train_cfg.get("lr_image_temporal", encoder_lr))
 
     buckets = {
         f"{group}_{decay}": []
-        for group in ("encoder", "temporal", "classifier")
+        for group in ("image_encoder", "image_temporal", "classifier")
         for decay in ("decay", "no_decay")
     }
 
@@ -241,22 +254,22 @@ def build_optimizer(model, config, logger=None):
 
         is_no_decay = _is_no_decay_param(name)
         if name.startswith("image_encoder."):
-            group = "encoder"
+            group = "image_encoder"
         elif name.startswith("temporal."):
-            group = "temporal"
+            group = "image_temporal"
         elif name.startswith("classifier."):
             group = "classifier"
         else:
-            group = "encoder"  # fallback
+            group = "image_encoder"  # 顶层 norm 等参数归入图像编码器组
 
         decay = "no_decay" if is_no_decay else "decay"
         buckets[f"{group}_{decay}"].append(param)
 
     group_specs = [
-        ("encoder_decay", encoder_lr, weight_decay),
-        ("encoder_no_decay", encoder_lr, 0.0),
-        ("temporal_decay", temporal_lr, weight_decay),
-        ("temporal_no_decay", temporal_lr, 0.0),
+        ("image_encoder_decay", encoder_lr, weight_decay),
+        ("image_encoder_no_decay", encoder_lr, 0.0),
+        ("image_temporal_decay", temporal_lr, weight_decay),
+        ("image_temporal_no_decay", temporal_lr, 0.0),
         ("classifier_decay", classifier_lr, weight_decay),
         ("classifier_no_decay", classifier_lr, 0.0),
     ]
@@ -461,6 +474,11 @@ def evaluate(model, loader, criterion, device, classification_task="", name="val
 # ---------------------------------------------------------------------------
 
 def main():
+    """训练入口：解析 --config 指定的 YAML 并执行完整训练流程。
+
+    副作用：在 paths.checkpoint_dir 写入 best_model*.pt，并在 paths.log_dir 下
+    创建运行目录（若已存在会删除重建）。
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/img_baseline_config.yaml")
     args = parser.parse_args()
@@ -592,8 +610,8 @@ def main():
                 epoch=epoch,
                 phase="training",
                 metrics=train_log,
-                lr_encoder=_lr_lookup.get("encoder_decay", _lr_lookup.get("encoder_no_decay", 0.0)),
-                lr_pooling=_lr_lookup.get("temporal_decay", _lr_lookup.get("temporal_no_decay", 0.0)),
+                lr_encoder=_lr_lookup.get("image_encoder_decay", _lr_lookup.get("image_encoder_no_decay", 0.0)),
+                lr_pooling=_lr_lookup.get("image_temporal_decay", _lr_lookup.get("image_temporal_no_decay", 0.0)),
                 lr_classifier=_lr_lookup.get("classifier_decay", _lr_lookup.get("classifier_no_decay", 0.0)),
                 classification_task=classification_task,
                 log_to_console=False,
@@ -620,8 +638,8 @@ def main():
                     epoch=epoch,
                     phase="validation",
                     metrics=val_log,
-                    lr_encoder=_lr_lookup.get("encoder_decay", _lr_lookup.get("encoder_no_decay", 0.0)),
-                    lr_pooling=_lr_lookup.get("temporal_decay", _lr_lookup.get("temporal_no_decay", 0.0)),
+                    lr_encoder=_lr_lookup.get("image_encoder_decay", _lr_lookup.get("image_encoder_no_decay", 0.0)),
+                    lr_pooling=_lr_lookup.get("image_temporal_decay", _lr_lookup.get("image_temporal_no_decay", 0.0)),
                     lr_classifier=_lr_lookup.get("classifier_decay", _lr_lookup.get("classifier_no_decay", 0.0)),
                     classification_task=classification_task,
                     log_to_console=False,
