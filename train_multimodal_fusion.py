@@ -1,4 +1,4 @@
-"""训练多模态融合基线（Phase 1: concat / gated）。
+"""训练多模态融合基线（Phase 1/2: concat / gated / cross_attention）。
 
 训练路径：
     image + audio -> AudioVisionFusionModel -> gated 四头分类
@@ -352,6 +352,10 @@ def train_one_epoch(
     for batch in tqdm(loader, desc="train", leave=False):
         image = batch["image"].to(device, non_blocking=True)
         audio = batch["audio"].to(device, non_blocking=True)
+
+
+
+
         labels = move_labels_to_device(batch["labels"], device)
 
         optimizer.zero_grad(set_to_none=True)

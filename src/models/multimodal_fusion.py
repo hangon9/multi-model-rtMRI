@@ -5,6 +5,7 @@ from src.models.attention_pooling import AttentionPooling, CenterBiasedAttention
 from src.models.audio_ssl_encoder import AudioSSLEncoder
 from src.models.classifier import ClassificationHead
 from src.models.conformer_encoder import ConformerEncoder
+from src.models.fusion_blocks import CrossAttentionFusion
 from src.models.img_encoder import build_image_encoder
 from src.models.img_only_model import ImageTemporalEncoder
 
@@ -206,7 +207,7 @@ class FusionModule(nn.Module):
 
 
 class AudioVisionFusionModel(nn.Module):
-    """多模态融合模型（Phase 1）：图像+音频联合分类，支持 concat/gated。"""
+    """多模态融合模型（Phase 1/2）：图像+音频联合分类，支持 concat/gated/cross_attention。"""
 
     def __init__(
         self,
@@ -232,11 +233,20 @@ class AudioVisionFusionModel(nn.Module):
             backbone_cfg=backbone_cfg,
             encoder_cfg=encoder_cfg,
         )
-        self.fusion = FusionModule(
+        fusion_type = str(fusion_cfg.get("fusion_type", "concat")).lower()
+        if fusion_type == "cross_attention":
+            self.fusion = CrossAttentionFusion(
             img_dim=self.image_branch.output_dim,
             audio_dim=self.audio_branch.output_dim,
             fusion_cfg=fusion_cfg,
         )
+        else:
+            self.fusion = FusionModule(
+                img_dim=self.image_branch.output_dim,
+                audio_dim=self.audio_branch.output_dim,
+                fusion_cfg=fusion_cfg,
+            )
+
 
         self.classifier = ClassificationHead(
             input_type="pooled",
@@ -255,9 +265,27 @@ class AudioVisionFusionModel(nn.Module):
         attention_mask: torch.Tensor | None = None,
         classification_task: str | None = None,
     ) -> dict[str, object]:
-        pooled_img, img_seq = self.image_branch(image)
-        pooled_audio, audio_seq = self.audio_branch(audio, attention_mask=attention_mask)
-        fused = self.fusion(pooled_img, pooled_audio)
+        if isinstance(self.fusion, CrossAttentionFusion):
+            img_seq = self.image_branch.encode_sequence(image)
+            audio_seq, audio_padding_mask = self.audio_branch.encode_sequence(
+                audio, attention_mask=attention_mask
+            )
+            pooled_img = self.image_branch.temporal(img_seq)
+            if self.audio_branch.encoder_type == "conformer":
+                pooled_audio, _ = self.audio_branch.pooling(
+                    audio_seq, padding_mask=audio_padding_mask
+                )
+            else:
+                pooled_audio, _ = self.audio_branch.pooling(
+                    audio_seq, attention_mask=attention_mask
+                )
+            fused = self.fusion(
+                img_seq, audio_seq, audio_padding_mask=audio_padding_mask
+            )
+        else:
+            pooled_img, img_seq = self.image_branch(image)
+            pooled_audio, audio_seq = self.audio_branch(audio, attention_mask=attention_mask)
+            fused = self.fusion(pooled_img, pooled_audio)
 
         active_classification_task = (
             self.classification_task

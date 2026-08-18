@@ -37,6 +37,7 @@ _EXPERIMENT_TO_FAMILY: dict[str, str] = {
     "img_baseline":                       "image",
     "multimodal_fusion_concat":           "multimodal_fusion",
     "multimodal_fusion_gated":            "multimodal_fusion",
+    "multimodal_fusion_cross_attn":       "multimodal_fusion",
 }
 
 
