@@ -11,6 +11,9 @@ import math
 import torch
 import torch.nn as nn
 
+from src.models.attention_pooling import CenterBiasedAttentionPooling
+from src.models.img_only_model import ImageTemporalEncoder
+
 
 class SinusoidalPositionalEncoding(nn.Module):
     """Absolute sinusoidal positional encoding for variable-length sequences.
@@ -100,7 +103,12 @@ class CrossAttentionFusion(nn.Module):
         img_seq  -> Linear(D_img -> D) + position -> query
         aud_seq  -> Linear(D_audio -> D) + position -> key/value
         cross-attention layers over image sequence
-        center readout -> [B, D]
+        temporal_aggregation ∈ {center, attn_pool, conformer} -> [B, D]
+
+    temporal_aggregation（P2.5，融合序列如何聚合成 [B, D]）：
+        - center:     中心帧读出（默认，保持 Phase 2 结果不变）
+        - attn_pool:  复用 CenterBiasedAttentionPooling（中心偏置注意力池化）
+        - conformer:  复用 ImageTemporalEncoder（conformer）做帧间时序建模后再中心帧读出
     """
 
     def __init__(
@@ -119,6 +127,14 @@ class CrossAttentionFusion(nn.Module):
             fusion_cfg.get("num_heads", fusion_cfg.get("cross_attention_heads", 8))
         )
         dropout = float(fusion_cfg.get("dropout", 0.1))
+        self.temporal_aggregation = str(
+            fusion_cfg.get("temporal_aggregation", "center")
+        ).lower()
+        if self.temporal_aggregation not in {"center", "attn_pool", "conformer"}:
+            raise ValueError(
+                f"Unsupported temporal_aggregation={self.temporal_aggregation!r}. "
+                "Expected 'center', 'attn_pool' or 'conformer'."
+            )
 
         if self.fusion_dim % self.num_heads != 0:
             raise ValueError(
@@ -147,6 +163,30 @@ class CrossAttentionFusion(nn.Module):
             ]
         )
         self.norm = nn.LayerNorm(self.fusion_dim)
+
+        # P2.5：可配置的时序聚合模块（attn_pool / conformer）；center 无需额外模块
+        if self.temporal_aggregation == "attn_pool":
+            self.pooling = CenterBiasedAttentionPooling(
+                hidden_size=self.fusion_dim,
+                attention_dim=int(fusion_cfg.get("attn_dim", 256)),
+                dropout=dropout,
+            )
+        elif self.temporal_aggregation == "conformer":
+            self.temporal_encoder = ImageTemporalEncoder(
+                d_model=self.fusion_dim,
+                temporal_type="conformer",
+                conformer_layers=int(
+                    fusion_cfg.get("temporal_conformer_layers", 2)
+                ),
+                conformer_heads=int(
+                    fusion_cfg.get("temporal_conformer_heads", 8)
+                ),
+                conv_kernel_size=int(
+                    fusion_cfg.get("temporal_conv_kernel_size", 5)
+                ),
+                dropout=dropout,
+            )
+
         self.output_dim = self.fusion_dim
 
     def forward(
@@ -162,7 +202,13 @@ class CrossAttentionFusion(nn.Module):
         x = img_seq
         for layer in self.layers:
             x = layer(x, audio_seq, key_padding_mask=audio_padding_mask)
-        x = self.norm(x)
+        x = self.norm(x)  # [B, T_img, fusion_dim]
 
-        # Center-frame readout over the image sequence.
+        # P2.5：按 temporal_aggregation 将融合序列聚合成 [B, fusion_dim]
+        if self.temporal_aggregation == "attn_pool":
+            pooled, _ = self.pooling(x)  # 中心偏置注意力池化 -> [B, D]
+            return pooled
+        if self.temporal_aggregation == "conformer":
+            return self.temporal_encoder(x)  # conformer 帧间建模 + 中心帧读出 -> [B, D]
+        # center（默认）：中心帧读出 over the image sequence -> [B, D]
         return x[:, x.size(1) // 2]

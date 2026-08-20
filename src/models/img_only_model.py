@@ -40,10 +40,11 @@ class ImageTemporalEncoder(nn.Module):
             )
 
     def forward(self, x):
-        # x: [B, T, D]
+        # 输入: [B, T, D]（T = 帧数，D = 图像特征维度）
         if self.encoder is not None:
-            x = self.encoder(x)
-        return x[:, x.size(1) // 2]  # center-frame readout -> [B, D]
+            x = self.encoder(x)  # conformer 输出仍为 [B, T, D]
+        # 中心帧读出：取时序维度中间帧 -> [B, D]
+        return x[:, x.size(1) // 2]
 
 
 class ImageMultiheadClassifier(nn.Module):
@@ -104,17 +105,17 @@ class ImageMultiheadClassifier(nn.Module):
         )
 
     def forward(self, image, classification_task=None):
-        # Accept both [B, C, H, W] (single frame) and [B, T, C, H, W] (multi-frame).
+        # 兼容单帧 [B, C, H, W] 与多帧 [B, T, C, H, W] 输入
         if image.dim() == 4:
             image = image.unsqueeze(1)  # [B, C, H, W] -> [B, 1, C, H, W]
         B, T, C, H, W = image.shape
-        feats = self.image_encoder(image.reshape(B * T, C, H, W))  # [B*T, D]
-        feats = self.norm(feats).reshape(B, T, -1)  # [B, T, D]
-        pooled = self.temporal(feats)  # [B, D]
+        feats = self.image_encoder(image.reshape(B * T, C, H, W))  # 展平帧维度逐帧编码 -> [B*T, D]
+        feats = self.norm(feats).reshape(B, T, -1)  # 恢复时序维度 -> [B, T, D]
+        pooled = self.temporal(feats)  # 时序聚合(中心帧读出) -> [B, D]
         active_task = (
             self.classification_task
             if classification_task is None
             else classification_task
         )
-        logits = self.classifier(pooled, classification_task=active_task)
+        logits = self.classifier(pooled, classification_task=active_task)  # 多任务: dict[头名, [B, C_i]]；单任务: [B, C]
         return {"logits": logits, "pooled_embedding": pooled}

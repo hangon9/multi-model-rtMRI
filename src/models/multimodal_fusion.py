@@ -46,16 +46,16 @@ class ImageBranch(nn.Module):
     def encode_sequence(self, image: torch.Tensor) -> torch.Tensor:
         """返回 [B, T, D]，兼容单帧 [B, C, H, W] 输入。"""
         if image.dim() == 4:
-            image = image.unsqueeze(1)
+            image = image.unsqueeze(1)  # [B, C, H, W] -> [B, 1, C, H, W]
         b, t, c, h, w = image.shape
-        feats = self.image_encoder(image.reshape(b * t, c, h, w))
-        feats = self.norm(feats).reshape(b, t, -1)
+        feats = self.image_encoder(image.reshape(b * t, c, h, w))  # 逐帧编码 -> [B*T, D]
+        feats = self.norm(feats).reshape(b, t, -1)  # 恢复时序维度 -> [B, T, D]
         return feats
 
     def forward(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        seq = self.encode_sequence(image)
-        pooled = self.temporal(seq)
-        return pooled, seq
+        seq = self.encode_sequence(image)  # [B, T, D]
+        pooled = self.temporal(seq)  # 时序聚合(中心帧读出) -> [B, D]
+        return pooled, seq  # 返回 (pooled [B, D], seq [B, T, D])
 
 
 class AudioBranch(nn.Module):
@@ -118,27 +118,27 @@ class AudioBranch(nn.Module):
         attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """返回 [B, T_audio, D]，以及可选 padding_mask。"""
-        seq = self.backbone(audio, attention_mask=attention_mask)
-        padding_mask = self._to_padding_mask(attention_mask)
+        seq = self.backbone(audio, attention_mask=attention_mask)  # [B, T_audio, D]
+        padding_mask = self._to_padding_mask(attention_mask)  # [B, T_audio] 布尔(True=padding)
 
         if self.encoder_type == "conformer":
-            seq = self.norm(seq)
-            seq = self.encoder(seq, padding_mask=padding_mask)
-            seq = self.norm2(seq)
+            seq = self.norm(seq)  # [B, T_audio, D]
+            seq = self.encoder(seq, padding_mask=padding_mask)  # conformer 输出 [B, T_audio, D]
+            seq = self.norm2(seq)  # [B, T_audio, D]
 
-        return seq, padding_mask
+        return seq, padding_mask  # 返回 (seq [B, T_audio, D], padding_mask [B, T_audio])
 
     def forward(
         self,
         audio: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        seq, padding_mask = self.encode_sequence(audio, attention_mask=attention_mask)
+        seq, padding_mask = self.encode_sequence(audio, attention_mask=attention_mask)  # seq [B, T_audio, D]
         if self.encoder_type == "conformer":
-            pooled, _ = self.pooling(seq, padding_mask=padding_mask)
+            pooled, _ = self.pooling(seq, padding_mask=padding_mask)  # 中心偏置注意力池化 -> [B, D]
         else:
-            pooled, _ = self.pooling(seq, attention_mask=attention_mask)
-        return pooled, seq
+            pooled, _ = self.pooling(seq, attention_mask=attention_mask)  # 注意力池化 -> [B, D]
+        return pooled, seq  # 返回 (pooled [B, D], seq [B, T_audio, D])
 
 
 class FusionModule(nn.Module):
@@ -194,16 +194,16 @@ class FusionModule(nn.Module):
             self.output_dim = self.fusion_dim * 2
 
     def forward(self, pooled_img: torch.Tensor, pooled_audio: torch.Tensor) -> torch.Tensor:
-        img_proj = self.img_proj(pooled_img)
-        audio_proj = self.audio_proj(pooled_audio)
+        img_proj = self.img_proj(pooled_img)  # [B, fusion_dim]
+        audio_proj = self.audio_proj(pooled_audio)  # [B, fusion_dim]
 
         if self.fusion_type == "concat":
-            return torch.cat([img_proj, audio_proj], dim=-1)
+            return torch.cat([img_proj, audio_proj], dim=-1)  # [B, fusion_dim*2]
 
-        context = torch.cat([img_proj, audio_proj], dim=-1)
-        img_gate = self.img_gate(context)
-        audio_gate = self.audio_gate(context)
-        return img_gate * img_proj + audio_gate * audio_proj
+        context = torch.cat([img_proj, audio_proj], dim=-1)  # [B, fusion_dim*2]
+        img_gate = self.img_gate(context)  # [B, fusion_dim]（sigmoid 门控）
+        audio_gate = self.audio_gate(context)  # [B, fusion_dim]（sigmoid 门控）
+        return img_gate * img_proj + audio_gate * audio_proj  # 门控加权求和 -> [B, fusion_dim]
 
 
 class AudioVisionFusionModel(nn.Module):
@@ -266,26 +266,26 @@ class AudioVisionFusionModel(nn.Module):
         classification_task: str | None = None,
     ) -> dict[str, object]:
         if isinstance(self.fusion, CrossAttentionFusion):
-            img_seq = self.image_branch.encode_sequence(image)
+            img_seq = self.image_branch.encode_sequence(image)  # [B, T_img, D_img]
             audio_seq, audio_padding_mask = self.audio_branch.encode_sequence(
                 audio, attention_mask=attention_mask
-            )
-            pooled_img = self.image_branch.temporal(img_seq)
+            )  # (seq [B, T_audio, D_audio], padding_mask [B, T_audio])
+            pooled_img = self.image_branch.temporal(img_seq)  # [B, D_img]
             if self.audio_branch.encoder_type == "conformer":
                 pooled_audio, _ = self.audio_branch.pooling(
                     audio_seq, padding_mask=audio_padding_mask
-                )
+                )  # [B, D_audio]
             else:
                 pooled_audio, _ = self.audio_branch.pooling(
                     audio_seq, attention_mask=attention_mask
-                )
+                )  # [B, D_audio]
             fused = self.fusion(
                 img_seq, audio_seq, audio_padding_mask=audio_padding_mask
-            )
+            )  # 跨注意力融合 -> [B, fusion.output_dim]
         else:
-            pooled_img, img_seq = self.image_branch(image)
-            pooled_audio, audio_seq = self.audio_branch(audio, attention_mask=attention_mask)
-            fused = self.fusion(pooled_img, pooled_audio)
+            pooled_img, img_seq = self.image_branch(image)  # (pooled [B, D_img], seq [B, T_img, D_img])
+            pooled_audio, audio_seq = self.audio_branch(audio, attention_mask=attention_mask)  # (pooled [B, D_audio], seq [B, T_audio, D_audio])
+            fused = self.fusion(pooled_img, pooled_audio)  # concat/gated 融合 -> [B, fusion.output_dim]
 
         active_classification_task = (
             self.classification_task
