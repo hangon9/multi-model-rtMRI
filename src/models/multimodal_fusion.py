@@ -5,7 +5,7 @@ from src.models.attention_pooling import AttentionPooling, CenterBiasedAttention
 from src.models.audio_ssl_encoder import AudioSSLEncoder
 from src.models.classifier import ClassificationHead
 from src.models.conformer_encoder import ConformerEncoder
-from src.models.fusion_blocks import CrossAttentionFusion
+from src.models.fusion_blocks import CrossAttentionFusion, MBTFusion
 from src.models.img_encoder import build_image_encoder
 from src.models.img_only_model import ImageTemporalEncoder
 
@@ -142,6 +142,8 @@ class AudioBranch(nn.Module):
 
 
 class FusionModule(nn.Module):
+    requires_sequence_input = False
+
     """Phase 1 融合模块：concat 或双门控 gated。"""
 
     def __init__(
@@ -207,7 +209,7 @@ class FusionModule(nn.Module):
 
 
 class AudioVisionFusionModel(nn.Module):
-    """多模态融合模型（Phase 1/2）：图像+音频联合分类，支持 concat/gated/cross_attention。"""
+    """多模态融合模型（Phase 1/2）：图像+音频联合分类，支持 concat/gated/cross_attention/mbt。"""
 
     def __init__(
         self,
@@ -236,10 +238,16 @@ class AudioVisionFusionModel(nn.Module):
         fusion_type = str(fusion_cfg.get("fusion_type", "concat")).lower()
         if fusion_type == "cross_attention":
             self.fusion = CrossAttentionFusion(
-            img_dim=self.image_branch.output_dim,
-            audio_dim=self.audio_branch.output_dim,
-            fusion_cfg=fusion_cfg,
-        )
+                img_dim=self.image_branch.output_dim,
+                audio_dim=self.audio_branch.output_dim,
+                fusion_cfg=fusion_cfg,
+            )
+        elif fusion_type == "mbt":
+            self.fusion = MBTFusion(
+                img_dim=self.image_branch.output_dim,
+                audio_dim=self.audio_branch.output_dim,
+                fusion_cfg=fusion_cfg,
+            )
         else:
             self.fusion = FusionModule(
                 img_dim=self.image_branch.output_dim,
@@ -265,7 +273,7 @@ class AudioVisionFusionModel(nn.Module):
         attention_mask: torch.Tensor | None = None,
         classification_task: str | None = None,
     ) -> dict[str, object]:
-        if isinstance(self.fusion, CrossAttentionFusion):
+        if getattr(self.fusion, "requires_sequence_input", False):
             img_seq = self.image_branch.encode_sequence(image)  # [B, T_img, D_img]
             audio_seq, audio_padding_mask = self.audio_branch.encode_sequence(
                 audio, attention_mask=attention_mask
@@ -281,7 +289,7 @@ class AudioVisionFusionModel(nn.Module):
                 )  # [B, D_audio]
             fused = self.fusion(
                 img_seq, audio_seq, audio_padding_mask=audio_padding_mask
-            )  # 跨注意力融合 -> [B, fusion.output_dim]
+            )  # 序列级融合（cross-attention/MBT） -> [B, fusion.output_dim]
         else:
             pooled_img, img_seq = self.image_branch(image)  # (pooled [B, D_img], seq [B, T_img, D_img])
             pooled_audio, audio_seq = self.audio_branch(audio, attention_mask=attention_mask)  # (pooled [B, D_audio], seq [B, T_audio, D_audio])

@@ -97,6 +97,8 @@ class _CrossAttentionLayer(nn.Module):
 
 
 class CrossAttentionFusion(nn.Module):
+    requires_sequence_input = True
+
     """Mid-level cross-attention fusion.
 
     Architecture:
@@ -215,3 +217,172 @@ class CrossAttentionFusion(nn.Module):
             return self.temporal_encoder(x)  # conformer 帧间建模 + 中心帧读出 -> [B, D]
         # center（默认）：中心帧读出 over the image sequence -> [B, D]
         return x[:, x.size(1) // 2]
+
+
+class _SelfAttentionBlock(nn.Module):
+    """标准 pre-LN self-attention + FFN，供 MBT 的 Step A/Step B 复用。"""
+
+    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=d_model, num_heads=num_heads, dropout=dropout, batch_first=True
+        )
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_model * 4), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model), nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor | None = None) -> torch.Tensor:
+        # x: [B, T, D]，key_padding_mask: [B, T]（True=padding）
+        h = self.norm1(x)
+        attn_out, _ = self.attn(
+            h, h, h, key_padding_mask=key_padding_mask, need_weights=False
+        )
+        x = x + attn_out
+        x = x + self.ffn(self.norm2(x))
+        return x
+
+
+class _MBTLayer(nn.Module):
+    """单层串行 MBT：Step A 更新瓶颈，Step B 继续更新瓶颈。"""
+
+    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1):
+        super().__init__()
+        self.step_img = _SelfAttentionBlock(d_model, num_heads, dropout)
+        self.step_audio = _SelfAttentionBlock(d_model, num_heads, dropout)
+
+    def forward(
+        self,
+        img_seq: torch.Tensor,
+        audio_seq: torch.Tensor,
+        bottleneck: torch.Tensor,
+        audio_padding_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        n_b = bottleneck.size(1)
+
+        joint_a = torch.cat([img_seq, bottleneck], dim=1)
+        joint_a = self.step_img(joint_a)
+        img_seq = joint_a[:, :-n_b]
+        bottleneck = joint_a[:, -n_b:]
+
+        joint_b = torch.cat([audio_seq, bottleneck], dim=1)
+        if audio_padding_mask is not None:
+            if audio_padding_mask.shape != audio_seq.shape[:2]:
+                raise ValueError(
+                    "audio_padding_mask must have shape [B, T_audio], got "
+                    f"{tuple(audio_padding_mask.shape)} for audio_seq {tuple(audio_seq.shape)}."
+                )
+            pad_b = torch.zeros(
+                bottleneck.size(0), n_b, dtype=torch.bool,
+                device=audio_padding_mask.device,
+            )
+            mask_b = torch.cat(
+                [audio_padding_mask.to(dtype=torch.bool), pad_b], dim=1
+            )
+        else:
+            mask_b = None
+
+        joint_b = self.step_audio(joint_b, key_padding_mask=mask_b)
+        audio_seq = joint_b[:, :-n_b]
+        bottleneck = joint_b[:, -n_b:]
+        return img_seq, audio_seq, bottleneck
+
+
+def _make_proj(input_dim: int, output_dim: int, dropout: float) -> nn.Sequential:
+    return nn.Sequential(
+        nn.LayerNorm(input_dim), nn.Linear(input_dim, output_dim),
+        nn.GELU(), nn.Dropout(dropout),
+    )
+
+
+class MBTFusion(nn.Module):
+    """MBT 风格瓶颈融合，跨模态信息只能通过共享 bottleneck token 交换。"""
+
+    requires_sequence_input = True
+
+    def __init__(self, img_dim: int, audio_dim: int, fusion_cfg: dict):
+        super().__init__()
+        self.fusion_type = "mbt"
+        self.fusion_dim = int(fusion_cfg.get("fusion_dim", 256))
+        self.num_layers = int(fusion_cfg.get("mbt_layers", 2))
+        self.num_heads = int(fusion_cfg.get("num_heads", 8))
+        self.num_bottlenecks = int(fusion_cfg.get("num_bottlenecks", 4))
+        dropout = float(fusion_cfg.get("dropout", 0.1))
+        self.readout = str(fusion_cfg.get("mbt_readout", "center_bottleneck")).lower()
+
+        if self.readout not in {"center_bottleneck", "bottleneck_only", "center_only"}:
+            raise ValueError(f"Unsupported mbt_readout={self.readout!r}")
+        if self.fusion_dim % self.num_heads != 0:
+            raise ValueError(
+                f"fusion_dim ({self.fusion_dim}) must be divisible by num_heads ({self.num_heads})."
+            )
+        if self.num_layers < 1:
+            raise ValueError("mbt_layers must be at least 1.")
+        if self.num_bottlenecks < 1:
+            raise ValueError("num_bottlenecks must be at least 1.")
+
+        self.img_proj = _make_proj(img_dim, self.fusion_dim, dropout)
+        self.audio_proj = _make_proj(audio_dim, self.fusion_dim, dropout)
+        self.img_pos = SinusoidalPositionalEncoding(self.fusion_dim, dropout=dropout)
+        self.audio_pos = SinusoidalPositionalEncoding(self.fusion_dim, dropout=dropout)
+
+        self.bottleneck = nn.Parameter(
+            torch.zeros(1, self.num_bottlenecks, self.fusion_dim)
+        )
+        nn.init.trunc_normal_(self.bottleneck, std=0.02)
+
+        self.layers = nn.ModuleList([
+            _MBTLayer(self.fusion_dim, self.num_heads, dropout=dropout)
+            for _ in range(self.num_layers)
+        ])
+        self.norm_img = nn.LayerNorm(self.fusion_dim)
+        self.norm_bn = nn.LayerNorm(self.fusion_dim)
+
+        readout_dim = {
+            "center_bottleneck": self.fusion_dim * 2,
+            "bottleneck_only": self.fusion_dim,
+            "center_only": self.fusion_dim,
+        }[self.readout]
+        self.out_proj = nn.Sequential(
+            nn.Linear(readout_dim, self.fusion_dim), nn.GELU(), nn.Dropout(dropout)
+        )
+        self.output_dim = self.fusion_dim
+
+    def forward(
+        self,
+        img_seq: torch.Tensor,
+        audio_seq: torch.Tensor,
+        audio_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if img_seq.ndim != 3 or audio_seq.ndim != 3:
+            raise ValueError("img_seq and audio_seq must both have shape [B, T, D].")
+        if img_seq.size(0) != audio_seq.size(0):
+            raise ValueError("img_seq and audio_seq must have the same batch size.")
+        if img_seq.size(1) == 0 or audio_seq.size(1) == 0:
+            raise ValueError("img_seq and audio_seq must contain at least one token.")
+
+        batch_size = img_seq.size(0)
+        img_seq = self.img_pos(self.img_proj(img_seq))
+        audio_seq = self.audio_pos(self.audio_proj(audio_seq))
+        bottleneck = self.bottleneck.expand(batch_size, -1, -1)
+
+        for layer in self.layers:
+            img_seq, audio_seq, bottleneck = layer(
+                img_seq, audio_seq, bottleneck,
+                audio_padding_mask=audio_padding_mask,
+            )
+
+        img_seq = self.norm_img(img_seq)
+        bottleneck = self.norm_bn(bottleneck)
+        center = img_seq[:, img_seq.size(1) // 2]
+        bn_pooled = bottleneck.mean(dim=1)
+
+        if self.readout == "center_bottleneck":
+            fused = torch.cat([center, bn_pooled], dim=-1)
+        elif self.readout == "bottleneck_only":
+            fused = bn_pooled
+        else:
+            fused = center
+        return self.out_proj(fused)
