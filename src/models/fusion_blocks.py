@@ -156,6 +156,8 @@ class CrossAttentionFusion(nn.Module):
         )
         self.img_pos = SinusoidalPositionalEncoding(self.fusion_dim, dropout=dropout)
         self.audio_pos = SinusoidalPositionalEncoding(self.fusion_dim, dropout=dropout)
+        self.audio_norm = nn.LayerNorm(self.fusion_dim)
+
         self.layers = nn.ModuleList(
             [
                 _CrossAttentionLayer(self.fusion_dim, self.num_heads, dropout=dropout)
@@ -198,7 +200,8 @@ class CrossAttentionFusion(nn.Module):
         # img_seq: [B, T_img, D_img], audio_seq: [B, T_audio, D_audio]
         img_seq = self.img_pos(self.img_proj(img_seq))
         audio_seq = self.audio_pos(self.audio_proj(audio_seq))
-
+        audio_seq = self.audio_norm(audio_seq)
+        
         x = img_seq
         for layer in self.layers:
             x = layer(x, audio_seq, key_padding_mask=audio_padding_mask)
