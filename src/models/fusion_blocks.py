@@ -220,7 +220,7 @@ class CrossAttentionFusion(nn.Module):
 
 
 class _SelfAttentionBlock(nn.Module):
-    """标准 pre-LN self-attention + FFN，供 MBT 的 Step A/Step B 复用。"""
+    """标准 pre-LN self-attention + FFN，供 MBT 的串行 Step 与对称分支复用。"""
 
     def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1):
         super().__init__()
@@ -246,12 +246,65 @@ class _SelfAttentionBlock(nn.Module):
 
 
 class _MBTLayer(nn.Module):
-    """单层串行 MBT：Step A 更新瓶颈，Step B 继续更新瓶颈。"""
+    """单层 MBT 瓶颈融合层，跨模态信息通过共享 bottleneck token 交换。
 
-    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1):
+    每层 bottleneck 的更新方式由 ``mode`` 控制（对应 yaml 中
+    ``fusion.bottleneck_update`` 键）：
+    - ``image_first``：图像先更新 bottleneck，音频再基于更新后的 bottleneck
+      继续更新（串行，优先图像，为默认行为）；
+    - ``audio_first``：音频先更新 bottleneck，图像再基于更新后的 bottleneck
+      继续更新（串行，优先音频）；
+    - ``symmetric``：图像/音频分别与"上一层的同一份 bottleneck"独立做
+      self-attn，产出两份候选 bottleneck 后取平均作为下一层输入（两路互不
+      依赖，可并行）。
+
+    三种模式共用同一组 ``step_img``/``step_audio`` 参数，state dict 键不随
+    模式变化，切换模式可直接复用旧 checkpoint 的权重。
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        dropout: float = 0.1,
+        mode: str = "audio_first",
+    ):
         super().__init__()
+        if mode not in {"image_first", "audio_first", "symmetric"}:
+            raise ValueError(
+                f"Unsupported mode={mode!r}. "
+                "Expected 'image_first', 'audio_first' or 'symmetric'."
+            )
+        self.mode = mode
         self.step_img = _SelfAttentionBlock(d_model, num_heads, dropout)
         self.step_audio = _SelfAttentionBlock(d_model, num_heads, dropout)
+
+    @staticmethod
+    def _make_joint(
+        seq: torch.Tensor,
+        bottleneck: torch.Tensor,
+        padding_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """拼接 [seq; bottleneck] 并扩展 padding mask，返回 (joint, mask)。
+
+        joint 的布局为「前段序列 token、末段 n_b 个 bottleneck token」；
+        bottleneck 段永远不是 padding，因此 mask 在尾部补 False。
+        padding_mask 为 None 时返回的 mask 亦为 None（图像分支无需屏蔽）。
+        """
+        n_b = bottleneck.size(1)
+        joint = torch.cat([seq, bottleneck], dim=1)
+        if padding_mask is None:
+            return joint, None
+        if padding_mask.shape != seq.shape[:2]:
+            raise ValueError(
+                "padding_mask must have shape [B, T], got "
+                f"{tuple(padding_mask.shape)} for seq {tuple(seq.shape)}."
+            )
+        pad_b = torch.zeros(
+            bottleneck.size(0), n_b, dtype=torch.bool, device=padding_mask.device
+        )
+        mask = torch.cat([padding_mask.to(dtype=torch.bool), pad_b], dim=1)
+        return joint, mask
 
     def forward(
         self,
@@ -260,33 +313,53 @@ class _MBTLayer(nn.Module):
         bottleneck: torch.Tensor,
         audio_padding_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        n_b = bottleneck.size(1)
+        n_b = bottleneck.size(1)  # joint 末段 n_b 个 token 为 bottleneck（见 _make_joint）
 
-        joint_a = torch.cat([img_seq, bottleneck], dim=1)
-        joint_a = self.step_img(joint_a)
-        img_seq = joint_a[:, :-n_b]
-        bottleneck = joint_a[:, -n_b:]
+        if self.mode == "image_first":
+            # Step A：图像分支先更新 bottleneck
+            joint_img, _ = self._make_joint(img_seq, bottleneck)
+            joint_img = self.step_img(joint_img)
+            img_seq = joint_img[:, :-n_b]
+            bottleneck = joint_img[:, -n_b:]
 
-        joint_b = torch.cat([audio_seq, bottleneck], dim=1)
-        if audio_padding_mask is not None:
-            if audio_padding_mask.shape != audio_seq.shape[:2]:
-                raise ValueError(
-                    "audio_padding_mask must have shape [B, T_audio], got "
-                    f"{tuple(audio_padding_mask.shape)} for audio_seq {tuple(audio_seq.shape)}."
-                )
-            pad_b = torch.zeros(
-                bottleneck.size(0), n_b, dtype=torch.bool,
-                device=audio_padding_mask.device,
+            # Step B：音频分支基于图像更新后的 bottleneck 继续更新
+            joint_audio, mask_audio = self._make_joint(
+                audio_seq, bottleneck, audio_padding_mask
             )
-            mask_b = torch.cat(
-                [audio_padding_mask.to(dtype=torch.bool), pad_b], dim=1
+            joint_audio = self.step_audio(joint_audio, key_padding_mask=mask_audio)
+            audio_seq = joint_audio[:, :-n_b]
+            bottleneck = joint_audio[:, -n_b:]
+        elif self.mode == "audio_first":
+            # Step A：音频分支先更新 bottleneck（串行顺序与 image_first 对调）
+            joint_audio, mask_audio = self._make_joint(
+                audio_seq, bottleneck, audio_padding_mask
             )
-        else:
-            mask_b = None
+            joint_audio = self.step_audio(joint_audio, key_padding_mask=mask_audio)
+            audio_seq = joint_audio[:, :-n_b]
+            bottleneck = joint_audio[:, -n_b:]
 
-        joint_b = self.step_audio(joint_b, key_padding_mask=mask_b)
-        audio_seq = joint_b[:, :-n_b]
-        bottleneck = joint_b[:, -n_b:]
+            # Step B：图像分支基于音频更新后的 bottleneck 继续更新
+            joint_img, _ = self._make_joint(img_seq, bottleneck)
+            joint_img = self.step_img(joint_img)
+            img_seq = joint_img[:, :-n_b]
+            bottleneck = joint_img[:, -n_b:]
+        else:  # symmetric
+            # 图像分支：[img_seq; 上一层的 bottleneck] 独立做 self-attn
+            joint_img, _ = self._make_joint(img_seq, bottleneck)
+            joint_img = self.step_img(joint_img)
+            img_seq = joint_img[:, :-n_b]
+            bn_from_img = joint_img[:, -n_b:]  # 候选 bottleneck A
+
+            # 音频分支：与图像分支共用同一份输入 bottleneck，两路互不依赖
+            joint_audio, mask_audio = self._make_joint(
+                audio_seq, bottleneck, audio_padding_mask
+            )
+            joint_audio = self.step_audio(joint_audio, key_padding_mask=mask_audio)
+            audio_seq = joint_audio[:, :-n_b]
+            bn_from_audio = joint_audio[:, -n_b:]  # 候选 bottleneck B
+
+            # 两份候选 bottleneck 取平均，作为下一层的输入
+            bottleneck = (bn_from_img + bn_from_audio) / 2
         return img_seq, audio_seq, bottleneck
 
 
@@ -298,7 +371,12 @@ def _make_proj(input_dim: int, output_dim: int, dropout: float) -> nn.Sequential
 
 
 class MBTFusion(nn.Module):
-    """MBT 风格瓶颈融合，跨模态信息只能通过共享 bottleneck token 交换。"""
+    """MBT 风格瓶颈融合，跨模态信息只能通过共享 bottleneck token 交换。
+
+    每层 bottleneck 的更新方式由 ``fusion_cfg["bottleneck_update"]`` 控制：
+    ``image_first``（默认，图像先更新）/ ``audio_first``（音频先更新）/
+    ``symmetric``（图像与音频分别独立更新同一份 bottleneck 后取平均）。
+    """
 
     requires_sequence_input = True
 
@@ -311,9 +389,19 @@ class MBTFusion(nn.Module):
         self.num_bottlenecks = int(fusion_cfg.get("num_bottlenecks", 4))
         dropout = float(fusion_cfg.get("dropout", 0.1))
         self.readout = str(fusion_cfg.get("mbt_readout", "center_bottleneck")).lower()
+        self.bottleneck_update = str(
+            fusion_cfg.get("bottleneck_update", "image_first")
+        ).lower()
 
         if self.readout not in {"center_bottleneck", "bottleneck_only", "center_only"}:
             raise ValueError(f"Unsupported mbt_readout={self.readout!r}")
+        if self.bottleneck_update not in {
+            "image_first", "audio_first", "symmetric",
+        }:
+            raise ValueError(
+                f"Unsupported bottleneck_update={self.bottleneck_update!r}. "
+                "Expected 'image_first', 'audio_first' or 'symmetric'."
+            )
         if self.fusion_dim % self.num_heads != 0:
             raise ValueError(
                 f"fusion_dim ({self.fusion_dim}) must be divisible by num_heads ({self.num_heads})."
@@ -334,7 +422,12 @@ class MBTFusion(nn.Module):
         nn.init.trunc_normal_(self.bottleneck, std=0.02)
 
         self.layers = nn.ModuleList([
-            _MBTLayer(self.fusion_dim, self.num_heads, dropout=dropout)
+            _MBTLayer(
+                self.fusion_dim,
+                self.num_heads,
+                dropout=dropout,
+                mode=self.bottleneck_update,
+            )
             for _ in range(self.num_layers)
         ])
         self.norm_img = nn.LayerNorm(self.fusion_dim)
