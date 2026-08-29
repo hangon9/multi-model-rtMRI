@@ -347,6 +347,7 @@ def train_one_epoch(
     task_loss_keys = ("loss_manner", "loss_place", "loss_voicing", "loss_vowel_backness")
     total_task_loss = {k: 0.0 for k in task_loss_keys}
     total_acc = {"mean": 0.0}
+    total_audio_dropped = 0  # 音频模态 dropout 实际被丢弃的样本数（用于日志统计）
     n_samples = 0
 
     for batch in tqdm(loader, desc="train", leave=False):
@@ -362,6 +363,9 @@ def train_one_epoch(
 
         outputs = model(image=image, audio=audio, classification_task=classification_task)
         logits = outputs["logits"]
+        # 统计音频模态 dropout 的实际丢弃比例（未启用时 audio_drop_mask 为 None）
+        if outputs.get("audio_drop_mask") is not None:
+            total_audio_dropped += outputs["audio_drop_mask"].sum().item()
 
         loss_dict = criterion(
             logits=logits,
@@ -404,6 +408,7 @@ def train_one_epoch(
         "loss": total_loss / n_samples,
         "cls_loss": total_cls_loss / n_samples,
         "acc": {k: v / n_samples for k, v in total_acc.items()},
+        "audio_drop_rate": total_audio_dropped / n_samples,  # 实际丢弃比例（未启用时为 0）
     }
     result.update({k: v / n_samples for k, v in total_task_loss.items()})
     return result
@@ -555,6 +560,8 @@ def main():
         fold_best_ckpt_path = checkpoint_dir / f"best_model_fold_{fold_id}.pt"
 
         for epoch in range(num_epochs):
+            # 供 audio_modality_dropout.schedule=linear_warmup 使用（constant 时无副作用）。
+            model.set_epoch(epoch)
             train_log = train_one_epoch(
                 model,
                 train_loader,

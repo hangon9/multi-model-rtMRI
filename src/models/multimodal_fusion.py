@@ -266,6 +266,90 @@ class AudioVisionFusionModel(nn.Module):
             gated=True,
         )
 
+        # ---- 音频模态 dropout（audio_modality_dropout 配置块）----
+        # 训练时以一定概率把某个样本的音频整体替换为可学习的 null 表征，
+        # 强迫融合/分类头在这些样本上只依赖图像，缓解 audio 主导、image 分支学习不足。
+        dropout_cfg = model_cfg.get("audio_modality_dropout", {})
+        self.audio_modality_dropout_enabled = bool(dropout_cfg.get("enabled", False))
+        self.audio_drop_prob = float(dropout_cfg.get("audio_drop_prob", 0.0))
+        self._audio_dropout_schedule = str(dropout_cfg.get("schedule", "constant"))
+        self._audio_dropout_warmup_epochs = int(dropout_cfg.get("warmup_epochs", 0))
+        self._current_epoch = 0  # 供 schedule=linear_warmup 使用（见 set_epoch/_current_audio_drop_prob）
+
+        if self.audio_modality_dropout_enabled and self.audio_drop_prob > 0:
+            # 可学习的"无音频"锚点：被丢弃样本的音频整体替换为这个向量，
+            # 经过与真实音频完全相同的 proj/attention/bottleneck 流程。
+            self.null_audio_embedding = nn.Parameter(
+                torch.zeros(self.audio_branch.output_dim)
+            )
+            nn.init.trunc_normal_(self.null_audio_embedding, std=0.02)
+        else:
+            self.null_audio_embedding = None
+
+    def set_epoch(self, epoch: int) -> None:
+        """训练脚本每个 epoch 开始时调用一次，供 schedule=linear_warmup 使用。"""
+        self._current_epoch = epoch
+
+    def _current_audio_drop_prob(self) -> float:
+        """返回当前 epoch 实际使用的丢弃概率（支持 constant / linear_warmup）。"""
+        if (
+            self._audio_dropout_schedule == "constant"
+            or self._audio_dropout_warmup_epochs <= 0
+        ):
+            return self.audio_drop_prob
+        ratio = min(1.0, self._current_epoch / self._audio_dropout_warmup_epochs)
+        return self.audio_drop_prob * ratio
+
+    def _maybe_drop_audio(
+        self,
+        pooled_audio: torch.Tensor | None,
+        audio_seq: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+        """训练时以一定概率将某些样本的音频整体替换为可学习的 null embedding。
+
+        仅在 self.training 且 audio_modality_dropout 开启时生效；eval/推理时原样返回，
+        不引入任何随机性。返回的 drop_mask 供训练脚本统计实际丢弃比例。
+
+        只替换数值、不修改 audio_padding_mask：若把被丢弃样本整行标为 padding，
+        nn.MultiheadAttention 的 softmax 分母会变成 0 产生 NaN（cross_attention/mbt
+        路径都会用到 audio_padding_mask）。保持 mask 不变，attention 照常计算，
+        只是 key/value 全变成同一个常数向量。
+        """
+        if not (
+            self.training
+            and self.audio_modality_dropout_enabled
+            and self.audio_drop_prob > 0
+        ):
+            return pooled_audio, audio_seq, None
+
+        if pooled_audio is not None:
+            batch_size = pooled_audio.size(0)
+        elif audio_seq is not None:
+            batch_size = audio_seq.size(0)
+        else:
+            raise ValueError("pooled_audio 与 audio_seq 至少有一个非空")
+
+        drop_prob = self._current_audio_drop_prob()
+        null_vec = self.null_audio_embedding
+        assert null_vec is not None, (
+            "audio_modality_dropout enabled 且 audio_drop_prob>0 时 "
+            "__init__ 必须创建 null_audio_embedding"
+        )
+        drop_mask = (
+            torch.rand(batch_size, device=null_vec.device) < drop_prob
+        )  # [B] 布尔掩码：True=该样本音频被丢弃
+
+        if drop_mask.any():
+            if pooled_audio is not None:
+                pooled_audio = pooled_audio.clone()
+                pooled_audio[drop_mask] = null_vec.to(pooled_audio.dtype)
+            if audio_seq is not None:
+                audio_seq = audio_seq.clone()
+                # [1, 1, D] 直接广播到 [n_drop, T, D]，避免 expand 视图赋值的边界情况
+                audio_seq[drop_mask] = null_vec.to(audio_seq.dtype).view(1, 1, -1)
+
+        return pooled_audio, audio_seq, drop_mask
+
     def forward(
         self,
         image: torch.Tensor,
@@ -287,12 +371,22 @@ class AudioVisionFusionModel(nn.Module):
                 pooled_audio, _ = self.audio_branch.pooling(
                     audio_seq, attention_mask=attention_mask
                 )  # [B, D_audio]
+            # 音频模态 dropout：训练态以一定概率把部分样本的音频整体替换为可学习 null 表征，
+            # 强迫融合/分类头在这些样本上只依赖图像（详见 audio_modality_dropout 配置块）。
+            pooled_audio, audio_seq, audio_drop_mask = self._maybe_drop_audio(
+                pooled_audio, audio_seq
+            )
             fused = self.fusion(
                 img_seq, audio_seq, audio_padding_mask=audio_padding_mask
             )  # 序列级融合（cross-attention/MBT） -> [B, fusion.output_dim]
         else:
             pooled_img, img_seq = self.image_branch(image)  # (pooled [B, D_img], seq [B, T_img, D_img])
             pooled_audio, audio_seq = self.audio_branch(audio, attention_mask=attention_mask)  # (pooled [B, D_audio], seq [B, T_audio, D_audio])
+            # 音频模态 dropout：训练态以一定概率把部分样本的音频整体替换为可学习 null 表征，
+            # 强迫融合/分类头在这些样本上只依赖图像（详见 audio_modality_dropout 配置块）。
+            pooled_audio, audio_seq, audio_drop_mask = self._maybe_drop_audio(
+                pooled_audio, audio_seq
+            )
             fused = self.fusion(pooled_img, pooled_audio)  # concat/gated 融合 -> [B, fusion.output_dim]
 
         active_classification_task = (
@@ -310,4 +404,7 @@ class AudioVisionFusionModel(nn.Module):
             "img_seq": img_seq,
             "audio_seq": audio_seq,
             "classification_task": active_classification_task,
+            # 新增：训练态为 [B] 布尔张量（哪些样本被丢弃音频），eval/未启用时为 None，
+            # 供训练脚本统计实际丢弃比例；推理路径(_extract_logits)不读取该键。
+            "audio_drop_mask": audio_drop_mask,
         }
