@@ -11,6 +11,7 @@ Two multimodal designs coexist:
 ## Quick start
 
 - **Environment**: conda env `rtmri` (activated in terminal). Core deps: `torch==2.5.1+cu121`, `torchaudio`, `torchvision`, `transformers`, `monai`, `scikit-learn`, `PyYAML`, `matplotlib`, `pandas`.
+*use 'conda activate rtmri' before running python scripts in this project*
 - **Run all commands from the repo root** (`f:\schoolworks\FAU\ss26\mt\multi-model-rtMRI`) — code uses relative paths like `data/`, `checkpoints/`, `logs/`.
 - Train image baseline: `python train_img_baseline.py --config configs/img_baseline_config.yaml`
 - Train audio baseline: `python train_wav_baseline.py --config configs/wav_baseline_config.yaml`

@@ -46,6 +46,8 @@ from src.eval.visualize import (
     plot_fold_loss,
     plot_fold_loss_components,
     plot_all_folds_val_loss,
+    plot_fold_f1,
+    plot_all_folds_f1,
     plot_task_prf1,
     plot_task_confusion,
     plot_task_multilabel_confusion,
@@ -535,14 +537,16 @@ def _generate_loss_plots(log_dir: str, checkpoint_path: str, figures_dir: Path) 
         meta = load_checkpoint_meta(ckpt_path.parent, fold=fold)
         plot_fold_loss(df_fold, fold, meta, figures_dir)
         plot_fold_loss_components(df_fold, fold, figures_dir)
-        print(f"[evaluate] Saved loss plots for fold {fold}")
+        plot_fold_f1(df_fold, fold, figures_dir)
+        print(f"[evaluate] Saved loss/F1 plots for fold {fold}")
 
     if histories:
         best_meta = load_checkpoint_meta(
             ckpt_path.parent, fold=None, best_model_name=ckpt_path.name
         )
         plot_all_folds_val_loss(histories, best_meta, figures_dir)
-        print("[evaluate] Saved all_folds_val_loss.png")
+        plot_all_folds_f1(histories, figures_dir)
+        print("[evaluate] Saved all_folds_val_loss.png / all_folds_f1.png")
 
 
 def _generate_task_plots(

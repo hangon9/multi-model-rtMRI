@@ -11,6 +11,7 @@
 """
 
 import argparse
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -21,6 +22,7 @@ from torch.optim import AdamW
 from tqdm import tqdm
 
 from data.splits import create_dataloader, make_train_test_split
+from src.eval.metrics import compute_metrics
 from src.losses.loss_factory import BuildLoss
 from src.models.multimodal_fusion import AudioVisionFusionModel
 from utils.logger import TrainingLogger
@@ -162,6 +164,76 @@ def compute_accuracy(logits, labels, classification_task=""):
     pred = logits.argmax(dim=-1)
     acc_val = (pred == labels).float().mean().item()
     return {classification_task: acc_val, "mean": acc_val}
+
+
+def collect_predictions_for_f1(logits, labels, classification_task, buffers):
+    """按验证门控规则累积预测与标签，供整个验证集计算 macro F1。
+
+    单任务标签仍由数据层组织为字典；place 和 voicing 的 ``-100`` 表示无效帧，
+    必须在收集前过滤。buffers 由调用方跨 batch 持有，不在此函数内计算局部 F1。
+    """
+    if classification_task != "":
+        pred = logits.argmax(dim=-1)
+        task_labels = labels[classification_task]
+        if classification_task in ("place", "voicing"):
+            valid_mask = task_labels != -100
+            if not valid_mask.any():
+                return
+            task_labels = task_labels[valid_mask]
+            pred = pred[valid_mask]
+        buffers[classification_task]["y_true"].append(task_labels.cpu().numpy())
+        buffers[classification_task]["y_pred"].append(pred.cpu().numpy())
+        return
+
+    if "manner" not in labels:
+        return
+
+    manner_labels = labels["manner"]
+    cons_mask = (manner_labels >= _CONSONANT_MANNER_MIN) & (
+        manner_labels <= _CONSONANT_MANNER_MAX
+    )
+    vowel_mask = manner_labels == _VOWEL_MANNER
+
+    for task in TASKS:
+        if task not in logits or task not in labels:
+            continue
+        if task in ("place", "voicing") and cons_mask.any():
+            pred = logits[task].argmax(dim=-1)
+            buffers[task]["y_true"].append(labels[task][cons_mask].cpu().numpy())
+            buffers[task]["y_pred"].append(pred[cons_mask].cpu().numpy())
+        elif task == "vowel_backness" and vowel_mask.any():
+            pred = (torch.sigmoid(logits[task]) >= 0.5).float()
+            buffers[task]["y_true"].append(labels[task][vowel_mask].cpu().numpy())
+            buffers[task]["y_pred"].append(pred[vowel_mask].cpu().numpy())
+        elif task == "manner":
+            pred = logits[task].argmax(dim=-1)
+            buffers[task]["y_true"].append(labels[task].cpu().numpy())
+            buffers[task]["y_pred"].append(pred.cpu().numpy())
+
+
+_TASK_LABEL_NAMES = {
+    "manner": _MANNER_COLS,
+    "place": _PLACE_COLS,
+    "voicing": _VOICING_COLS,
+    "vowel_backness": _VOWEL_BACKNESS_COLS,
+}
+
+
+def finalize_f1_scores(buffers, classification_task):
+    """拼接验证集缓存并返回各任务及其未加权平均 macro F1。"""
+    tasks = (classification_task,) if classification_task != "" else TASKS
+    scores = {}
+    for task in tasks:
+        y_true_parts = buffers.get(task, {}).get("y_true", [])
+        if not y_true_parts:
+            scores[task] = 0.0
+            continue
+        y_true = np.concatenate(y_true_parts)
+        y_pred = np.concatenate(buffers[task]["y_pred"])
+        result = compute_metrics(y_true, y_pred, _TASK_LABEL_NAMES[task])
+        scores[task] = float(result["macro_f1"])
+    scores["mean"] = sum(scores.values()) / max(len(scores), 1)
+    return scores
 
 
 def build_loss_from_config(config, device, class_weights=None, bce_pos_weight=None):
@@ -416,7 +488,7 @@ def train_one_epoch(
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, device, classification_task="", name="val"):
-    """验证循环，计算与训练一致的统计指标。"""
+    """计算验证损失、准确率和 F1，并按开关执行单模态诊断。"""
     model.eval()
     total_loss = 0.0
     total_cls_loss = 0.0
@@ -424,6 +496,30 @@ def evaluate(model, loader, criterion, device, classification_task="", name="val
     total_task_loss = {k: 0.0 for k in task_loss_keys}
     total_acc = {"mean": 0.0}
     n_samples = 0
+    tasks_for_buffers = (classification_task,) if classification_task != "" else TASKS
+    f1_buffers = {task: {"y_true": [], "y_pred": []} for task in tasks_for_buffers}
+    diagnostics_enabled = getattr(model, "unimodal_diagnostics_enabled", False)
+    image_only_buffers = (
+        {task: {"y_true": [], "y_pred": []} for task in tasks_for_buffers}
+        if diagnostics_enabled
+        else None
+    )
+    audio_only_buffers = (
+        {task: {"y_true": [], "y_pred": []} for task in tasks_for_buffers}
+        if diagnostics_enabled
+        else None
+    )
+
+    configured_batch_size = getattr(loader, "batch_size", None)
+    if diagnostics_enabled and isinstance(configured_batch_size, int) and configured_batch_size <= 2:
+        if not getattr(model, "_unimodal_diagnostics_batch_warning_emitted", False):
+            warnings.warn(
+                "单模态诊断启用且 batch_size <= 2；batch 均值置空的诊断稳定性有限，"
+                "但训练和诊断仍会继续。",
+                UserWarning,
+                stacklevel=2,
+            )
+            model._unimodal_diagnostics_batch_warning_emitted = True
 
     for batch in tqdm(loader, desc=name, leave=False):
         image = batch["image"].to(device, non_blocking=True)
@@ -454,13 +550,50 @@ def evaluate(model, loader, criterion, device, classification_task="", name="val
             total_acc.setdefault(key, 0.0)
             total_acc[key] += batch_acc[key] * bs
 
+        collect_predictions_for_f1(logits, labels, classification_task, f1_buffers)
+
+        if diagnostics_enabled:
+            image_only_outputs = model(
+                image=image,
+                audio=audio,
+                classification_task=classification_task,
+                force_drop_modality="audio",
+            )
+            collect_predictions_for_f1(
+                image_only_outputs["logits"],
+                labels,
+                classification_task,
+                image_only_buffers,
+            )
+
+            audio_only_outputs = model(
+                image=image,
+                audio=audio,
+                classification_task=classification_task,
+                force_drop_modality="image",
+            )
+            collect_predictions_for_f1(
+                audio_only_outputs["logits"],
+                labels,
+                classification_task,
+                audio_only_buffers,
+            )
+
         n_samples += bs
 
     result = {
         "loss": total_loss / n_samples,
         "cls_loss": total_cls_loss / n_samples,
         "acc": {k: v / n_samples for k, v in total_acc.items()},
+        "f1": finalize_f1_scores(f1_buffers, classification_task),
     }
+    if diagnostics_enabled:
+        result["image_only_f1"] = finalize_f1_scores(
+            image_only_buffers, classification_task
+        )
+        result["audio_only_f1"] = finalize_f1_scores(
+            audio_only_buffers, classification_task
+        )
     result.update({k: v / n_samples for k, v in total_task_loss.items()})
     return result
 

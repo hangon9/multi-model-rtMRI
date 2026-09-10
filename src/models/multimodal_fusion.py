@@ -226,6 +226,9 @@ class AudioVisionFusionModel(nn.Module):
         encoder_cfg = model_cfg.get("audio_encoder", {})
         fusion_cfg = model_cfg.get("fusion", {})
         classifier_cfg = model_cfg.get("classifier", {})
+        self.unimodal_diagnostics_enabled = bool(
+            fusion_cfg.get("enable_unimodal_diagnostics", False)
+        )
 
         self.image_branch = ImageBranch(
             image_encoder_cfg=image_encoder_cfg,
@@ -285,6 +288,8 @@ class AudioVisionFusionModel(nn.Module):
             nn.init.trunc_normal_(self.null_audio_embedding, std=0.02)
         else:
             self.null_audio_embedding = None
+
+        self._unimodal_diagnostics_batch_warning_emitted = False
 
     def set_epoch(self, epoch: int) -> None:
         """训练脚本每个 epoch 开始时调用一次，供 schedule=linear_warmup 使用。"""
@@ -350,13 +355,38 @@ class AudioVisionFusionModel(nn.Module):
 
         return pooled_audio, audio_seq, drop_mask
 
+    @staticmethod
+    def _ablate_with_batch_mean(
+        pooled: torch.Tensor | None,
+        seq: torch.Tensor | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """用 batch 均值替换模态特征，保留形状但去除样本区分信息。
+
+        该方法只服务于验证期诊断，不创建参数，也不修改序列的 padding mask；
+        传入为 ``None`` 的特征分支原样返回 ``None``。
+        """
+        if pooled is not None:
+            pooled = pooled.mean(dim=0, keepdim=True).expand_as(pooled).contiguous()
+        if seq is not None:
+            seq = seq.mean(dim=0, keepdim=True).expand_as(seq).contiguous()
+        return pooled, seq
+
     def forward(
         self,
         image: torch.Tensor,
         audio: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         classification_task: str | None = None,
+        force_drop_modality: str | None = None,
     ) -> dict[str, object]:
+        """执行融合分类，并可在验证时强制移除一个模态的样本信息。
+
+        ``None`` 表示正常双模态前向；``"audio"`` 和 ``"image"`` 分别替换对应
+        模态的 pooled/sequence 特征。非法值抛出 ``ValueError``，返回字典结构保持不变。
+        """
+        if force_drop_modality not in (None, "audio", "image"):
+            raise ValueError(f"Invalid force_drop_modality: {force_drop_modality!r}")
+
         if getattr(self.fusion, "requires_sequence_input", False):
             img_seq = self.image_branch.encode_sequence(image)  # [B, T_img, D_img]
             audio_seq, audio_padding_mask = self.audio_branch.encode_sequence(
@@ -376,6 +406,10 @@ class AudioVisionFusionModel(nn.Module):
             pooled_audio, audio_seq, audio_drop_mask = self._maybe_drop_audio(
                 pooled_audio, audio_seq
             )
+            if force_drop_modality == "audio":
+                _, audio_seq = self._ablate_with_batch_mean(pooled_audio, audio_seq)
+            elif force_drop_modality == "image":
+                _, img_seq = self._ablate_with_batch_mean(None, img_seq)
             fused = self.fusion(
                 img_seq, audio_seq, audio_padding_mask=audio_padding_mask
             )  # 序列级融合（cross-attention/MBT） -> [B, fusion.output_dim]
@@ -387,6 +421,10 @@ class AudioVisionFusionModel(nn.Module):
             pooled_audio, audio_seq, audio_drop_mask = self._maybe_drop_audio(
                 pooled_audio, audio_seq
             )
+            if force_drop_modality == "audio":
+                pooled_audio, _ = self._ablate_with_batch_mean(pooled_audio, audio_seq)
+            elif force_drop_modality == "image":
+                pooled_img, _ = self._ablate_with_batch_mean(pooled_img, img_seq)
             fused = self.fusion(pooled_img, pooled_audio)  # concat/gated 融合 -> [B, fusion.output_dim]
 
         active_classification_task = (

@@ -320,6 +320,84 @@ def plot_all_folds_val_loss(histories: Mapping[int, pd.DataFrame], best_meta: Ma
     plt.close(fig)
 
 
+_F1_TASKS = ("manner", "place", "voicing", "vowel_backness")
+
+
+def plot_fold_f1(
+    df: pd.DataFrame,
+    fold: int,
+    out_dir: Path,
+    tasks: Sequence[str] = _F1_TASKS,
+) -> None:
+    """绘制单折验证 F1，并在存在字段时叠加两种强制单模态曲线。"""
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+    for ax, task in zip(axes.flat, tasks):
+        columns = (
+            (f"val_f1_{task}", "双模态", "o", "-"),
+            (f"val_image_only_f1_{task}", "仅图像", "^", "--"),
+            (f"val_audio_only_f1_{task}", "仅音频", "s", ":"),
+        )
+        for column, label, marker, linestyle in columns:
+            if column not in df.columns:
+                continue
+            sub = df[["epoch", column]].dropna()
+            if not sub.empty:
+                ax.plot(
+                    sub["epoch"],
+                    sub[column],
+                    marker=marker,
+                    linestyle=linestyle,
+                    label=label,
+                )
+        ax.set_title(task.capitalize())
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Macro F1")
+        ax.set_ylim(0, 1.05)
+        ax.grid(True, alpha=0.3)
+        if ax.lines:
+            ax.legend()
+
+    fig.suptitle(f"Fold {fold} Validation F1")
+    fig.tight_layout()
+    fig.savefig(out_dir / f"fold{fold}_f1.png", dpi=200)
+    plt.close(fig)
+
+
+def plot_all_folds_f1(
+    histories: Mapping[int, pd.DataFrame],
+    out_dir: Path,
+    tasks: Sequence[str] = _F1_TASKS,
+) -> None:
+    """绘制跨折正常双模态验证 F1；单模态曲线保留在单折图中避免拥挤。"""
+    fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+    for ax, task in zip(axes.flat, tasks):
+        column = f"val_f1_{task}"
+        for fold, df in sorted(histories.items()):
+            if column not in df.columns:
+                continue
+            sub = df[["epoch", column]].dropna()
+            if not sub.empty:
+                ax.plot(
+                    sub["epoch"],
+                    sub[column],
+                    marker="o",
+                    linestyle="--",
+                    label=f"Fold {fold}",
+                )
+        ax.set_title(task.capitalize())
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Macro F1")
+        ax.set_ylim(0, 1.05)
+        ax.grid(True, alpha=0.3)
+        if ax.lines:
+            ax.legend(title="Folds", fontsize=8)
+
+    fig.suptitle("All Folds Validation F1")
+    fig.tight_layout()
+    fig.savefig(out_dir / "all_folds_f1.png", dpi=200)
+    plt.close(fig)
+
+
 # -----------------------------
 # Plot 4 & 5: task metrics
 # -----------------------------
