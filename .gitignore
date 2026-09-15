@@ -79,7 +79,9 @@ predictions_*.json
 datasets/
 data/processed/
 data/USC-annot-16/
+data/USC-16-mask/
 data/USC-TIMIT/
+data/USC-TIMIT_mask/
 *.zip
 docs/
 
