@@ -10,6 +10,7 @@ from pathlib import Path
 from src.models.contrastive_model import AudioVisionContrastiveModel
 from src.losses.loss_factory import BuildLoss
 from utils.logger import TrainingLogger
+from utils.model_params import log_model_params
 from data.splits import make_train_test_split, create_dataloader
 
 CONFIG_PATH = "configs/baseline_config.yaml"
@@ -301,6 +302,43 @@ def validate_one_epoch(model, dataloader, criterion, device, classification_task
         result[k] = v / n
     return result
 
+def resolve_model_params(config, classification_task: str) -> dict:
+    """汇总 AudioVisionContrastiveModel 实际接收的构造参数（含代码默认值）。
+
+    返回值同时用于两处：写进 training.log，以及展开成构造函数的实参
+    （AudioVisionContrastiveModel(**params)）。两边共用同一份字典，因此日志里的取值就是
+    本次训练真正生效的取值。
+
+    Args:
+        config: 完整训练配置字典；用其中的 loss.contrast_loss 判断是否启用对比分支。
+        classification_task: "" 表示四头多任务，否则为单任务名（决定分类头输出维度）。
+
+    Returns:
+        dict，键名与 AudioVisionContrastiveModel.__init__ 的形参名严格一致。
+
+    Warning:
+        对比模型的编码器尺寸目前硬编码在 src/models/contrastive_model.py 内部
+        （img_size=128、patch_size=16、mlp_dim=3072、num_layers/num_heads=12、
+        音频骨干 facebook/wav2vec2-base-960h、hidden_size 由 hidden_size 入参决定），
+        因此 configs/contrast_baseline_config.yaml 里的 model.image_encoder /
+        model.backbone / model.projection 等键当前不生效，改动它们不会影响本模型；
+        本函数记录的是脚本真正传进去的实参，改这些硬编码值需同时改本函数与模型类。
+    """
+    # 对比分支开关：loss.contrast_loss 为 None / "none" / "null" 时只用图像分支
+    contrast_loss_name = config.get("loss", {}).get("contrast_loss", None)
+    use_contrast = contrast_loss_name is not None and str(contrast_loss_name).lower() not in ("none", "null")
+
+    return {
+        "num_classes": NUM_CLASSES[classification_task],
+        "visual_tokens": 65,    # 单帧 ViT 的 token 数（含 CLS），与 MRIViTEncoder 输出对齐
+        "target_tokens": 31,    # 音频 SSL 时间步，作为投影后的统一序列长度
+        "hidden_size": 768,     # 视觉/音频 token 的公共维度
+        "lambda_cosine": 0.1,   # 模型内部保存的对比损失权重（实际由 BuildLoss 的 lambda 控制）
+        "classification_task": classification_task,
+        "use_contrast": use_contrast,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train 3D Grounding-DETR')
     parser.add_argument('--config', type=str, default='configs/baseline_config.yaml',
@@ -346,6 +384,11 @@ def main():
     else:
         logger.info(f"train_fold: 只跑折 {sorted(train_folds)}（共 {n_splits} 折）")
 
+    # 模型实参先解析出来：既用于写日志，也直接展开成 AudioVisionContrastiveModel 的实参，
+    # 保证日志记录的就是构造函数真正收到的取值；参数各折相同，只打印一次
+    model_params = resolve_model_params(config, classification_task)
+    log_model_params(logger, "AudioVisionContrastiveModel", model_params)
+
     # Prepare checkpoint directory from config and track global best across folds
     checkpoint_dir = Path(config["paths"]["checkpoint_dir"])
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -370,17 +413,9 @@ def main():
 
         # init model, criterion, optimizer for each fold
         contrast_loss_name = config["loss"].get("contrast_loss", None)
-        use_contrast = contrast_loss_name is not None and str(contrast_loss_name).lower() not in ("none", "null")
+        use_contrast = model_params["use_contrast"]   # 与日志打印的开关同源，避免两处判断不一致
 
-        model = AudioVisionContrastiveModel(
-            num_classes=NUM_CLASSES[classification_task],
-            visual_tokens=65,
-            target_tokens=31,
-            hidden_size=768,
-            lambda_cosine=0.1,
-            classification_task=classification_task,
-            use_contrast=use_contrast,
-        ).to(device)
+        model = AudioVisionContrastiveModel(**model_params).to(device)
 
         class_weights = get_class_weights(train_df, config)   # ← 每折单独算
         bce_pos_weight = get_bce_pos_weight(train_df, config)

@@ -9,6 +9,99 @@ from src.models.img_encoder import build_image_encoder
 from src.models.img_only_model import ImageTemporalEncoder
 
 
+# ---------------------------------------------------------------------------
+# 默认配置表与归一化
+# ---------------------------------------------------------------------------
+# 下表与各分支内部 .get(key, default) 的默认值一一对应，集中到一处是为了：
+#   1. 训练脚本能把「模型实际接收到的参数（含默认值）」完整写进 training.log；
+#   2. 排查配置键名写错导致的静默回退时，只需对照这一张表。
+# 修改默认值只需改这里：归一化后的配置会显式提供所有键，分支里的 .get 默认值不再生效。
+_DEFAULT_MODEL_CFG = {
+    "image_encoder": {
+        "model_name": "vit",       # vit | ViT-Base | ResNet50
+        "pretrained": True,        # 仅 ResNet50 与 ViT-Base 支持加载预训练权重
+        "freeze_layers": 0,        # 冻结编码器前 N 层，0 表示全部参与训练
+        "img_size": 128,           # 输入分辨率；ViT-Base 需 224
+        "patch_size": 16,
+        "hidden_size": 768,
+        "mlp_dim": 3072,
+        "num_layers": 12,
+        "num_heads": 12,
+        "dropout": 0.1,
+    },
+    "image_temporal": {
+        "temporal_type": "none",   # none | conformer
+        "conformer_layers": 2,
+        "conformer_heads": 8,
+        "conv_kernel_size": 5,
+        "dropout": 0.1,
+    },
+    "audio_backbone": {
+        "model_name": "facebook/wav2vec2-base",
+        "freeze_feature_extractor": True,
+        "freeze_transformer_layers": 0,
+        "attn_dim": 256,
+        "dropout": 0.1,
+    },
+    "audio_encoder": {
+        "encoder_type": "attention",  # attention | conformer
+        "conformer_layers": 2,
+        "conformer_heads": 8,
+        "conv_kernel_size": 17,
+    },
+    "fusion": {
+        "fusion_type": "concat",   # concat | gated
+        "fusion_dim": 256,
+        "dropout": 0.1,
+    },
+    "classifier": {
+        "clf_hidden_dim": 256,
+        "dropout": 0.1,
+    },
+}
+
+
+def _fill_defaults(raw: dict, defaults: dict) -> dict:
+    """用 defaults 递归补齐 raw 中缺失的键，返回新的嵌套字典。
+
+    合并规则：
+    - 两边同一键都是字典 → 递归合并；
+    - 其余情况以 raw 为准；raw 中 defaults 没有的键会原样保留——这样写错键名的配置会
+      出现在日志里（例如 fusion.fusion_type: cross_attn），而不是被悄悄丢弃。
+
+    Args:
+        raw: 用户配置子树，允许为空字典。
+        defaults: 默认值子树，结构应与模型读取路径一致。
+
+    Returns:
+        新的 dict，嵌套层也是新对象；不修改任何入参，可安全用于写日志或继续传给模型。
+    """
+    merged = dict(defaults)
+    for key, value in (raw or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _fill_defaults(value, merged[key])
+        else:
+            merged[key] = value
+    return merged
+
+
+def resolve_fusion_model_cfg(model_cfg: dict | None) -> dict:
+    """把 config 的 model 节补全成 AudioVisionFusionModel 实际使用的完整配置。
+
+    Args:
+        model_cfg: config["model"] 原始内容；允许为 None，缺失的子节按默认值构建。
+
+    Returns:
+        新的嵌套字典，键路径与模型内部读取的路径一致、取值已含默认值。
+
+    Note:
+        本函数无副作用（不写回 config），训练脚本可以直接把它交给 log_model_params，
+        因此日志里的取值就是模型真正读到的取值。图像/音频分支内部仍保留
+        .get(key, default) 兜底，但归一化之后这些兜底不会触发。
+    """
+    return _fill_defaults(model_cfg or {}, _DEFAULT_MODEL_CFG)
+
+
 class ImageBranch(nn.Module):
     """图像分支：按帧编码后做时序聚合，输出图像 pooled 表征。"""
 
@@ -206,7 +299,13 @@ class FusionModule(nn.Module):
 
 
 class AudioVisionFusionModel(nn.Module):
-    """多模态融合模型（Phase 1）：图像+音频联合分类，支持 concat/gated。"""
+    """多模态融合模型（Phase 1）：图像 + 音频联合分类，支持 concat/gated。
+
+    协作关系：ImageBranch 与 AudioBranch 各自输出 pooled 表征，FusionModule 负责融合，
+    末端的 ClassificationHead 输出 gated 四头（manner/place/voicing/vowel_backness）logits。
+    传入的 model_cfg 会先经 resolve_fusion_model_cfg 补齐默认值，因此内部各分支读到的
+    取值与训练脚本写进 training.log 的「模型实际接收参数」完全一致。
+    """
 
     def __init__(
         self,
@@ -216,6 +315,10 @@ class AudioVisionFusionModel(nn.Module):
     ):
         super().__init__()
         self.classification_task = classification_task or ""
+
+        # 先把配置补齐成完整取值再分发到各分支：子模块因此总能拿到显式取值，
+        # 也让训练脚本打印的参数字典与模型实际使用的一致
+        model_cfg = resolve_fusion_model_cfg(model_cfg)
 
         image_encoder_cfg = model_cfg.get("image_encoder", {})
         temporal_cfg = model_cfg.get("image_temporal", {})
