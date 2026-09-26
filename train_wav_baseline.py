@@ -268,13 +268,15 @@ def get_optimizer_hparams(config):
 
     fallback_lr = train_cfg.get("lr", 1e-5)
     backbone_lr = train_cfg.get(
-        "lr_backbone", model_cfg.get("lr_audio_encoder", fallback_lr)
+        "lr_audio_backbone", train_cfg.get("lr_backbone", fallback_lr)
     )
-    downstream_fallback = loss_cfg.get("lr_downstream", fallback_lr)
-    encoder_lr = train_cfg.get("lr_encoder", downstream_fallback)
-    classifier_lr = train_cfg.get("lr_classifier", downstream_fallback)
+
+    encoder_lr = train_cfg.get(
+        "lr_audio_encoder", train_cfg.get("lr_encoder", fallback_lr)
+    )
+    classifier_lr = train_cfg.get("lr_classifier", fallback_lr)
     global_lr = train_cfg.get(
-        "lr_global", train_cfg.get("lr_pooling", downstream_fallback)
+        "lr_global", train_cfg.get("lr_pooling", fallback_lr)
     )
     weight_decay = train_cfg.get("weight_decay", 0.0)
 
@@ -539,8 +541,8 @@ def main():
     config = load_config(args.config)
     train_cfg = config.get("train", {})
     model_root = config.get("model", {})
-    model_cfg = model_root.get("audio_backbone", {})
-    encoder_cfg = model_root.get("audio_encoder", {})
+    model_cfg = model_root.get("audio_backbone", model_root.get("backbone", {}))
+    encoder_cfg = model_root.get("audio_encoder", model_root.get("encoder", {}))
     data_cfg = config.get("data", {})
     classification_task = config.get("data", {}).get("classification_task", "") or ""
     grad_clip = train_cfg.get("grad_clip", 0.5)
