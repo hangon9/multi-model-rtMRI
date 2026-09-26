@@ -25,6 +25,7 @@ from data.splits import make_train_test_split, create_dataloader
 from src.models.img_only_model import ImageMultiheadClassifier
 from src.losses.loss_factory import BuildLoss
 from utils.logger import TrainingLogger
+from utils.model_params import log_model_params
 
 NUM_CLASSES = {
     "": 18,
@@ -302,6 +303,59 @@ def build_optimizer(model, config, logger=None):
 
 
 # ---------------------------------------------------------------------------
+# model params: 解析模型实际接收的参数
+# ---------------------------------------------------------------------------
+
+def resolve_model_params(config, classification_task: str) -> dict:
+    """汇总 ImageMultiheadClassifier 实际接收的构造参数（含代码默认值）。
+
+    返回值同时用于两处：写进 training.log，以及展开成构造函数的实参
+    （ImageMultiheadClassifier(**params)）。两边共用同一份字典，因此日志里的取值就是
+    本次训练真正生效的取值，不会出现「config 写了 A、代码默认值是 B」而不自知的情况。
+
+    Args:
+        config: 完整训练配置字典，读取其中的 model 节。
+        classification_task: "" 表示四头多任务，否则为 manner/place/voicing/vowel_backness
+            之一，决定分类头的输出维度。
+
+    Returns:
+        dict，键名与 ImageMultiheadClassifier.__init__ 的形参名严格一致。
+
+    Note:
+        config 中缺失的键回退到构造函数里的默认值（img_size=128、dropout=0.1 等）；
+        freeze_layers 统一转 int，兼容 YAML 里写成字符串（如 "4"）的情况。
+        configs/img_baseline_config.yaml 没有 image_temporal 节，此时 temporal_type
+        取 "none"，即单帧基线行为。
+    """
+    model_cfg = config.get("model", {})
+    img_cfg = model_cfg.get("image_encoder", {})
+    temporal_cfg = model_cfg.get("image_temporal", {})
+    clf_cfg = model_cfg.get("classifier", {})
+
+    # 图像编码器的结构参数来自 model.image_encoder，分类头隐层来自 model.classifier，
+    # 时序模块来自 model.image_temporal；三者的默认值与 ImageMultiheadClassifier 一致
+    return {
+        "num_classes": NUM_CLASSES[classification_task],
+        "img_size": img_cfg.get("img_size", 128),
+        "patch_size": img_cfg.get("patch_size", 16),
+        "hidden_size": img_cfg.get("hidden_size", 768),
+        "mlp_dim": img_cfg.get("mlp_dim", 3072),
+        "clf_hidden_dim": clf_cfg.get("clf_hidden_dim", 256),
+        "num_layers": img_cfg.get("num_layers", 12),
+        "num_heads": img_cfg.get("num_heads", 12),
+        "dropout": img_cfg.get("dropout", 0.1),
+        "classification_task": classification_task,
+        "model_name": img_cfg.get("model_name", "vit"),
+        "pretrained": img_cfg.get("pretrained", True),
+        "freeze_layers": int(img_cfg.get("freeze_layers", 0)),
+        "temporal_type": temporal_cfg.get("temporal_type", "none"),
+        "conformer_layers": temporal_cfg.get("conformer_layers", 2),
+        "conformer_heads": temporal_cfg.get("conformer_heads", 8),
+        "conv_kernel_size": temporal_cfg.get("conv_kernel_size", 5),
+    }
+
+
+# ---------------------------------------------------------------------------
 # CV split helper
 # ---------------------------------------------------------------------------
 
@@ -487,15 +541,13 @@ def main():
         config = yaml.safe_load(f)
 
     train_cfg = config.get("train", {})
-    model_cfg = config.get("model", {})
-    img_cfg = model_cfg.get("image_encoder", {})
-    model_name = img_cfg.get("model_name", "vit")
-    temporal_cfg = model_cfg.get("image_temporal", {})
-    freeze_layers = int(img_cfg.get("freeze_layers", 0))
-    clf_cfg = model_cfg.get("classifier", {})
     data_cfg = config.get("data", {})
     classification_task = data_cfg.get("classification_task", "") or ""
     grad_clip = train_cfg.get("grad_clip", 0.5)
+
+    # 模型实参先解析出来：既用于写日志，也直接展开成 ImageMultiheadClassifier 的实参，
+    # 保证日志记录的就是构造函数真正收到的取值
+    model_params = resolve_model_params(config, classification_task)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -521,14 +573,17 @@ def main():
     checkpoint_dir = Path(config["paths"]["checkpoint_dir"])
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Image encoder: {model_name}, freeze_layers: {freeze_layers}")
-    logger.info(f"Temporal encoder: {temporal_cfg.get('temporal_type', 'none')}")
+    logger.info(f"Image encoder: {model_params['model_name']}, freeze_layers: {model_params['freeze_layers']}")
+    logger.info(f"Temporal encoder: {model_params['temporal_type']}")
     logger.info(f"Classification task: {classification_task or 'multi-task'}")
     logger.info(f"Cross-validation: {n_splits} folds, {num_epochs} epochs each")
     if train_folds is None:
         logger.info(f"train_fold: 留空，跑全部 {n_splits} 折")
     else:
         logger.info(f"train_fold: 只跑折 {sorted(train_folds)}（共 {n_splits} 折）")
+
+    # 模型参数各折完全相同，只在训练开始前打印一次
+    log_model_params(logger, "ImageMultiheadClassifier", model_params)
 
     global_best_val_loss = float("inf")
     global_best_ckpt_path = None
@@ -549,26 +604,7 @@ def main():
         val_loader = create_dataloader(val_df, config, train=False)
 
         # ---- model ----
-        
-        model = ImageMultiheadClassifier(
-            num_classes=NUM_CLASSES[classification_task],
-            img_size=img_cfg.get("img_size", 128),
-            patch_size=img_cfg.get("patch_size", 16),
-            hidden_size=img_cfg.get("hidden_size", 768),
-            mlp_dim=img_cfg.get("mlp_dim", 3072),
-            clf_hidden_dim=clf_cfg.get("clf_hidden_dim", 256),
-            num_layers=img_cfg.get("num_layers", 12),
-            num_heads=img_cfg.get("num_heads", 12),
-            dropout=img_cfg.get("dropout", 0.1),
-            classification_task=classification_task,
-            model_name=model_name,
-            pretrained=img_cfg.get("pretrained", True),
-            freeze_layers=freeze_layers,
-            temporal_type=temporal_cfg.get("temporal_type", "none"),
-            conformer_layers=temporal_cfg.get("conformer_layers", 2),
-            conformer_heads=temporal_cfg.get("conformer_heads", 8),
-            conv_kernel_size=temporal_cfg.get("conv_kernel_size", 5),
-        ).to(device)
+        model = ImageMultiheadClassifier(**model_params).to(device)
 
         # ---- loss & optimizer & scheduler ----
         class_weights = get_class_weights(train_df, config)

@@ -24,8 +24,9 @@ from tqdm import tqdm
 from data.splits import create_dataloader, make_train_test_split
 from src.eval.metrics import compute_metrics
 from src.losses.loss_factory import BuildLoss
-from src.models.multimodal_fusion import AudioVisionFusionModel
+from src.models.multimodal_fusion import AudioVisionFusionModel, resolve_fusion_model_cfg
 from utils.logger import TrainingLogger
+from utils.model_params import log_model_params
 
 NUM_CLASSES = {
     "": 18,
@@ -598,6 +599,34 @@ def evaluate(model, loader, criterion, device, classification_task="", name="val
     return result
 
 
+def resolve_model_params(config, classification_task: str) -> dict:
+    """汇总 AudioVisionFusionModel 实际接收的构造参数（含代码默认值）。
+
+    返回值同时用于两处：写进 training.log，以及展开成构造函数的实参
+    （AudioVisionFusionModel(**params)）。其中 model_cfg 由模型模块的
+    resolve_fusion_model_cfg 归一化，与模型内部读到的嵌套取值同源，因此日志里既能
+    看到 config 显式写下的键，也能看到靠默认值补齐的键。
+
+    Args:
+        config: 完整训练配置字典，读取其中的 model 节。
+        classification_task: "" 表示四头多任务，否则为 manner/place/voicing/vowel_backness
+            之一，决定分类头的输出维度。
+
+    Returns:
+        dict，键名与 AudioVisionFusionModel.__init__ 的形参名严格一致
+        （model_cfg 为嵌套字典，展开成点号路径后即为 model_cfg.image_encoder.* 等）。
+
+    Note:
+        configs/multimodal_fusion_*.yaml 的 fusion_type 目前只支持 concat/gated；
+        若写成 cross_attn/mbt，该取值会出现在日志里，并在构造 FusionModule 时直接报错。
+    """
+    return {
+        "num_classes": NUM_CLASSES[classification_task],
+        "model_cfg": resolve_fusion_model_cfg(config.get("model", {})),
+        "classification_task": classification_task,
+    }
+
+
 def main():
     """训练入口。"""
     parser = argparse.ArgumentParser()
@@ -608,10 +637,13 @@ def main():
         config = yaml.safe_load(f)
 
     train_cfg = config.get("train", {})
-    model_cfg = config.get("model", {})
     data_cfg = config.get("data", {})
     classification_task = data_cfg.get("classification_task", "") or ""
     grad_clip = train_cfg.get("grad_clip", 0.5)
+
+    # 模型实参先解析出来：既用于写日志，也直接展开成 AudioVisionFusionModel 的实参，
+    # 保证日志记录的就是构造函数真正收到的取值
+    model_params = resolve_model_params(config, classification_task)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -635,13 +667,16 @@ def main():
     checkpoint_dir = Path(config["paths"]["checkpoint_dir"])
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Fusion type: {model_cfg.get('fusion', {}).get('fusion_type', 'concat')}")
+    logger.info(f"Fusion type: {model_params['model_cfg']['fusion']['fusion_type']}")
     logger.info(f"Classification task: {classification_task or 'multi-task'}")
     logger.info(f"Cross-validation: {n_splits} folds, {num_epochs} epochs each")
     if train_folds is None:
         logger.info(f"train_fold: 留空，跑全部 {n_splits} 折")
     else:
         logger.info(f"train_fold: 只跑折 {sorted(train_folds)}（共 {n_splits} 折）")
+
+    # 模型参数各折完全相同，只在训练开始前打印一次
+    log_model_params(logger, "AudioVisionFusionModel", model_params)
 
     global_best_val_loss = float("inf")
     global_best_ckpt_path = None
@@ -662,11 +697,7 @@ def main():
         train_loader = create_dataloader(train_df, config, train=True)
         val_loader = create_dataloader(val_df, config, train=False)
 
-        model = AudioVisionFusionModel(
-            num_classes=NUM_CLASSES[classification_task],
-            model_cfg=model_cfg,
-            classification_task=classification_task,
-        ).to(device)
+        model = AudioVisionFusionModel(**model_params).to(device)
 
         class_weights = get_class_weights(train_df, config)
         bce_pos_weight = get_bce_pos_weight(train_df, config)
