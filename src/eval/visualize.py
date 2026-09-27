@@ -333,9 +333,9 @@ def plot_fold_f1(
     fig, axes = plt.subplots(2, 2, figsize=(13, 9))
     for ax, task in zip(axes.flat, tasks):
         columns = (
-            (f"val_f1_{task}", "双模态", "o", "-"),
-            (f"val_image_only_f1_{task}", "仅图像", "^", "--"),
-            (f"val_audio_only_f1_{task}", "仅音频", "s", ":"),
+            (f"val_f1_{task}", "multimodal", "o", "-"),
+            (f"val_image_only_f1_{task}", "img_only", "^", "--"),
+            (f"val_audio_only_f1_{task}", "audio_only", "s", ":"),
         )
         for column, label, marker, linestyle in columns:
             if column not in df.columns:
