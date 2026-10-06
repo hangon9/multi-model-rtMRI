@@ -30,6 +30,8 @@ TASKS: tuple[str, ...] = ("manner", "place", "voicing", "vowel_backness")
 # Maps experiment_name values → model family tag
 _EXPERIMENT_TO_FAMILY: dict[str, str] = {
     "contrast_contrastive":               "contrastive",
+    "contrast_post_temporal":             "contrastive",
+    "contrast_pre_temporal":              "contrastive",
     "wav2vec2-base-960h_baseline":        "audio",
     "wav2vec2-xlsr-53-espeak-cv-ft_baseline": "audio",
     "hubert_baseline":                    "audio",   # same forward interface
@@ -184,23 +186,17 @@ def _build_contrastive_model(
     classification_task: str,
     device: torch.device,
 ) -> AudioVisionContrastiveModel:
-    projection_cfg = config["model"].get("projection", {})
-    loss_cfg       = config.get("loss", {})
+    """构建对比模型的推理副本：只含图像分支与分类头。
 
-    contrast_loss_name = loss_cfg.get("contrast_loss", None)
-    use_contrast = (
-        contrast_loss_name is not None
-        and str(contrast_loss_name).lower() not in ("none", "null")
-    )
-
+    对比模型把音频分支当训练期教师，权重里不带 ``audio_branch.*`` /
+    ``contrast.*``（冻结教师不入档、投影头推理无用），因此这里以 ``inference_only=True``
+    构建，推理既不需要音频 checkpoint，也不需要下载 wav2vec2。
+    """
     return AudioVisionContrastiveModel(
         num_classes=NUM_CLASSES[classification_task],
-        visual_tokens=projection_cfg.get("visual_tokens", 65),
-        target_tokens=projection_cfg.get("target_tokens", 31),
-        hidden_size=projection_cfg.get("hidden_size", 768),
-        lambda_cosine=loss_cfg.get("lambda", 0.1),
+        model_cfg=config.get("model", {}),
         classification_task=classification_task,
-        use_contrast=use_contrast,
+        inference_only=True,
     ).to(device)
 
 
@@ -292,6 +288,46 @@ def _build_model(
     if model_family == "multimodal_fusion":
         return _build_multimodal_model(config, classification_task, device)
     raise ValueError(f"Unknown model_family: {model_family!r}")
+
+
+def _load_state(model: nn.Module, state_dict: dict, model_family: str) -> None:
+    """把 checkpoint 权重载入模型。
+
+    Args:
+        model: 已构建的模型实例。
+        state_dict: ``ckpt["model_state_dict"]``。
+        model_family: 模型族标签；``"contrastive"`` 走宽松加载，其余严格加载。
+
+    Raises:
+        RuntimeError: 模型需要的参数在 checkpoint 里找不到时抛出。
+
+    Note:
+        对比模型训练时含音频教师与投影头，推理副本不含它们，所以两侧键集合天然不同：
+        多出来的键（``audio_branch.*`` / ``contrast.*``）丢弃并打印条数，缺少的键仍然报错
+        ——缺键意味着模型结构或 image_encoder 配置与训练时不一致，静默忽略会得到随机权重。
+    """
+    if model_family != "contrastive":
+        model.load_state_dict(state_dict)
+        return
+
+    model_keys = set(model.state_dict().keys())
+    matched = {key: value for key, value in state_dict.items() if key in model_keys}
+
+    missing = sorted(model_keys - set(matched))
+    if missing:
+        preview = ", ".join(missing[:5])
+        raise RuntimeError(
+            f"contrastive checkpoint 缺少模型需要的 {len(missing)} 个参数，例如 {preview}。"
+            "请确认 config 的 model.image_encoder / image_temporal 与训练时一致。"
+        )
+
+    extra = sorted(set(state_dict.keys()) - model_keys)
+    if extra:
+        print(
+            f"[inference] 丢弃推理不需要的 {len(extra)} 个参数（如 {', '.join(extra[:3])}）"
+        )
+
+    model.load_state_dict(matched, strict=True)
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +491,12 @@ def run_inference(
     results : dict[task, {"preds": ndarray, "labels": ndarray}]
     meta    : {fold, epoch, best_val_loss, classification_task, config,
                model_family, experiment_name}
+
+    Note
+    ────
+    Contrastive checkpoints carry audio-teacher and projection weights that the
+    image-only inference copy does not build, so they are loaded leniently (extra
+    keys dropped, missing keys still fatal) — see :func:`_load_state`.
     """
     checkpoint_path = Path(checkpoint_path)
     device_obj = torch.device(
@@ -471,7 +513,7 @@ def run_inference(
 
     # ── Build & load model ───────────────────────────────────────────────────
     model = _build_model(config, classification_task, device_obj, model_family)
-    model.load_state_dict(ckpt["model_state_dict"])
+    _load_state(model, ckpt["model_state_dict"], model_family)
     model.eval()
 
     # ── Test data ────────────────────────────────────────────────────────────
