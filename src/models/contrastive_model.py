@@ -95,10 +95,21 @@ _DEFAULT_MODEL_CFG = {
     },
 }
 
-# 允许的音频教师键前缀：_validate_audio_state_dict 用它判断「这份存档是不是单音频实验产出的」
+# 允许出现在教师存档里的音频分支键前缀：用于区分「外来键」（别的分支/实验）与「音频键」
 _AUDIO_SD_PREFIXES = ("backbone.", "norm.", "encoder.", "norm2.", "pooling.", "classifier.")
+# 单音频实验自带、但教师结构不需要的下游键前缀：属预期内的多余键，静默丢弃
+_AUDIO_TEACHER_IGNORED_PREFIXES = ("classifier.",)
 _FREEZE_MODES = ("all", "backbone", "none")
 _CONTRAST_POSITIONS = ("post_temporal", "pre_temporal")
+
+# 日志与报错里列出的键名上限，避免一次刷出几百行
+_KEY_PREVIEW_LIMIT = 5
+
+
+def _preview_keys(keys: list[str], limit: int = _KEY_PREVIEW_LIMIT) -> str:
+    """把键名列表截断成日志友好的单行预览，超出上限时以 ``...`` 结尾。"""
+    preview = ", ".join(keys[:limit])
+    return f"{preview}, ...（共 {len(keys)} 个）" if len(keys) > limit else preview
 
 
 def _fill_defaults(raw: dict, defaults: dict) -> dict:
@@ -544,28 +555,75 @@ def _extract_state_dict(checkpoint) -> dict:
     return checkpoint if isinstance(checkpoint, dict) else {}
 
 
-def _validate_audio_state_dict(state_dict: dict, checkpoint_path: str) -> None:
-    """校验权重字典确实来自单音频实验，防止误加载别的实验的存档。
+def _select_audio_branch_state(
+    state_dict: dict,
+    expected_keys: set,
+    checkpoint_path: str,
+    logger=None,
+) -> dict:
+    """从教师存档中挑出音频教师需要的权重，对外来键只提示不打断。
 
     Args:
-        state_dict: 教师权重字典。
-        checkpoint_path: 仅用于报错信息，指出是哪份文件出错。
+        state_dict: 教师存档里的权重字典（``ckpt["model_state_dict"]`` 或裸 state_dict）。
+        expected_keys: 已构建的音频教师 ``state_dict()`` 的键集合，用于判断缺失与多余。
+        checkpoint_path: 仅用于日志与报错信息，指出是哪份文件。
+        logger: 可选日志器；提供 ``warning`` 时输出提示，None 表示静默。
+
+    Returns:
+        只含 ``expected_keys`` 的权重字典，可直接 ``strict=True`` 加载。
 
     Raises:
-        ValueError: 权重字典为空，或出现不属于音频分支命名空间（``backbone.`` / ``norm.`` /
-            ``encoder.`` / ``norm2.`` / ``pooling.`` / ``classifier.``）的键时抛出；
-            后者用于拦住误指向图像/对比/多模态实验存档的情况。
+        ValueError: 存档为空，或缺少教师需要的参数时抛出。
+
+    Note:
+        多余键只警告（例如同一份存档里还存着 ``image_branch.*`` / ``contrast.*``）；指向别的
+        实验的情况由「缺键」检查兜底——缺键才是真正致命的情形，因为那会静默得到随机初始化的
+        教师权重，让对比实验失去意义。``classifier.`` 是单音频实验自带的下游头，教师不需要，
+        属预期内的多余键，静默丢弃。
     """
     if not state_dict:
         raise ValueError(f"音频教师存档里没有可用的权重：{checkpoint_path}")
 
-    unexpected = [key for key in state_dict if not key.startswith(_AUDIO_SD_PREFIXES)]
-    if unexpected:
-        raise ValueError(
-            f"{checkpoint_path} 不像单音频实验的存档：出现 {len(unexpected)} 个非音频键，"
-            f"例如 {unexpected[:5]}。请确认 model.audio_branch.checkpoint 指向的是 "
-            "train_wav_baseline.py 产出的 checkpoint。"
+    selected = {key: value for key, value in state_dict.items() if key in expected_keys}
+
+    # 外来键：不属于音频分支命名空间，通常是存档里顺带存了别的分支/别的实验的权重
+    foreign = sorted(
+        key
+        for key in state_dict
+        if key not in expected_keys and not key.startswith(_AUDIO_SD_PREFIXES)
+    )
+    # 音频命名空间内、但当前结构用不到的键（如 attention 模式下多出来的 encoder.*）
+    unused = sorted(
+        key
+        for key in state_dict
+        if key not in expected_keys
+        and key.startswith(_AUDIO_SD_PREFIXES)
+        and not key.startswith(_AUDIO_TEACHER_IGNORED_PREFIXES)
+    )
+
+    if logger is not None and foreign:
+        logger.warning(
+            f"{checkpoint_path} 含 {len(foreign)} 个非音频键，已忽略："
+            f"{_preview_keys(foreign)}。请确认 model.audio_branch.checkpoint 指向的是 "
+            "train_wav_baseline.py 产出的存档。"
         )
+    if logger is not None and unused:
+        logger.warning(
+            f"{checkpoint_path} 含 {len(unused)} 个当前教师结构用不到的音频键，已忽略："
+            f"{_preview_keys(unused)}。若这与预期不符，请检查 "
+            "model.audio_branch.cfg_from_checkpoint 与本实验 yaml 声明的结构。"
+        )
+
+    missing = sorted(key for key in expected_keys if key not in selected)
+    if missing:
+        raise ValueError(
+            f"{checkpoint_path} 缺少音频教师需要的 {len(missing)} 个参数，例如 "
+            f"{_preview_keys(missing)}。这说明它不是单音频实验的存档，或结构与 "
+            "model.audio_branch.cfg_from_checkpoint / 本实验 yaml 声明的取值不一致；"
+            "继续加载会静默得到随机初始化的教师，因此这里必须报错。"
+        )
+
+    return selected
 
 
 def _format_teacher_path(template: str, fold_id: int | None) -> tuple[str, bool]:
@@ -696,7 +754,7 @@ class AudioVisionContrastiveModel(nn.Module):
 
         Raises:
             ValueError: ``freeze`` 取值非法、路径模板含 ``{fold}`` 但缺 fold_id、
-                存档键布局不是单音频实验、或存档缺少结构配置时抛出。
+                存档缺少教师需要的参数、或存档缺少结构配置时抛出。
         """
         branch_cfg = model_cfg.get("audio_branch", {})
         freeze = str(branch_cfg.get("freeze", "all")).lower()
@@ -731,6 +789,9 @@ class AudioVisionContrastiveModel(nn.Module):
             checkpoint_template: 教师路径，可含 ``{fold}`` 占位符。
             fold_id: 当前折号。
             window_frames: 本实验窗长，用于与存档记录的窗长比对。
+
+        Raises:
+            ValueError: 存档缺少教师需要的参数（详见 :func:`_select_audio_branch_state`）。
         """
         checkpoint_path, used_placeholder = _format_teacher_path(checkpoint_template, fold_id)
         # map_location="cpu" + weights_only=False：与仓库其它脚本（evaluate/visualize）一致，
@@ -743,14 +804,15 @@ class AudioVisionContrastiveModel(nn.Module):
         )
         self.audio_branch = ContrastAudioTeacher(backbone_cfg, encoder_cfg)
 
-        # 键布局校验必须在加载前做：它能把「误指向别的实验」这类错误变成明确的报错，
-        # 而不是一堆形状不匹配的 load_state_dict 提示
+        # 按已构建教师的键集合挑选权重：外来/多余键只警告并丢弃，缺键才报错。
+        # 这样误指向别的实验时不会静默得到随机教师，也不会因为存档里顺带存了别的分支而中断训练
         teacher_state = _extract_state_dict(checkpoint)
-        _validate_audio_state_dict(teacher_state, checkpoint_path)
-        # classifier 属于单音频实验的下游，教师分支不含它，剔除后严格加载即可
-        branch_state = {
-            key: value for key, value in teacher_state.items() if not key.startswith("classifier.")
-        }
+        branch_state = _select_audio_branch_state(
+            teacher_state,
+            expected_keys=set(self.audio_branch.state_dict().keys()),
+            checkpoint_path=checkpoint_path,
+            logger=self.logger,
+        )
         self.audio_branch.load_state_dict(branch_state, strict=True)
 
         teacher_data_cfg = (teacher_config or {}).get("data") or {}
