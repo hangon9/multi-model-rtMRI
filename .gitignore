@@ -24,6 +24,7 @@ MANIFEST
 # hpc
 *.slurm
 *.sh
+hpc/
 
 # Virtual environments
 venv/
