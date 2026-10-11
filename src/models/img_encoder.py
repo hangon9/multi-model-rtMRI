@@ -2,7 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from monai.networks.nets import ViT
-
+from torchvision.models import ViT_B_16_Weights, vit_b_16
+from torchvision.models import ResNet50_Weights, resnet50
+from torchvision.models import ResNet18_Weights, resnet18
 
 def _freeze(module):
     for p in module.parameters():
@@ -83,8 +85,7 @@ class ViTBaseEncoder(FrozenStageMixin, nn.Module):
 
     def __init__(self, pretrained=True, freeze_layers=0, **_):
         super().__init__()
-        self._init_freezing()
-        from torchvision.models import ViT_B_16_Weights, vit_b_16
+        self._init_freezing()        
         weights = ViT_B_16_Weights.DEFAULT if pretrained else None
         self.vit = vit_b_16(weights=weights)
         self._apply_freezing(int(freeze_layers))
@@ -117,8 +118,7 @@ class ResNet50Encoder(FrozenStageMixin, nn.Module):
 
     def __init__(self, pretrained=True, freeze_layers=0, **_):
         super().__init__()
-        self._init_freezing()
-        from torchvision.models import ResNet50_Weights, resnet50
+        self._init_freezing()        
         weights = ResNet50_Weights.DEFAULT if pretrained else None
         self.resnet = resnet50(weights=weights)
         self.resnet.fc = nn.Identity()
@@ -142,10 +142,38 @@ class ResNet50Encoder(FrozenStageMixin, nn.Module):
         pooled = self.resnet(image)
         return (pooled, []) if return_hidden_states else pooled
 
+class ResNet18Encoder(FrozenStageMixin, nn.Module):
+    output_dim = 512
+
+    def __init__(self, pretrained=True, freeze_layers=0, **_):
+        super().__init__()
+        self._init_freezing()        
+        weights = ResNet18_Weights.DEFAULT if pretrained else None
+        self.resnet = resnet18(weights=weights)
+        self.resnet.fc = nn.Identity()
+        self._apply_freezing(int(freeze_layers))
+
+    def _apply_freezing(self, n):
+        stem = nn.Sequential(self.resnet.conv1, self.resnet.bn1,
+                             self.resnet.relu, self.resnet.maxpool)
+        stages = [stem, self.resnet.layer1, self.resnet.layer2,
+                  self.resnet.layer3, self.resnet.layer4]
+        if n < -1 or n > len(stages):
+            raise ValueError(f"ResNet18 freeze_layers must be -1 or 0..{len(stages)}")
+        if n == -1:
+            self._fully_frozen = True
+            _freeze(self)
+        else:
+            for stage in stages[:n]:
+                self._freeze_stage(stage)
+
+    def forward(self, image, return_hidden_states=False):
+        pooled = self.resnet(image)
+        return (pooled, []) if return_hidden_states else pooled
 
 def build_image_encoder(model_name="vit", **kwargs):
     encoders = {"vit": MRIViTEncoder, "ViT-Base": ViTBaseEncoder,
-                "ResNet50": ResNet50Encoder}
+                "ResNet50": ResNet50Encoder, "ResNet18": ResNet18Encoder}
     if model_name not in encoders:
         raise ValueError(f"Unknown model_name {model_name!r}; choose from {list(encoders)}")
     return encoders[model_name](**kwargs)
