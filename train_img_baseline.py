@@ -225,11 +225,9 @@ def build_optimizer(model, config, logger=None):
     """Build AdamW with separate LR for image_encoder and classifier."""
     train_cfg = config.get("train", {})
     encoder_lr = float(train_cfg.get("lr_image_encoder", 1e-4))
-    temporal_lr = float(train_cfg.get("lr_image_temporal", encoder_lr))
+    temporal_lr = float(train_cfg.get("lr_image_temporal", 1e-4))
     classifier_lr = float(train_cfg.get("lr_classifier", 1e-4))
     weight_decay = float(train_cfg.get("weight_decay", 0.0))
-
-    temporal_lr = float(train_cfg.get("lr_temporal", encoder_lr))
 
     buckets = {
         f"{group}_{decay}": []
