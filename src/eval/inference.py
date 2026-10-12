@@ -41,6 +41,48 @@ _EXPERIMENT_TO_FAMILY: dict[str, str] = {
     "multimodal_fusion_gated":            "multimodal_fusion",
 }
 
+# CLI ``--model`` 取值 → 内部模型族标签（``_build_model`` / ``_load_state`` /
+# ``_forward`` 认的就是内部标签）。单独留一层映射是因为用户口中的「多模态」在内部叫
+# ``multimodal_fusion``，而 ``contrast`` 对应 ``contrastive``。
+MODEL_FAMILY_ALIASES: dict[str, str] = {
+    "audio":    "audio",
+    "image":    "image",
+    "multi":    "multimodal_fusion",
+    "contrast": "contrastive",
+}
+
+# 内部标签集合：``resolve_model_family_override`` 用它保证幂等（内部标签原样返回），
+# 于是 ``--model`` 的取值与自动识别出的标签可以混用而不报错。
+_MODEL_FAMILY_TAGS: frozenset[str] = frozenset(MODEL_FAMILY_ALIASES.values())
+
+
+def resolve_model_family_override(value: str | None) -> str | None:
+    """把 ``--model`` 的用户取值翻译成内部模型族标签。
+
+    Args:
+        value: CLI 上的模型族取值，``audio`` / ``image`` / ``multi`` / ``contrast``；
+            也接受内部标签（``audio`` / ``image`` / ``multimodal_fusion`` /
+            ``contrastive``）以便重复调用。``None`` 表示未指定。
+
+    Returns:
+        内部模型族标签；``value`` 为 ``None`` 时返回 ``None``，调用方据此退回自动识别。
+
+    Raises:
+        ValueError: ``value`` 既不是 CLI 取值也不是内部标签时抛出。拼错的模型名必须
+            立刻报错，不能静默退回自动识别——那样会拿到一份「看起来正常」的错误结果。
+    """
+    if value is None:
+        return None
+    if value in _MODEL_FAMILY_TAGS:          # 已是内部标签，原样返回
+        return value
+    try:
+        return MODEL_FAMILY_ALIASES[value]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown model family {value!r}; expected one of "
+            f"{sorted(MODEL_FAMILY_ALIASES)} or an internal tag {sorted(_MODEL_FAMILY_TAGS)}."
+        ) from exc
+
 
 # ---------------------------------------------------------------------------
 # YAML / experiment-name discovery
@@ -100,17 +142,41 @@ def discover_experiment_name(checkpoint_path: Path) -> str | None:
     return None   # placeholder; called AFTER config is loaded — see _resolve_model_family
 
 
-def _resolve_model_family(config: dict, checkpoint_path: Path) -> str:
+def _resolve_model_family(
+    config: dict,
+    checkpoint_path: Path,
+    override: str | None = None,
+) -> str:
     """
-    Return the model-family tag ("contrastive" | "wav2vec2" | "image") for a checkpoint.
+    Return the model-family tag ("contrastive" | "audio" | "image" |
+    "multimodal_fusion") for a checkpoint.
 
     Resolution order
     ────────────────
+    0. ``override`` when given (``--model`` on the CLI) — beats everything below
     1. config["experiment_name"]  (or config["experiment"]["name"] / config["name"])
     2. YAML file found in checkpoint_dir or its parent
     3. Run-folder name heuristic (strips trailing _YYYYMMDD_HHMMSS)
     4. Default → "contrastive"
+
+    Args:
+        config: checkpoint 内嵌的 config 字典（``ckpt["config"]``）。
+        checkpoint_path: checkpoint 路径；YAML / 目录名两级兜底都从它推导。
+        override: CLI ``--model`` 指定的模型族，``None`` 表示走下面的启发式判断；
+            取值见 :func:`resolve_model_family_override`（``multi`` 等别名会被翻译）。
+
+    Returns:
+        内部模型族标签，可直接交给 ``_build_model`` / ``_load_state`` / ``_forward``；
+        自动识别全部失败时返回 ``"contrastive"``。
+
+    Note:
+        训练时 ``experiment_name`` 与实际网络结构可能不一致（例如拿图像实验的 config
+        去载对比权重），所以显式 override 的优先级高于一切启发式信息。
     """
+    # 0. 显式指定优先：跳过 config / YAML / 目录名三级推断
+    if override is not None:
+        return resolve_model_family_override(override)
+
     # 1. From checkpoint's embedded config
     experiment_name = (
         config.get("experiment_name")
@@ -444,8 +510,19 @@ def run_inference_all_folds(
     checkpoint_dir: str | Path,
     device: str = "cuda",
     mode: str = "default",
+    model_family: str | None = None,
 ) -> dict[int, tuple[dict, dict]]:
-    """Run run_inference() for every discovered fold checkpoint."""
+    """Run run_inference() for every discovered fold checkpoint.
+
+    Args:
+        checkpoint_dir: 存放 ``best_model_fold_*.pt`` 的目录；没有匹配文件时返回空字典。
+        device: 推理设备字符串（``"cuda"`` / ``"cpu"``）。
+        mode: 测试集模式（``unseen_speaker`` / ``unseen_task`` / ``unseen_both``）。
+        model_family: 可选的模型族覆盖，取值同 ``--model``；``None`` 时逐折自动识别。
+
+    Returns:
+        ``{fold_id: (results, meta)}``，键按 fold 升序（``discover_fold_checkpoints`` 已排序）。
+    """
     checkpoint_dir = Path(checkpoint_dir)
     fold_checkpoints = discover_fold_checkpoints(checkpoint_dir)
 
@@ -455,6 +532,7 @@ def run_inference_all_folds(
             checkpoint_path=checkpoint_path,
             device=device,
             mode=mode,
+            model_family=model_family,
         )
     return results
 
@@ -467,13 +545,23 @@ def run_inference(
     checkpoint_path: str | Path,
     device: str = "cuda",
     mode: str = "default",
+    model_family: str | None = None,
 ) -> tuple[dict, dict]:
     """
-    Load a checkpoint, auto-detect model type from its YAML config, run
-    inference on the held-out test set, and return predictions + metadata.
+    Load a checkpoint, detect its model type, run inference on the held-out
+    test set, and return predictions + metadata.
+
+    Parameters
+    ──────────
+    checkpoint_path : 训练脚本保存的 checkpoint 路径；``ckpt["config"]`` 必须存在。
+    device          : 推理设备；CUDA 不可用时静默退到 CPU。
+    mode            : 测试集模式，决定取哪一份 held-out 数据。
+    model_family    : ``--model`` 指定的模型族覆盖（``audio`` / ``image`` / ``multi`` /
+                      ``contrast``）；``None`` 时走下面的自动识别。
 
     Model-family detection order
     ────────────────────────────
+    0. model_family 参数（``--model`` 覆盖，跳过下面全部启发式）
     1. ckpt["config"]["experiment_name"]  (or ["experiment"]["name"] / ["name"])
     2. YAML file in checkpoint_dir / its parent
     3. Run-folder name heuristic  (strips _YYYYMMDD_HHMMSS suffix)
@@ -508,8 +596,9 @@ def run_inference(
     classification_task = config["data"].get("classification_task") or ""
     active_tasks = _active_tasks(classification_task)
 
-    # ── Detect model family ──────────────────────────────────────────────────
-    model_family = _resolve_model_family(config, checkpoint_path)
+    # ── Resolve model family: ``--model`` override > config/YAML/folder heuristic ──
+    # 参数里是 CLI 别名（或 None），这一步换成内部标签后下面的分支只认内部标签。
+    model_family = _resolve_model_family(config, checkpoint_path, override=model_family)
 
     # ── Build & load model ───────────────────────────────────────────────────
     model = _build_model(config, classification_task, device_obj, model_family)
