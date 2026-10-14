@@ -49,6 +49,8 @@ from src.eval.visualize import (
     plot_fold_loss,
     plot_fold_loss_components,
     plot_all_folds_val_loss,
+    plot_fold_f1,
+    plot_all_folds_f1,
     plot_task_prf1,
     plot_task_confusion,
     plot_task_multilabel_confusion,
@@ -284,6 +286,8 @@ def _run_or_load_inference(
     results_pkl = raw_dir / "results.pkl"
 
     if skip_inference and results_pkl.exists():
+        print(f"[evaluate] Loading cached results from {results_pkl}")
+
         with results_pkl.open("rb") as f:
             cached_results, cached_meta = pickle.load(f)
         cached_family = cached_meta.get("model_family")       # 早于本功能写下的缓存无此键
@@ -445,6 +449,7 @@ def _run_fold_comparison(
     mode: str,
     out_dir: Path,
     skip_inference: bool = False,
+    allowed_folds: set[int] | None = None,
     model_family: Optional[str] = None,
 ) -> None:
     """跑 ``best_model_fold_*.pt`` 的逐折对比评估。
@@ -460,6 +465,8 @@ def _run_fold_comparison(
             ``raw/``（逐折缓存写 ``raw/results_fold{n}.pkl``）。
         skip_inference: True 时优先复用逐折缓存；缺失或与 ``model_family`` 不符的折才重跑。
         model_family: ``--model`` 解析后的内部模型族标签；``None`` 表示自动识别。
+        allowed_folds: 仅比较这些折；None 表示全部已发现折。
+
 
     Side effects:
         创建输出目录、写入逐折 pickle 缓存、逐任务 JSON 与 PNG 图；全部通过 ``print`` 汇报。
@@ -476,8 +483,20 @@ def _run_fold_comparison(
     ensure_dir(raw_dir)
 
     fold_checkpoints = discover_fold_checkpoints(checkpoint_dir)
+    if allowed_folds is not None:
+        fold_checkpoints = {
+            fold_id: path
+            for fold_id, path in fold_checkpoints.items()
+            if fold_id in allowed_folds
+        }
     if not fold_checkpoints:
-        print(f"[evaluate] No best_model_fold_*.pt files found in {checkpoint_dir}; skipping fold comparison.")
+        folds_text = (
+            f" for folds {sorted(allowed_folds)}" if allowed_folds is not None else ""
+        )
+        print(
+            f"[evaluate] No best_model_fold_*.pt files{folds_text} "
+            f"found in {checkpoint_dir}; skipping fold comparison."
+        )        
         return
 
     per_fold: Dict[int, Tuple[Dict[str, Dict[str, np.ndarray]], Dict[str, Any]]] = {}
@@ -508,7 +527,7 @@ def _run_fold_comparison(
         if stale_folds:
             print(f"[evaluate] Running inference for folds: {stale_folds}")
             fresh = run_inference_all_folds(
-                checkpoint_dir, device=device, mode=mode, model_family=model_family
+                checkpoint_dir, device=device, mode=mode, allowed_folds=allowed_folds, model_family=model_family
             )
             for fold_id, value in fresh.items():
                 cache_path = raw_dir / f"results_fold{fold_id}.pkl"
@@ -518,7 +537,7 @@ def _run_fold_comparison(
     else:
         print("[evaluate] Running fold-comparison inference ...")
         per_fold = run_inference_all_folds(
-            checkpoint_dir, device=device, mode=mode, model_family=model_family
+            checkpoint_dir, device=device, mode=mode, allowed_folds=allowed_folds, model_family=model_family
         )
         for fold_id, value in per_fold.items():
             cache_path = raw_dir / f"results_fold{fold_id}.pkl"
@@ -574,14 +593,16 @@ def _generate_loss_plots(log_dir: str, checkpoint_path: str, figures_dir: Path) 
         meta = load_checkpoint_meta(ckpt_path.parent, fold=fold)
         plot_fold_loss(df_fold, fold, meta, figures_dir)
         plot_fold_loss_components(df_fold, fold, figures_dir)
-        print(f"[evaluate] Saved loss plots for fold {fold}")
+        plot_fold_f1(df_fold, fold, figures_dir)
+        print(f"[evaluate] Saved loss/F1 plots for fold {fold}")
 
     if histories:
         best_meta = load_checkpoint_meta(
             ckpt_path.parent, fold=None, best_model_name=ckpt_path.name
         )
         plot_all_folds_val_loss(histories, best_meta, figures_dir)
-        print("[evaluate] Saved all_folds_val_loss.png")
+        plot_all_folds_f1(histories, figures_dir)
+        print("[evaluate] Saved all_folds_val_loss.png / all_folds_f1.png")
 
 
 def _generate_task_plots(
@@ -697,12 +718,22 @@ def _run_eval_for_mode(
     print(f"[evaluate][{mode}] Saved meta → {meta_path}")
 
     if run_fold_comparison:
+        # 只对比本次训练实际跑过的折（data.train_fold），跳过目录中的历史遗留 checkpoint
+        data_cfg = (meta.get("config") or {}).get("data", {})
+        train_fold = data_cfg.get("train_fold")
+        if isinstance(train_fold, int):
+            allowed_folds = {train_fold}
+        elif train_fold:
+            allowed_folds = {int(fold) for fold in train_fold}
+        else:
+            allowed_folds = None
         _run_fold_comparison(
             checkpoint_dir=checkpoint_dir,
             device=device,
             mode=mode,
             out_dir=fold_comparison_dir,
             skip_inference=skip_inference,
+            allowed_folds=allowed_folds,
             model_family=model_family,
         )
 

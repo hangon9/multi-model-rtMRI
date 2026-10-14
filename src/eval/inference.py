@@ -39,6 +39,8 @@ _EXPERIMENT_TO_FAMILY: dict[str, str] = {
     "img_baseline":                       "image",
     "multimodal_fusion_concat":           "multimodal_fusion",
     "multimodal_fusion_gated":            "multimodal_fusion",
+    "multimodal_fusion_cross_attn":       "multimodal_fusion",
+
 }
 
 # CLI ``--model`` 取值 → 内部模型族标签（``_build_model`` / ``_load_state`` /
@@ -511,6 +513,7 @@ def run_inference_all_folds(
     device: str = "cuda",
     mode: str = "default",
     model_family: str | None = None,
+    allowed_folds: set[int] | None = None,
 ) -> dict[int, tuple[dict, dict]]:
     """Run run_inference() for every discovered fold checkpoint.
 
@@ -519,12 +522,19 @@ def run_inference_all_folds(
         device: 推理设备字符串（``"cuda"`` / ``"cpu"``）。
         mode: 测试集模式（``unseen_speaker`` / ``unseen_task`` / ``unseen_both``）。
         model_family: 可选的模型族覆盖，取值同 ``--model``；``None`` 时逐折自动识别。
+        allowed_folds: 仅推理这些折号；None 表示全部折。
 
     Returns:
         ``{fold_id: (results, meta)}``，键按 fold 升序（``discover_fold_checkpoints`` 已排序）。
     """
     checkpoint_dir = Path(checkpoint_dir)
     fold_checkpoints = discover_fold_checkpoints(checkpoint_dir)
+    if allowed_folds is not None:
+        fold_checkpoints = {
+            fold_id: path
+            for fold_id, path in fold_checkpoints.items()
+            if fold_id in allowed_folds
+        }
 
     results: dict[int, tuple[dict, dict]] = {}
     for fold_id, checkpoint_path in fold_checkpoints.items():
@@ -591,7 +601,11 @@ def run_inference(
         device if (torch.cuda.is_available() or device == "cpu") else "cpu"
     )
 
-    ckpt = torch.load(checkpoint_path, map_location=device_obj)
+    ckpt = torch.load(
+        checkpoint_path,
+        map_location=device_obj,
+        weights_only=False,  # checkpoint 内含嵌套 config 等普通对象，显式关闭 weights_only
+    )
     config = ckpt["config"]
     classification_task = config["data"].get("classification_task") or ""
     active_tasks = _active_tasks(classification_task)
