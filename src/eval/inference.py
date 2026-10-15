@@ -30,6 +30,8 @@ TASKS: tuple[str, ...] = ("manner", "place", "voicing", "vowel_backness")
 # Maps experiment_name values → model family tag
 _EXPERIMENT_TO_FAMILY: dict[str, str] = {
     "contrast_contrastive":               "contrastive",
+    "contrast_post_temporal":             "contrastive",
+    "contrast_pre_temporal":              "contrastive",
     "wav2vec2-base-960h_baseline":        "audio",
     "wav2vec2-xlsr-53-espeak-cv-ft_baseline": "audio",
     "hubert_baseline":                    "audio",   # same forward interface
@@ -37,7 +39,51 @@ _EXPERIMENT_TO_FAMILY: dict[str, str] = {
     "img_baseline":                       "image",
     "multimodal_fusion_concat":           "multimodal_fusion",
     "multimodal_fusion_gated":            "multimodal_fusion",
+    "multimodal_fusion_cross_attn":       "multimodal_fusion",
+
 }
+
+# CLI ``--model`` 取值 → 内部模型族标签（``_build_model`` / ``_load_state`` /
+# ``_forward`` 认的就是内部标签）。单独留一层映射是因为用户口中的「多模态」在内部叫
+# ``multimodal_fusion``，而 ``contrast`` 对应 ``contrastive``。
+MODEL_FAMILY_ALIASES: dict[str, str] = {
+    "audio":    "audio",
+    "image":    "image",
+    "multi":    "multimodal_fusion",
+    "contrast": "contrastive",
+}
+
+# 内部标签集合：``resolve_model_family_override`` 用它保证幂等（内部标签原样返回），
+# 于是 ``--model`` 的取值与自动识别出的标签可以混用而不报错。
+_MODEL_FAMILY_TAGS: frozenset[str] = frozenset(MODEL_FAMILY_ALIASES.values())
+
+
+def resolve_model_family_override(value: str | None) -> str | None:
+    """把 ``--model`` 的用户取值翻译成内部模型族标签。
+
+    Args:
+        value: CLI 上的模型族取值，``audio`` / ``image`` / ``multi`` / ``contrast``；
+            也接受内部标签（``audio`` / ``image`` / ``multimodal_fusion`` /
+            ``contrastive``）以便重复调用。``None`` 表示未指定。
+
+    Returns:
+        内部模型族标签；``value`` 为 ``None`` 时返回 ``None``，调用方据此退回自动识别。
+
+    Raises:
+        ValueError: ``value`` 既不是 CLI 取值也不是内部标签时抛出。拼错的模型名必须
+            立刻报错，不能静默退回自动识别——那样会拿到一份「看起来正常」的错误结果。
+    """
+    if value is None:
+        return None
+    if value in _MODEL_FAMILY_TAGS:          # 已是内部标签，原样返回
+        return value
+    try:
+        return MODEL_FAMILY_ALIASES[value]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unknown model family {value!r}; expected one of "
+            f"{sorted(MODEL_FAMILY_ALIASES)} or an internal tag {sorted(_MODEL_FAMILY_TAGS)}."
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -98,17 +144,41 @@ def discover_experiment_name(checkpoint_path: Path) -> str | None:
     return None   # placeholder; called AFTER config is loaded — see _resolve_model_family
 
 
-def _resolve_model_family(config: dict, checkpoint_path: Path) -> str:
+def _resolve_model_family(
+    config: dict,
+    checkpoint_path: Path,
+    override: str | None = None,
+) -> str:
     """
-    Return the model-family tag ("contrastive" | "wav2vec2" | "image") for a checkpoint.
+    Return the model-family tag ("contrastive" | "audio" | "image" |
+    "multimodal_fusion") for a checkpoint.
 
     Resolution order
     ────────────────
+    0. ``override`` when given (``--model`` on the CLI) — beats everything below
     1. config["experiment_name"]  (or config["experiment"]["name"] / config["name"])
     2. YAML file found in checkpoint_dir or its parent
     3. Run-folder name heuristic (strips trailing _YYYYMMDD_HHMMSS)
     4. Default → "contrastive"
+
+    Args:
+        config: checkpoint 内嵌的 config 字典（``ckpt["config"]``）。
+        checkpoint_path: checkpoint 路径；YAML / 目录名两级兜底都从它推导。
+        override: CLI ``--model`` 指定的模型族，``None`` 表示走下面的启发式判断；
+            取值见 :func:`resolve_model_family_override`（``multi`` 等别名会被翻译）。
+
+    Returns:
+        内部模型族标签，可直接交给 ``_build_model`` / ``_load_state`` / ``_forward``；
+        自动识别全部失败时返回 ``"contrastive"``。
+
+    Note:
+        训练时 ``experiment_name`` 与实际网络结构可能不一致（例如拿图像实验的 config
+        去载对比权重），所以显式 override 的优先级高于一切启发式信息。
     """
+    # 0. 显式指定优先：跳过 config / YAML / 目录名三级推断
+    if override is not None:
+        return resolve_model_family_override(override)
+
     # 1. From checkpoint's embedded config
     experiment_name = (
         config.get("experiment_name")
@@ -184,23 +254,17 @@ def _build_contrastive_model(
     classification_task: str,
     device: torch.device,
 ) -> AudioVisionContrastiveModel:
-    projection_cfg = config["model"].get("projection", {})
-    loss_cfg       = config.get("loss", {})
+    """构建对比模型的推理副本：只含图像分支与分类头。
 
-    contrast_loss_name = loss_cfg.get("contrast_loss", None)
-    use_contrast = (
-        contrast_loss_name is not None
-        and str(contrast_loss_name).lower() not in ("none", "null")
-    )
-
+    对比模型把音频分支当训练期教师，权重里不带 ``audio_branch.*`` /
+    ``contrast.*``（冻结教师不入档、投影头推理无用），因此这里以 ``inference_only=True``
+    构建，推理既不需要音频 checkpoint，也不需要下载 wav2vec2。
+    """
     return AudioVisionContrastiveModel(
         num_classes=NUM_CLASSES[classification_task],
-        visual_tokens=projection_cfg.get("visual_tokens", 65),
-        target_tokens=projection_cfg.get("target_tokens", 31),
-        hidden_size=projection_cfg.get("hidden_size", 768),
-        lambda_cosine=loss_cfg.get("lambda", 0.1),
+        model_cfg=config.get("model", {}),
         classification_task=classification_task,
-        use_contrast=use_contrast,
+        inference_only=True,
     ).to(device)
 
 
@@ -292,6 +356,46 @@ def _build_model(
     if model_family == "multimodal_fusion":
         return _build_multimodal_model(config, classification_task, device)
     raise ValueError(f"Unknown model_family: {model_family!r}")
+
+
+def _load_state(model: nn.Module, state_dict: dict, model_family: str) -> None:
+    """把 checkpoint 权重载入模型。
+
+    Args:
+        model: 已构建的模型实例。
+        state_dict: ``ckpt["model_state_dict"]``。
+        model_family: 模型族标签；``"contrastive"`` 走宽松加载，其余严格加载。
+
+    Raises:
+        RuntimeError: 模型需要的参数在 checkpoint 里找不到时抛出。
+
+    Note:
+        对比模型训练时含音频教师与投影头，推理副本不含它们，所以两侧键集合天然不同：
+        多出来的键（``audio_branch.*`` / ``contrast.*``）丢弃并打印条数，缺少的键仍然报错
+        ——缺键意味着模型结构或 image_encoder 配置与训练时不一致，静默忽略会得到随机权重。
+    """
+    if model_family != "contrastive":
+        model.load_state_dict(state_dict)
+        return
+
+    model_keys = set(model.state_dict().keys())
+    matched = {key: value for key, value in state_dict.items() if key in model_keys}
+
+    missing = sorted(model_keys - set(matched))
+    if missing:
+        preview = ", ".join(missing[:5])
+        raise RuntimeError(
+            f"contrastive checkpoint 缺少模型需要的 {len(missing)} 个参数，例如 {preview}。"
+            "请确认 config 的 model.image_encoder / image_temporal 与训练时一致。"
+        )
+
+    extra = sorted(set(state_dict.keys()) - model_keys)
+    if extra:
+        print(
+            f"[inference] 丢弃推理不需要的 {len(extra)} 个参数（如 {', '.join(extra[:3])}）"
+        )
+
+    model.load_state_dict(matched, strict=True)
 
 
 # ---------------------------------------------------------------------------
@@ -408,10 +512,29 @@ def run_inference_all_folds(
     checkpoint_dir: str | Path,
     device: str = "cuda",
     mode: str = "default",
+    model_family: str | None = None,
+    allowed_folds: set[int] | None = None,
 ) -> dict[int, tuple[dict, dict]]:
-    """Run run_inference() for every discovered fold checkpoint."""
+    """Run run_inference() for every discovered fold checkpoint.
+
+    Args:
+        checkpoint_dir: 存放 ``best_model_fold_*.pt`` 的目录；没有匹配文件时返回空字典。
+        device: 推理设备字符串（``"cuda"`` / ``"cpu"``）。
+        mode: 测试集模式（``unseen_speaker`` / ``unseen_task`` / ``unseen_both``）。
+        model_family: 可选的模型族覆盖，取值同 ``--model``；``None`` 时逐折自动识别。
+        allowed_folds: 仅推理这些折号；None 表示全部折。
+
+    Returns:
+        ``{fold_id: (results, meta)}``，键按 fold 升序（``discover_fold_checkpoints`` 已排序）。
+    """
     checkpoint_dir = Path(checkpoint_dir)
     fold_checkpoints = discover_fold_checkpoints(checkpoint_dir)
+    if allowed_folds is not None:
+        fold_checkpoints = {
+            fold_id: path
+            for fold_id, path in fold_checkpoints.items()
+            if fold_id in allowed_folds
+        }
 
     results: dict[int, tuple[dict, dict]] = {}
     for fold_id, checkpoint_path in fold_checkpoints.items():
@@ -419,6 +542,7 @@ def run_inference_all_folds(
             checkpoint_path=checkpoint_path,
             device=device,
             mode=mode,
+            model_family=model_family,
         )
     return results
 
@@ -431,13 +555,23 @@ def run_inference(
     checkpoint_path: str | Path,
     device: str = "cuda",
     mode: str = "default",
+    model_family: str | None = None,
 ) -> tuple[dict, dict]:
     """
-    Load a checkpoint, auto-detect model type from its YAML config, run
-    inference on the held-out test set, and return predictions + metadata.
+    Load a checkpoint, detect its model type, run inference on the held-out
+    test set, and return predictions + metadata.
+
+    Parameters
+    ──────────
+    checkpoint_path : 训练脚本保存的 checkpoint 路径；``ckpt["config"]`` 必须存在。
+    device          : 推理设备；CUDA 不可用时静默退到 CPU。
+    mode            : 测试集模式，决定取哪一份 held-out 数据。
+    model_family    : ``--model`` 指定的模型族覆盖（``audio`` / ``image`` / ``multi`` /
+                      ``contrast``）；``None`` 时走下面的自动识别。
 
     Model-family detection order
     ────────────────────────────
+    0. model_family 参数（``--model`` 覆盖，跳过下面全部启发式）
     1. ckpt["config"]["experiment_name"]  (or ["experiment"]["name"] / ["name"])
     2. YAML file in checkpoint_dir / its parent
     3. Run-folder name heuristic  (strips _YYYYMMDD_HHMMSS suffix)
@@ -455,23 +589,34 @@ def run_inference(
     results : dict[task, {"preds": ndarray, "labels": ndarray}]
     meta    : {fold, epoch, best_val_loss, classification_task, config,
                model_family, experiment_name}
+
+    Note
+    ────
+    Contrastive checkpoints carry audio-teacher and projection weights that the
+    image-only inference copy does not build, so they are loaded leniently (extra
+    keys dropped, missing keys still fatal) — see :func:`_load_state`.
     """
     checkpoint_path = Path(checkpoint_path)
     device_obj = torch.device(
         device if (torch.cuda.is_available() or device == "cpu") else "cpu"
     )
 
-    ckpt = torch.load(checkpoint_path, map_location=device_obj)
+    ckpt = torch.load(
+        checkpoint_path,
+        map_location=device_obj,
+        weights_only=False,  # checkpoint 内含嵌套 config 等普通对象，显式关闭 weights_only
+    )
     config = ckpt["config"]
     classification_task = config["data"].get("classification_task") or ""
     active_tasks = _active_tasks(classification_task)
 
-    # ── Detect model family ──────────────────────────────────────────────────
-    model_family = _resolve_model_family(config, checkpoint_path)
+    # ── Resolve model family: ``--model`` override > config/YAML/folder heuristic ──
+    # 参数里是 CLI 别名（或 None），这一步换成内部标签后下面的分支只认内部标签。
+    model_family = _resolve_model_family(config, checkpoint_path, override=model_family)
 
     # ── Build & load model ───────────────────────────────────────────────────
     model = _build_model(config, classification_task, device_obj, model_family)
-    model.load_state_dict(ckpt["model_state_dict"])
+    _load_state(model, ckpt["model_state_dict"], model_family)
     model.eval()
 
     # ── Test data ────────────────────────────────────────────────────────────

@@ -107,10 +107,21 @@ def create_dataloader(
     config: dict,
     train=True,
 ):
+    """按配置构建 USC-annot-16 的 DataLoader。
 
-    '''
-    Create train and validation dataloaders.
-    '''
+    Args:
+        dataframe: 该划分的帧级 DataFrame（训练折 / 验证折 / 测试集）。
+        config: 完整配置；窗长、采样率、fps 取自 ``data``，batch_size / num_workers /
+            data_augment / drop_last 取自 ``train``，图像尺寸取自 ``model.image_encoder``。
+        train: True 构建训练集（打乱 + 应用 data_augment），False 构建验证/测试集。
+
+    Returns:
+        ``torch.utils.data.DataLoader``，逐 batch 产出 ``image`` / ``audio`` / ``labels``。
+
+    Note:
+        ``train.data_augment`` 同时兼容旧的布尔写法（True 等价于开 RandomAffine 加时间平移）
+        与新的字典写法；``drop_last`` 仅在 train 上生效，供需要 batch 内负样本的对比学习使用。
+    """
     cfg_data = config["data"]
     cfg_img = config["model"]["image_encoder"]
     cfg_train = config["train"]
@@ -157,6 +168,9 @@ def create_dataloader(
         shuffle=train,
         num_workers=num_workers,
         pin_memory=True,
+        # 对比损失（InfoNCE）的负样本全部来自 batch 内，只对训练集开放丢弃最后一个不满批，
+        # 默认 False 以保持既有三个 pipeline 的 batch 组成不变
+        drop_last=bool(cfg_train.get("drop_last", False)) if train else False,
     )
 
     return loader

@@ -7,7 +7,10 @@ Usage:
     # Explicit log directory
     python -m src.eval.evaluate --checkpoint checkpoints/best_model.pt \\
         --log-dir logs/wav_baseline_20260627_081322 --output-dir eval_output
-
+    # Pin the model family instead of relying on checkpoint auto-detection
+    python -m src.eval.evaluate --checkpoint checkpoints/best_model.pt \
+        --model image --log-dir logs/img_baseline_20260728_160114 \
+        --output-dir eval_output
     # Auto-discover the most-recent run in a parent directory
     python -m src.eval.evaluate --checkpoint checkpoints/best_model.pt \\
         --runs-dir logs/ --run-prefix wav_baseline --output-dir eval_output
@@ -38,7 +41,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from sklearn.metrics import confusion_matrix, multilabel_confusion_matrix
 
-from src.eval.inference import TASKS, run_inference
+from src.eval.inference import MODEL_FAMILY_ALIASES, TASKS, resolve_model_family_override, run_inference
 from src.eval.metrics import compute_metrics
 from src.eval.parse_logs import parse_training_log
 from src.eval.visualize import (
@@ -46,6 +49,8 @@ from src.eval.visualize import (
     plot_fold_loss,
     plot_fold_loss_components,
     plot_all_folds_val_loss,
+    plot_fold_f1,
+    plot_all_folds_f1,
     plot_task_prf1,
     plot_task_confusion,
     plot_task_multilabel_confusion,
@@ -196,6 +201,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Inference device (default: 'cuda' if available else 'cpu')",
     )
     parser.add_argument(
+        "--model",
+        type=str,
+        default=None,
+        choices=sorted(MODEL_FAMILY_ALIASES),
+        help=(
+            "Model family to evaluate, bypassing checkpoint auto-detection "
+            "(which otherwise infers it from the checkpoint config, a nearby "
+            "YAML file, or the run-folder name). 'multi' selects the "
+            "multimodal-fusion model. Omit to keep auto-detection."
+        ),
+    )
+    parser.add_argument(
         "--eval-mode",
         type=str,
         default="default",
@@ -244,20 +261,50 @@ def _run_or_load_inference(
     mode: str,
     skip_inference: bool,
     raw_dir: Path,
+    model_family: Optional[str] = None,
 ) -> Tuple[Dict[str, Dict[str, np.ndarray]], Dict[str, Any]]:
-    """Run inference (or load cached results), return (results, meta)."""
+    """跑推理（或读缓存），返回 ``(results, meta)``。
+
+    Args:
+        checkpoint_path: checkpoint 路径，透传给 ``run_inference``。
+        device: 推理设备字符串。
+        mode: 测试集模式，见 ``run_inference``。
+        skip_inference: True 时优先复用 ``raw/results.pkl``，不存在或不一致才重跑。
+        raw_dir: 缓存 pickle 的所在目录（不存在时自动创建）。
+        model_family: ``--model`` 解析后的内部模型族标签，见 ``_run_eval_for_mode``；
+            ``None`` 表示自动识别（此时无条件信任缓存）。
+
+    Returns:
+        ``results``：``{task: {"preds": ndarray, "labels": ndarray}}``；
+        ``meta``：checkpoint 元信息 + ``model_family`` 等推理期字段。
+
+    Note:
+        缓存里存了上次推理实际用的 ``model_family``。显式给了 ``--model`` 且与缓存
+        不一致时缓存作废（日志会说明原因），否则会把旧模型的结果当成新模型的指标，
+        且从输出上完全看不出来。
+    """
     results_pkl = raw_dir / "results.pkl"
 
     if skip_inference and results_pkl.exists():
         print(f"[evaluate] Loading cached results from {results_pkl}")
+
         with results_pkl.open("rb") as f:
-            return pickle.load(f)
+            cached_results, cached_meta = pickle.load(f)
+        cached_family = cached_meta.get("model_family")       # 早于本功能写下的缓存无此键
+        if model_family is None or cached_family == model_family:
+            print(f"[evaluate] Loading cached results from {results_pkl}")
+            return cached_results, cached_meta
+        print(
+            f"[evaluate] Cached results are model_family={cached_family!r} but "
+            f"--model requested {model_family!r}; re-running inference."
+        )
 
     print("[evaluate] Running inference ...")
     results, meta = run_inference(
         checkpoint_path=checkpoint_path,
         device=device,
         mode=mode,
+        model_family=model_family,
     )
 
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -402,7 +449,28 @@ def _run_fold_comparison(
     mode: str,
     out_dir: Path,
     skip_inference: bool = False,
+    allowed_folds: set[int] | None = None,
+    model_family: Optional[str] = None,
 ) -> None:
+    """跑 ``best_model_fold_*.pt`` 的逐折对比评估。
+
+    与单份 ``best_model.pt`` 评估路径刻意保持分离（见仓库记忆）：这里只产出折间汇总的
+    PRF1 图与 ``*_fold_comparison.json``，不写混淆矩阵/逐头指标。
+
+    Args:
+        checkpoint_dir: 存放 ``best_model_fold_*.pt`` 的目录；无匹配文件时直接返回。
+        device: 推理设备字符串。
+        mode: 测试集模式。
+        out_dir: 本次 fold 对比的输出根目录，内部再分子目录 ``figures/``、``metrics/``、
+            ``raw/``（逐折缓存写 ``raw/results_fold{n}.pkl``）。
+        skip_inference: True 时优先复用逐折缓存；缺失或与 ``model_family`` 不符的折才重跑。
+        model_family: ``--model`` 解析后的内部模型族标签；``None`` 表示自动识别。
+        allowed_folds: 仅比较这些折；None 表示全部已发现折。
+
+
+    Side effects:
+        创建输出目录、写入逐折 pickle 缓存、逐任务 JSON 与 PNG 图；全部通过 ``print`` 汇报。
+    """
     from src.eval.inference import discover_fold_checkpoints, run_inference_all_folds
 
     checkpoint_dir = Path(checkpoint_dir)
@@ -415,25 +483,52 @@ def _run_fold_comparison(
     ensure_dir(raw_dir)
 
     fold_checkpoints = discover_fold_checkpoints(checkpoint_dir)
+    if allowed_folds is not None:
+        fold_checkpoints = {
+            fold_id: path
+            for fold_id, path in fold_checkpoints.items()
+            if fold_id in allowed_folds
+        }
     if not fold_checkpoints:
-        print(f"[evaluate] No best_model_fold_*.pt files found in {checkpoint_dir}; skipping fold comparison.")
+        folds_text = (
+            f" for folds {sorted(allowed_folds)}" if allowed_folds is not None else ""
+        )
+        print(
+            f"[evaluate] No best_model_fold_*.pt files{folds_text} "
+            f"found in {checkpoint_dir}; skipping fold comparison."
+        )        
         return
 
     per_fold: Dict[int, Tuple[Dict[str, Dict[str, np.ndarray]], Dict[str, Any]]] = {}
     if skip_inference:
-        missing_folds: list[int] = []
+        stale_folds: list[int] = []
         for fold_id in fold_checkpoints:
             cache_path = raw_dir / f"results_fold{fold_id}.pkl"
-            if cache_path.exists():
-                print(f"[evaluate] Loading cached fold results from {cache_path}")
-                with cache_path.open("rb") as f:
-                    per_fold[fold_id] = pickle.load(f)
-            else:
-                missing_folds.append(fold_id)
+            if not cache_path.exists():
+                stale_folds.append(fold_id)
+                continue
 
-        if missing_folds:
-            print(f"[evaluate] Running inference for missing folds: {missing_folds}")
-            fresh = run_inference_all_folds(checkpoint_dir, device=device, mode=mode)
+            with cache_path.open("rb") as f:
+                cached = pickle.load(f)
+
+            # 缓存是 (results, meta) 二元组；meta 里记录着该折实际用的模型族。
+            cached_family = cached[1].get("model_family")
+            if model_family is not None and cached_family != model_family:
+                print(
+                    f"[evaluate] Fold {fold_id} cache is model_family={cached_family!r} but "
+                    f"--model requested {model_family!r}; re-running this fold."
+                )
+                stale_folds.append(fold_id)
+                continue
+
+            print(f"[evaluate] Loading cached fold results from {cache_path}")
+            per_fold[fold_id] = cached
+
+        if stale_folds:
+            print(f"[evaluate] Running inference for folds: {stale_folds}")
+            fresh = run_inference_all_folds(
+                checkpoint_dir, device=device, mode=mode, allowed_folds=allowed_folds, model_family=model_family
+            )
             for fold_id, value in fresh.items():
                 cache_path = raw_dir / f"results_fold{fold_id}.pkl"
                 with cache_path.open("wb") as f:
@@ -441,7 +536,9 @@ def _run_fold_comparison(
                 per_fold[fold_id] = value
     else:
         print("[evaluate] Running fold-comparison inference ...")
-        per_fold = run_inference_all_folds(checkpoint_dir, device=device, mode=mode)
+        per_fold = run_inference_all_folds(
+            checkpoint_dir, device=device, mode=mode, allowed_folds=allowed_folds, model_family=model_family
+        )
         for fold_id, value in per_fold.items():
             cache_path = raw_dir / f"results_fold{fold_id}.pkl"
             with cache_path.open("wb") as f:
@@ -496,14 +593,16 @@ def _generate_loss_plots(log_dir: str, checkpoint_path: str, figures_dir: Path) 
         meta = load_checkpoint_meta(ckpt_path.parent, fold=fold)
         plot_fold_loss(df_fold, fold, meta, figures_dir)
         plot_fold_loss_components(df_fold, fold, figures_dir)
-        print(f"[evaluate] Saved loss plots for fold {fold}")
+        plot_fold_f1(df_fold, fold, figures_dir)
+        print(f"[evaluate] Saved loss/F1 plots for fold {fold}")
 
     if histories:
         best_meta = load_checkpoint_meta(
             ckpt_path.parent, fold=None, best_model_name=ckpt_path.name
         )
         plot_all_folds_val_loss(histories, best_meta, figures_dir)
-        print("[evaluate] Saved all_folds_val_loss.png")
+        plot_all_folds_f1(histories, figures_dir)
+        print("[evaluate] Saved all_folds_val_loss.png / all_folds_f1.png")
 
 
 def _generate_task_plots(
@@ -550,8 +649,25 @@ def _run_eval_for_mode(
     skip_inference: bool,
     run_fold_comparison: bool,
     checkpoint_dir: Path,
+    model_family: Optional[str] = None,
 ) -> None:
-    """跑一次 inference + per-task 图/metrics + meta,全部写入 eval_root 下。"""
+    """跑一次 inference + per-task 图/metrics + meta，全部写入 eval_root 下。
+
+    Args:
+        mode: 测试集模式（``unseen_speaker`` / ``unseen_task`` / ``unseen_both``），
+            也作为子目录名与 meta 里的标记。
+        eval_root: 本模式的输出根目录（内部分 ``figures/``/``raw/``/``metrics/``
+            /``fold_comparison/``）。
+        checkpoint_path: checkpoint 路径。
+        device: 推理设备字符串。
+        skip_inference: True 时优先复用 ``raw/results.pkl``。
+        run_fold_comparison: 是否额外跑逐折对比评估（写入 ``fold_comparison/``）。
+        checkpoint_dir: checkpoint 所在目录，逐折发现时用。
+        model_family: ``--model`` 解析后的内部模型族标签；``None`` 表示自动识别。
+
+    Side effects:
+        创建目录、写图/JSON/pickle 缓存；均通过 ``print`` 汇报。
+    """
     figures_dir = eval_root / "figures"
     raw_dir     = eval_root / "raw"
     metrics_dir = eval_root / "metrics"
@@ -566,6 +682,7 @@ def _run_eval_for_mode(
         mode=mode,
         skip_inference=skip_inference,
         raw_dir=raw_dir,
+        model_family=model_family,
     )
 
     active_tasks = _active_tasks_from_meta(meta)
@@ -601,12 +718,23 @@ def _run_eval_for_mode(
     print(f"[evaluate][{mode}] Saved meta → {meta_path}")
 
     if run_fold_comparison:
+        # 只对比本次训练实际跑过的折（data.train_fold），跳过目录中的历史遗留 checkpoint
+        data_cfg = (meta.get("config") or {}).get("data", {})
+        train_fold = data_cfg.get("train_fold")
+        if isinstance(train_fold, int):
+            allowed_folds = {train_fold}
+        elif train_fold:
+            allowed_folds = {int(fold) for fold in train_fold}
+        else:
+            allowed_folds = None
         _run_fold_comparison(
             checkpoint_dir=checkpoint_dir,
             device=device,
             mode=mode,
             out_dir=fold_comparison_dir,
             skip_inference=skip_inference,
+            allowed_folds=allowed_folds,
+            model_family=model_family,
         )
 
 # ---------------------------------------------------------------------------
@@ -664,6 +792,12 @@ def main() -> None:
     device = _resolve_device(args.device)
     checkpoint_dir = Path(args.checkpoint).resolve().parent
 
+    # 在入口处就把 --model 的别名翻译成内部标签（``multi`` → ``multimodal_fusion``），
+    # 下游的缓存校验拿 meta["model_family"] 直接比字符串即可。
+    model_family = resolve_model_family_override(args.model)
+    if model_family is not None:
+        print(f"[evaluate] Model family pinned via --model: {model_family}")
+
     for mode in ("unseen_speaker", "unseen_task", "unseen_both"):
         print(f"[evaluate] === Running eval_mode={mode} ===")
         _run_eval_for_mode(
@@ -674,6 +808,7 @@ def main() -> None:
             skip_inference=args.skip_inference,
             run_fold_comparison=args.eval_folds,
             checkpoint_dir=checkpoint_dir,
+            model_family=model_family,
         )
 
     print("[evaluate] Done.")
