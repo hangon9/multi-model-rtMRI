@@ -39,6 +39,10 @@ def main():
 
     with (REPO_ROOT / "configs" / "contrast_post_temporal.yaml").open("r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
+    # 强行打开对比分量：本脚本的断言都针对对比路径，而 yaml 里的 enabled 会随实验矩阵切换
+    config["model"]["contrast"]["enabled"] = True
+    config["loss"]["contrast_loss_name"] = "info_nce"
+    config["loss"]["contrast_loss_kwargs"] = {"temperature": 0.07, "mask_same_label": True}
     config["data"]["train_fold"] = [1]
     config["train"]["epochs"] = 1
     config["train"]["batch_size"] = 8
@@ -140,10 +144,10 @@ def main():
     log_text = (run_dir / "training.log").read_text(encoding="utf-8", errors="replace")
     check("日志记录教师路径", "audio_only_best_model.pt" in log_text)
     check("日志记录冻结模式", "freeze=all" in log_text)
-    check("日志提示跨折泄漏风险", "不含 {fold}" in log_text)
+    check("日志记录教师路径解析来源", "path_source=given" in log_text)
+    check("日志提示未找到同折存档", "不含折号" in log_text and "best_model_fold_" in log_text)
     check("日志记录对比位置与择优指标", "Contrast position: post_temporal" in log_text
           and "Checkpoint select metric: cls_loss" in log_text)
-
     print(f"\n{'=' * 60}")
     print(f"共 {len(FAILURES)} 项失败" if FAILURES else "全部通过")
     for name in FAILURES:

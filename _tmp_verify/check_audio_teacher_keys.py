@@ -56,6 +56,8 @@ _KEY_SECTIONS = {
 }
 # 单音频实验自带、教师不需要的下游前缀
 _BASELINE_ONLY_PREFIX = "classifier."
+# 诊断默认按哪一折解析「教师路径 → 具体存档」：用于演示自动搜索的行为
+_DIAGNOSTIC_FOLD = 1
 
 
 def _section_of(key: str) -> str:
@@ -400,8 +402,13 @@ def _resolve_paths(args, config: dict) -> list[Path]:
     if not paths:
         template = ((config.get("model") or {}).get("audio_branch") or {}).get("checkpoint")
         if template:
-            # {fold} 占位符在诊断阶段固定用 1，方便直接看到某一份存档的差异
-            paths.append(Path(str(template).replace("{fold}", "1")))
+            # 用运行时同一套解析逻辑（而非简单替换 {fold}），这样报告的就是实际会被加载的那份：
+            # 有同折存档就取它，否则回退同目录的 best_model.pt
+            from src.models.contrastive_model import _resolve_teacher_checkpoint
+
+            resolved, source = _resolve_teacher_checkpoint(str(template), _DIAGNOSTIC_FOLD, None)
+            print(f"config 指定的教师路径 {template!r} 解析为 {resolved!r}（source={source}）")
+            paths.append(Path(resolved))
         paths.append(REPO_ROOT / "hpc" / "audio_only_best_model.pt")
 
     unique: list[Path] = []

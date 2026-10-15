@@ -8,15 +8,20 @@
     audio [B,L] → ContrastAudioTeacher → pooled_audio [B,D_a]
     contrast.visual_proj(pooled_img) → [B,d] ，contrast.audio_proj(pooled_audio) → [B,d] → 对比损失
 
+``contrast.position: pre_temporal`` 把对比损失移到时序聚合之前：视觉用逐帧的 ``img_seq``，
+音频用 ``audio_seq`` 沿时间维池化到同样帧数，两侧都是 ``[B,T,d]``（分类路径不变）。
+
 推理只使用图像主干：``inference_only=True`` 时不构建音频教师与投影头，因此既不需要音频
 checkpoint，也不需要下载 HF 权重。
 
 音频教师的两种来源：
 
 1. 给了 ``model.audio_branch.checkpoint``（单音频实验 ``train_wav_baseline.py`` 的存档）：
-   结构读 ``ckpt["config"]["model"]``，权重去掉 ``classifier.*`` 后严格加载。每折应加载
-   **同折**的存档：路径不含 ``{fold}`` 时所有折共用同一个教师，而那个教师见过本折的验证
-   subject，指标会被泄漏污染（会打警告）。
+   结构读 ``ckpt["config"]["model"]``，权重去掉 ``classifier.*`` 后严格加载。路径可以是
+   目录、也可以是 ``best_model.pt`` 一类的文件；**每折优先自动取同折的**
+   ``best_model_fold_{fold}.pt``，找不到时回退到同目录的全局最优 ``best_model.pt``
+   （或给定的那份自定义命名存档）并打警告——回退意味着该教师可能见过本折的验证 subject。
+   路径里显式写 ``{fold}`` 占位符时按占位符取，不做自动搜索。
 2. 未给路径：结构取自本实验 yaml，骨干用 HF 预训练权重初始化。此时时序编码器与池化是随机
    初始化的，冻结后相当于「预训练声学特征 → 固定随机投影」这一对齐目标，只适合作为对照或
    冒烟训练，正式实验仍应使用单音频实验训练出的教师。
@@ -28,6 +33,7 @@ checkpoint，也不需要下载 HF 权重。
 """
 
 import contextlib
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -101,6 +107,17 @@ _AUDIO_SD_PREFIXES = ("backbone.", "norm.", "encoder.", "norm2.", "pooling.", "c
 _AUDIO_TEACHER_IGNORED_PREFIXES = ("classifier.",)
 _FREEZE_MODES = ("all", "backbone", "none")
 _CONTRAST_POSITIONS = ("post_temporal", "pre_temporal")
+
+# 教师存档的命名规范（与各 train_*.py 的保存逻辑一致）：
+#   每折最佳 = best_model_fold_{fold}.pt，全局最佳 = best_model.pt
+_FOLD_CHECKPOINT_TEMPLATE = "best_model_fold_{fold}.pt"
+_GLOBAL_CHECKPOINT_NAME = "best_model.pt"
+
+# 教师路径的解析来源，写进日志与 audio_teacher_meta，便于事后确认每折用了哪份存档
+_TEACHER_SOURCE_PLACEHOLDER = "placeholder"  # 路径里显式写了 {fold}，按占位符替换
+_TEACHER_SOURCE_FOLD_FILE = "fold_file"      # 自动搜到同折的 best_model_fold_{fold}.pt
+_TEACHER_SOURCE_GLOBAL_BEST = "global_best"  # 回退到同目录的全局最优 best_model.pt
+_TEACHER_SOURCE_GIVEN = "given"              # 回退到给定的那份自定义命名存档
 
 # 日志与报错里列出的键名上限，避免一次刷出几百行
 _KEY_PREVIEW_LIMIT = 5
@@ -232,7 +249,8 @@ class ContrastAudioTeacher(nn.Module):
 
     层序与 ``AudioMultiHeadClassifier``（单音频基线）一致，因此单音频实验的 checkpoint
     去掉 ``classifier.*`` 后可以严格加载进来（键为 ``backbone.* / norm.* / encoder.* /
-    norm2.* / pooling.*``）。池化只使用 pooled 结果，注意力权重丢弃——对比损失不需要它。
+    norm2.* / pooling.*``，其中 conformer 模式共 302 个键）。池化只使用 pooled 结果，
+    注意力权重丢弃——对比损失不需要它。
 
     Args:
         backbone_cfg: 骨干配置，读取 model_name / freeze_feature_extractor /
@@ -626,28 +644,80 @@ def _select_audio_branch_state(
     return selected
 
 
-def _format_teacher_path(template: str, fold_id: int | None) -> tuple[str, bool]:
-    """把教师路径模板里的 ``{fold}`` 替换成当前折号。
+def _resolve_teacher_checkpoint(
+    template: str,
+    fold_id: int | None,
+    logger=None,
+) -> tuple[str, str]:
+    """解析音频教师存档路径：优先同折的 ``best_model_fold_{fold}.pt``，其次全局最优。
+
+    解析顺序（``template`` 指 config 里的 ``model.audio_branch.checkpoint``）：
+
+    1. ``template`` 含 ``{fold}`` 占位符 → 直接替换成当前折号，不做搜索（调用方明确指定了
+       每折一份存档的命名方式）。
+    2. 在 ``template`` 所在目录里找 ``best_model_fold_{fold}.pt``：命中就用它。目录的判定是
+       「``template`` 是目录就用它本身，否则用它的父目录」——因此无论配置写目录还是写
+       ``.../best_model.pt``，都会自动选中本折的存档。
+    3. 该折的存档不存在时回退到同目录的 ``best_model.pt``（全局最优），并打警告。
+    4. 连 ``best_model.pt`` 也没有时，回退到 ``template`` 本身（自定义命名的单份存档，例如
+       ``hpc/audio_only_best_model.pt``），同样打警告。
 
     Args:
-        template: config 里的路径，可含 ``{fold}`` 占位符。
-        fold_id: 当前折号（1 基）；模板含占位符但 fold_id 为 None 时抛错。
+        template: config 里的教师路径，可以是目录、``best_model.pt`` 一类文件，或含
+            ``{fold}`` 占位符的路径。
+        fold_id: 当前折号（1 基）。为 None 时无法搜索同折存档，只会在第 3/4 步里挑一份。
+        logger: 可选日志器；提供 ``warning`` 时输出回退提示，None 表示静默。
 
     Returns:
-        ``(resolved_path, used_placeholder)``；used_placeholder 为 False 表示该路径不含
-        折号（例如只有一份存档），调用方需要据此提示跨折泄漏风险。
+        ``(resolved_path, source)``；source 取 ``placeholder`` / ``fold_file`` /
+        ``global_best`` / ``given`` 之一，写进日志与 ``audio_teacher_meta``。
 
     Raises:
-        ValueError: 模板含 ``{fold}`` 但未提供 fold_id 时抛出。
+        ValueError: 模板含 ``{fold}`` 但 fold_id 为 None（无法决定用哪一折），或模板是目录但
+            目录里既没有本折存档也没有 ``best_model.pt``。两种情况都是配置问题，直接报错比让
+            ``torch.load`` 抛出难懂的 IsADirectoryError 更好。
     """
-    path = str(template)
-    if "{fold}" not in path:
-        return path, False
-    if fold_id is None:
+    raw = str(template)
+
+    # 1) 显式占位符：不做搜索，尊重调用方的写法
+    if "{fold}" in raw:
+        if fold_id is None:
+            raise ValueError(
+                f"音频教师路径 {raw!r} 含 {{fold}} 占位符，但构建模型时没有传入 fold_id。"
+            )
+        return raw.replace("{fold}", str(fold_id)), _TEACHER_SOURCE_PLACEHOLDER
+
+    # 2) 目录与文件统一处理：搜索范围 = 该目录本身 / 该文件的所在目录
+    template_path = Path(raw)
+    search_dir = template_path if template_path.is_dir() else template_path.parent
+    fold_name = _FOLD_CHECKPOINT_TEMPLATE.format(fold=fold_id)
+
+    if fold_id is not None:
+        fold_candidate = search_dir / fold_name
+        if fold_candidate.is_file():
+            return str(fold_candidate), _TEACHER_SOURCE_FOLD_FILE
+
+    # 3) 回退全局最优：它是「跨全部折」选出的存档，也就是各折共用的那一份
+    global_candidate = search_dir / _GLOBAL_CHECKPOINT_NAME
+    if global_candidate.is_file():
+        if logger is not None:
+            logger.warning(
+                f"教师路径 {raw!r} 不含折号：未找到 {fold_name}，其他折共用全局最优 "
+                f"{str(global_candidate)!r}。"
+            )
+        return str(global_candidate), _TEACHER_SOURCE_GLOBAL_BEST
+
+    # 4) 回退到给定路径本身；是目录的话说明目录里没有任何可用存档
+    if template_path.is_dir():
         raise ValueError(
-            f"音频教师路径 {path!r} 含 {{fold}} 占位符，但构建模型时没有传入 fold_id。"
+            f"教师路径 {raw!r} 是目录，但既没有本折的 {fold_name}，也没有 "
+            f"{_GLOBAL_CHECKPOINT_NAME}。请确认这里指向的是单音频实验的 checkpoint 目录。"
         )
-    return path.replace("{fold}", str(fold_id)), True
+    if logger is not None:
+        logger.warning(
+            f"教师路径 {raw!r} 不含折号：未找到 {fold_name}，其他折共用该存档。"
+        )
+    return raw, _TEACHER_SOURCE_GIVEN
 
 
 class AudioVisionContrastiveModel(nn.Module):
@@ -663,7 +733,8 @@ class AudioVisionContrastiveModel(nn.Module):
         model_cfg: ``config["model"]``；内部先经 :func:`resolve_contrast_model_cfg` 补全默认值。
         classification_task: "" 表示四头多任务，否则为 manner/place/voicing/vowel_backness。
         inference_only: True 时只构建图像主干与分类头（推理路径），跳过音频教师和投影头。
-        fold_id: 当前折号（1 基），用于解析教师路径里的 ``{fold}`` 占位符；单折推理可为 None。
+        fold_id: 当前折号（1 基），用于优先选中同折的 ``best_model_fold_{fold}.pt``；
+            单折推理或没有折概念时可传 None。
         window_frames: 本实验的图像/音频窗长，与教师存档记录的窗长不一致时打警告；
             None 表示不比较。
         logger: 可选日志器，提供 ``info`` / ``warning``；None 时静默。
@@ -673,8 +744,8 @@ class AudioVisionContrastiveModel(nn.Module):
         audio_branch: 音频教师；``inference_only`` 或对比关闭时为 None。
         contrast: 视觉/音频投影头；同上为 None。参数前缀 ``contrast.`` 对应独立 param group。
         audio_freeze: 生效的冻结模式（"all" | "backbone" | "none"）。
-        audio_teacher_meta: 教师加载信息（路径、折、epoch、best_val_loss、结构来源），
-            供训练脚本写进日志复现实验。
+        audio_teacher_meta: 教师加载信息（路径、路径解析来源、折、epoch、best_val_loss、
+            结构来源），供训练脚本写进日志复现实验。
 
     Note:
         ``contrast.position`` 决定对比损失作用的位置：``post_temporal`` 用时序聚合后的
@@ -683,7 +754,6 @@ class AudioVisionContrastiveModel(nn.Module):
         音频教师冻结时本模块重写 ``train()``，保证它始终停留在 eval（详见
         :meth:`ContrastAudioTeacher.enforce_eval`）。
     """
-
     def __init__(
         self,
         num_classes: int,
@@ -749,12 +819,12 @@ class AudioVisionContrastiveModel(nn.Module):
 
         Args:
             model_cfg: 归一化后的 ``model`` 配置。
-            fold_id: 当前折号，用于替换教师路径中的 ``{fold}``。
+            fold_id: 当前折号，用于优先选中同折的 ``best_model_fold_{fold}.pt``。
             window_frames: 本实验窗长；与存档记录值不同时打警告（分布会偏移）。
 
         Raises:
-            ValueError: ``freeze`` 取值非法、路径模板含 ``{fold}`` 但缺 fold_id、
-                存档缺少教师需要的参数、或存档缺少结构配置时抛出。
+            ValueError: ``freeze`` 取值非法、教师路径无法解析（含 ``{fold}`` 却缺 fold_id、
+                目录里没有可用存档）、存档缺少教师需要的参数、或存档缺少结构配置时抛出。
         """
         branch_cfg = model_cfg.get("audio_branch", {})
         freeze = str(branch_cfg.get("freeze", "all")).lower()
@@ -786,14 +856,17 @@ class AudioVisionContrastiveModel(nn.Module):
 
         Args:
             model_cfg: 归一化后的 ``model`` 配置。
-            checkpoint_template: 教师路径，可含 ``{fold}`` 占位符。
-            fold_id: 当前折号。
+            checkpoint_template: 教师路径/目录，可含 ``{fold}`` 占位符。
+            fold_id: 当前折号，用于优先选中同折的 ``best_model_fold_{fold}.pt``。
             window_frames: 本实验窗长，用于与存档记录的窗长比对。
 
         Raises:
-            ValueError: 存档缺少教师需要的参数（详见 :func:`_select_audio_branch_state`）。
+            ValueError: 路径含 ``{fold}`` 却缺 fold_id、目录里没有可用存档、
+                或存档缺少教师需要的参数（详见 :func:`_select_audio_branch_state`）。
         """
-        checkpoint_path, used_placeholder = _format_teacher_path(checkpoint_template, fold_id)
+        checkpoint_path, path_source = _resolve_teacher_checkpoint(
+            checkpoint_template, fold_id, self.logger
+        )
         # map_location="cpu" + weights_only=False：与仓库其它脚本（evaluate/visualize）一致，
         # 存档里除张量外还有 config 字典，需要放开 weights_only
         checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -828,15 +901,23 @@ class AudioVisionContrastiveModel(nn.Module):
                 "不一致：权重能加载，但音频窗分布不同，对齐质量会受影响。"
             )
 
-        if not used_placeholder and self.logger is not None:
+        # 存档自己记录了它是在哪一折上选出来的；与本折不一致说明该教师见过本折的验证集
+        teacher_fold = checkpoint.get("fold") if isinstance(checkpoint, dict) else None
+        if (
+            fold_id is not None
+            and teacher_fold is not None
+            and int(teacher_fold) != int(fold_id)
+            and self.logger is not None
+        ):
             self.logger.warning(
-                f"教师路径 {checkpoint_path!r} 不含 {{fold}}：所有折共用同一份存档，"
-                "该教师见过本折的验证 subject，指标存在泄漏风险。"
+                f"教师存档记录的 fold={teacher_fold} 与本折 {fold_id} 不一致："
+                "该教师见过本折的验证 subject，本折指标存在泄漏风险。"
             )
 
         self.audio_teacher_meta = {
             "checkpoint": checkpoint_path,
-            "fold": checkpoint.get("fold") if isinstance(checkpoint, dict) else None,
+            "path_source": path_source,
+            "fold": teacher_fold,
             "epoch": checkpoint.get("epoch") if isinstance(checkpoint, dict) else None,
             "best_val_loss": checkpoint.get("best_val_loss") if isinstance(checkpoint, dict) else None,
             "cfg_source": source,
@@ -905,8 +986,9 @@ class AudioVisionContrastiveModel(nn.Module):
         meta = self.audio_teacher_meta
         self.logger.info(
             "[contrast] 音频教师: "
-            f"path={meta.get('checkpoint')} fold={meta.get('fold')} "
-            f"epoch={meta.get('epoch')} best_val_loss={meta.get('best_val_loss')} "
+            f"path={meta.get('checkpoint')} path_source={meta.get('path_source')} "
+            f"fold={meta.get('fold')} epoch={meta.get('epoch')} "
+            f"best_val_loss={meta.get('best_val_loss')} "
             f"cfg_source={meta.get('cfg_source')} freeze={self.audio_freeze}"
         )
         self.logger.info(
@@ -948,6 +1030,9 @@ class AudioVisionContrastiveModel(nn.Module):
             ``(visual_emb, audio_emb)``。post_temporal 下形状为 ``[B, proj_dim]``；
             pre_temporal 下形状为 ``[B, T, proj_dim]``，两侧帧数一致。
 
+        Raises:
+            ValueError: pre_temporal 下音频 token 数少于图像帧数，无法逐帧对齐时抛出。
+
         Note:
             pre_temporal 的对齐依据：音频窗与图像窗覆盖同一时间跨度（都以当前帧时间戳居中），
             因此把音频 token（约 3.3 token/帧）沿时间维均值池化到图像帧数即可近似逐帧对齐。
@@ -957,6 +1042,17 @@ class AudioVisionContrastiveModel(nn.Module):
             return self.contrast.visual_proj(pooled_img), self.contrast.audio_proj(pooled_audio)
 
         frame_count = img_seq.size(1)
+        audio_tokens = audio_seq.size(1)
+        # adaptive_avg_pool1d 在「输出长度 > 输入长度」时会重复采样同一 token，
+        # 那不是对齐而是造数据，因此这里显式拦住
+        if audio_tokens < frame_count:
+            raise ValueError(
+                f"contrast.position='pre_temporal' 需要音频 token 数不少于图像帧数，"
+                f"实际 audio_tokens={audio_tokens} < frame_count={frame_count}。"
+                "音频 token 数约为 window_frames × (16000 / fps) / 320，帧率越高越容易不足；"
+                "请减小 window_frames 或核对 data.fps / data.audio_sample_rate。"
+            )
+
         # [B,Ta,Da] → [B,Da,Ta] → 时间维池化到 T 帧 → [B,T,Da]；LayerNorm 由投影头负责
         audio_frames = F.adaptive_avg_pool1d(
             audio_seq.transpose(1, 2), frame_count

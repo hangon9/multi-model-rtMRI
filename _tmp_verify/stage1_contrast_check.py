@@ -983,9 +983,19 @@ def test_real_teacher_checkpoint():
         str(logger.warnings[:2]),
     )
     check(
-        "路径不含 {fold} 时提示跨折泄漏",
-        logger.has("不含 {fold}", bucket="warning"),
+        "找不到同折存档时提示『不含折号 + 其他折共用』",
+        logger.has("不含折号", bucket="warning") and logger.has("best_model_fold_", bucket="warning"),
         str([w[:60] for w in logger.warnings]),
+    )
+    check(
+        "解析来源标记为 given（单份自定义命名存档）",
+        meta.get("path_source") == "given",
+        str(meta.get("path_source")),
+    )
+    check(
+        "存档 fold=5 与实际折号不同 → 提示泄漏",
+        logger.has("与本折", bucket="warning") and logger.has("泄漏", bucket="warning"),
+        str([w[:70] for w in logger.warnings if "折" in w]),
     )
     check(
         "窗长一致（存档 11 = 本实验 11）时不打窗长警告",
@@ -1195,9 +1205,14 @@ def test_real_config_smoke():
         check("真实 config 端到端", False, f"缺少 {REAL_TEACHER}")
         return
 
-    # 用仓库里真正的 config，只把数据规模与 batch 调小；model / loss 段保持原样
+    # 用仓库里真正的 config，只把数据规模与 batch 调小
     with (REPO_ROOT / "configs" / "contrast_post_temporal.yaml").open("r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
+    # 强行打开对比分量：本小节要验证的就是对比路径（教师加载、visual_emb/audio_emb、对比指标），
+    # 而 yaml 里的 enabled 会随实验矩阵（image-only 对照 / 扫 λ / 阶段二）来回切换
+    config["model"]["contrast"]["enabled"] = True
+    config["loss"]["contrast_loss_name"] = "info_nce"
+    config["loss"]["contrast_loss_kwargs"] = {"temperature": 0.07, "mask_same_label": True}
     config["train"]["batch_size"] = 2
     config["train"]["epochs"] = 1
     config["train"]["num_workers"] = 0
@@ -1336,6 +1351,163 @@ def test_real_config_smoke():
     torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
 
+# ---------------------------------------------------------------------------
+# 13. 教师路径自动搜索（同折 best_model_fold_{n}.pt → 全局 best_model.pt）
+# ---------------------------------------------------------------------------
+def _hardlink_or_copy(src: Path, dst: Path) -> None:
+    """用硬链接把同一份权重挂成多个文件名；不支持硬链接时退回复制。
+
+    硬链接不额外占磁盘：本小节的多个 fold 文件内容相同，复制会在临时目录里堆出 GB 级数据。
+    """
+    import os
+
+    try:
+        os.link(src, dst)
+    except OSError:
+        import shutil
+
+        shutil.copy2(src, dst)
+
+
+def test_teacher_fold_autosearch(tmpdir: Path):
+    print("\n=== 13. 教师路径自动搜索（逐折） ===")
+    # 合成一份单音频存档作为“权重真值”，再用硬链接摆成 checkpoint 目录的命名规范
+    teacher, src_path = build_teacher_checkpoint(tmpdir, "attention")
+    teacher = teacher.to(DEVICE).eval()
+    audio = torch.randn(2, 17600, device=DEVICE)
+    with torch.no_grad():
+        expected = teacher(audio=audio)["pooled_embedding"]
+
+    ckpt_dir = tmpdir / "wav2vec2-lv"
+    ckpt_dir.mkdir(exist_ok=True)
+    for fold_number in (1, 3, 5):
+        _hardlink_or_copy(src_path, ckpt_dir / f"best_model_fold_{fold_number}.pt")
+    _hardlink_or_copy(src_path, ckpt_dir / "best_model.pt")
+
+    def build(fold_id):
+        logger = RecordingLogger()
+        cfg = make_model_cfg(
+            model_name="vit",
+            temporal="none",
+            window=11,
+            freeze="all",
+            checkpoint=str(ckpt_dir),
+            cfg_from_checkpoint=False,
+        )
+        model = AudioVisionContrastiveModel(
+            18, cfg, "", fold_id=fold_id, window_frames=11, logger=logger
+        ).to(DEVICE).eval()
+        return model, logger
+
+    # 有同折存档的折：取自己的那份，且不抱怨折号
+    for fold_number in (1, 3, 5):
+        model, logger = build(fold_number)
+        meta = model.audio_teacher_meta
+        check(
+            f"折{fold_number} 自动选中 best_model_fold_{fold_number}.pt",
+            Path(meta["checkpoint"]).name == f"best_model_fold_{fold_number}.pt"
+            and meta["path_source"] == "fold_file",
+            f"{Path(meta['checkpoint']).name} source={meta['path_source']}",
+        )
+        check(
+            f"折{fold_number} 无『不含折号』警告",
+            not logger.has("不含折号", bucket="warning"),
+            str(logger.warnings[:1]),
+        )
+        # 权重必须真的来自该文件：与教师真值逐位一致
+        with torch.no_grad():
+            got = model(image=frames_for("vit", 11), audio=audio)["pooled_audio"]
+        check(
+            f"折{fold_number} 教师权重与存档一致",
+            (expected - got).abs().max().item() < 1e-5,
+            f"max|Δ|={(expected - got).abs().max().item():.3e}",
+        )
+        del model
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    # 缺同折存档的折：回退全局最优 + 新警告文案
+    for fold_number in (2, 4):
+        model, logger = build(fold_number)
+        meta = model.audio_teacher_meta
+        check(
+            f"折{fold_number} 无同折存档 → 回退 best_model.pt",
+            Path(meta["checkpoint"]).name == "best_model.pt" and meta["path_source"] == "global_best",
+            f"{Path(meta['checkpoint']).name} source={meta['path_source']}",
+        )
+        check(
+            f"折{fold_number} 给出『不含折号 + 其他折共用全局最优』警告",
+            any(
+                "不含折号" in w and f"best_model_fold_{fold_number}.pt" in w and "其他折共用全局最优" in w
+                for w in logger.warnings
+            ),
+            str([w[:90] for w in logger.warnings]),
+        )
+        del model
+        torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    # 指向具体文件时也要优先同折（配置写 .../best_model.pt 的常见情形）
+    model, logger = build(4)
+    del model
+    logger_file = RecordingLogger()
+    model_file = AudioVisionContrastiveModel(
+        18,
+        make_model_cfg(
+            model_name="vit", window=11, freeze="all",
+            checkpoint=str(ckpt_dir / "best_model.pt"), cfg_from_checkpoint=False,
+        ),
+        "",
+        fold_id=3,
+        window_frames=11,
+        logger=logger_file,
+    ).to(DEVICE)
+    check(
+        "给 best_model.pt 时仍优先同折存档",
+        Path(model_file.audio_teacher_meta["checkpoint"]).name == "best_model_fold_3.pt"
+        and not logger_file.warnings,
+        f"{Path(model_file.audio_teacher_meta['checkpoint']).name}",
+    )
+    del model_file
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+    # {fold} 占位符仍然显式生效（不做搜索）
+    logger_ph = RecordingLogger()
+    model_ph = AudioVisionContrastiveModel(
+        18,
+        make_model_cfg(
+            model_name="vit", window=11, freeze="all",
+            checkpoint=str(ckpt_dir / "best_model_fold_{fold}.pt"), cfg_from_checkpoint=False,
+        ),
+        "",
+        fold_id=5,
+        window_frames=11,
+        logger=logger_ph,
+    ).to(DEVICE)
+    check(
+        "{fold} 占位符按折号替换且不搜索",
+        Path(model_ph.audio_teacher_meta["checkpoint"]).name == "best_model_fold_5.pt"
+        and model_ph.audio_teacher_meta["path_source"] == "placeholder",
+        str(model_ph.audio_teacher_meta["path_source"]),
+    )
+
+    # 目录里既没有该折也没有全局最优 → 明确报错
+    empty_dir = tmpdir / "empty_ckpt_dir"
+    empty_dir.mkdir(exist_ok=True)
+    try:
+        AudioVisionContrastiveModel(
+            18,
+            make_model_cfg(model_name="vit", window=11, freeze="all", checkpoint=str(empty_dir)),
+            "",
+            fold_id=2,
+            logger=None,
+        )
+        check("空目录明确报错", False)
+    except ValueError as exc:
+        check("空目录明确报错", "是目录" in str(exc), str(exc)[:80])
+
+    del teacher
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+
 def main():
     # 小节编号与各测试函数打印的标题编号一致；“重”= 需要真实数据集 / 真实教师存档 / GPU
     sections = {
@@ -1350,8 +1522,8 @@ def main():
         10: ("真实教师存档（hpc/audio_only_best_model.pt）", True, test_real_teacher_checkpoint, None),
         11: ("冻结模式 / 模块自洽（含不依赖 multimodal_fusion）", False, test_teacher_freeze_modes, "tmpdir"),
         12: ("真实 config 端到端（真实教师 + 真实图像主干）", True, test_real_config_smoke, None),
+        13: ("教师路径自动搜索（逐折 fold 文件 → 全局最优）", False, test_teacher_fold_autosearch, "tmpdir"),
     }
-
     parser = argparse.ArgumentParser(description="contrast 模型验证清单")
     parser.add_argument(
         "--sections",
