@@ -8,6 +8,7 @@ Multi-modal real-time MRI (rtMRI) speech articulography research project — fra
 
 - Using simplified Chinese for conversation and comments.
 - Do not run whole train and interference pipelines on this machine. If needed, tell the user to run on HPC. This machine is for code development and small-scale testing only.
+- The configs and checkpoints are unreliable and didn't use or generate by real experiments, do not use them for resoning and evaluation.
 
 ## Quick start
 
