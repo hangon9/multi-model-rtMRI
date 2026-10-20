@@ -15,6 +15,61 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# mask_same_label 的三种合法语义：
+#   false    —— 不区分同组样本，所有非对角项都当负样本（原始 InfoNCE）
+#   mask     —— 同组非对角项视为假负样本，从 softmax 分母中屏蔽
+#   positive —— 同组非对角项视为额外正样本，与对角线一起参与多正样本 InfoNCE
+_MASK_SAME_LABEL_MODES = ("false", "mask", "positive")
+
+
+def _normalize_mask_same_label(value) -> str:
+    """把 config 里的 ``mask_same_label`` 归一到 :data:`_MASK_SAME_LABEL_MODES`。
+
+    为兼容历史 config，布尔值按旧语义映射：``True`` → ``mask``、``False`` / ``None``
+    → ``false``。字符串的大小写、连字符差异（``Positive`` / ``pos``）均被识别。
+
+    Raises:
+        ValueError: 取值无法识别时抛出，避免拼写错误静默退化成 ``false``。
+    """
+    if value is None:
+        return "false"
+    if isinstance(value, bool):
+        return "mask" if value else "false"
+
+    normalized = str(value).strip().lower().replace("-", "_")
+    if normalized in ("", "false", "off", "none", "null", "0"):
+        return "false"
+    if normalized in ("mask", "true", "on", "1"):
+        return "mask"
+    if normalized in ("positive", "pos"):
+        return "positive"
+    raise ValueError(
+        f"mask_same_label 只支持 {' / '.join(_MASK_SAME_LABEL_MODES)}"
+        f"（或布尔值），收到 {value!r}"
+    )
+
+
+def _multi_positive_infonce(logits: torch.Tensor, positive_mask: torch.Tensor) -> torch.Tensor:
+    """多正样本 InfoNCE / 监督对比损失：每个锚点的正样本取平均后再对 batch 求均值。
+
+    Args:
+        logits: ``[B, B]`` 的相似度（已除温度）；``(i, j)`` 表示锚点 ``i`` 与候选 ``j``。
+        positive_mask: ``[B, B]`` 的布尔掩码，True 表示该候选是锚点的正样本。掩码必须
+            包含对角线（样本与自身配对），这样每个锚点至少有一个正样本。
+
+    Returns:
+        标量损失，等价于 ``-mean_i mean_{p in P(i)} log softmax(logits_i)[p]``。
+
+    Note:
+        分母包含全部候选（含锚点自身），与单正样本 :class:`InfoNCELoss` 的约定一致：
+        当掩码退化为单位阵时，本函数与逐行 ``cross_entropy`` 的结果完全相同。
+    """
+    log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+    weights = positive_mask.to(log_prob.dtype)
+    # 每个锚点至少有对角线一个正样本，clamp 只是防御除零，正常不会生效
+    per_anchor = -(log_prob * weights).sum(dim=1) / weights.sum(dim=1).clamp(min=1.0)
+    return per_anchor.mean()
+
 
 def _framewise_similarity(visual: torch.Tensor, audio: torch.Tensor) -> torch.Tensor:
     """计算 batch 内两两余弦相似度矩阵。
@@ -92,31 +147,38 @@ class CosineContrastLoss(nn.Module):
 class InfoNCELoss(nn.Module):
     """InfoNCE（NT-Xent）对比损失，对称计算 v→a 与 a→v 两个方向。
 
-    正样本为 batch 内同一位置配对的 (视觉, 音频) 样本，其余样本全部充当负样本。当
-    ``mask_same_label=True`` 时，与锚点具有相同 ``group_ids`` 的非对角项会被屏蔽——
-    音系特征相同的相邻帧互为「假负样本」，屏蔽它们可避免把本应对齐的表征推开。
+    正样本为 batch 内同一位置配对的 (视觉, 音频) 样本。 ``mask_same_label`` 决定
+    「与锚点具有相同 ``group_ids`` 的非对角项」怎么处理——音系特征相同的相邻帧互为
+    「假负样本」，既不该被推开，也可以直接当作额外正样本：
+
+    - ``false``：不区分同组样本，所有非对角项都是负样本（原始 InfoNCE，默认）；
+    - ``mask``：同组非对角项置 ``-inf``，退出 softmax 分母（假负样本屏蔽）；
+    - ``positive``：同组非对角项与对角线一起作为正样本，按多正样本 InfoNCE 求平均。
 
     Args:
         temperature: 相似度缩放温度 τ，默认 0.07（对比学习常用值）。必须 > 0，
             越小则负样本的区分压力越大。
-        mask_same_label: 是否屏蔽同组非对角项，默认 False。开启时 forward 需要提供
-            ``group_ids``，缺失时静默退化为不屏蔽。
+        mask_same_label: ``false`` / ``mask`` / ``positive``，默认 ``false``。也接受
+            布尔值以兼容历史 config（``True`` → ``mask``，``False``/``None`` → ``false``）。
+            ``mask`` 与 ``positive`` 需要 forward 提供 ``group_ids``，缺失时静默退化为
+            ``false`` 的行为。
 
     Note:
         ``last_stats`` 中的 ``contrast_acc_v2a`` / ``contrast_acc_a2v`` 是 batch 内检索
         准确率（随机基线为 ``1/B``），``contrast_pos_sim`` 是正样本对的平均余弦相似度。
 
-        开启 ``mask_same_label`` 后，若一个 batch 内所有样本的分组完全相同（例如小 batch
-        取到连续且标签一致的帧），非对角项会被全部屏蔽，此时损失与梯度恒为 0——batch 内
-        没有可区分的负样本，这是屏蔽语义的必然结果，不是训练异常。
+        ``mask`` 模式下，若一个 batch 内所有样本的分组完全相同（例如小 batch 取到连续
+        且标签一致的帧），非对角项会被全部屏蔽，此时损失与梯度恒为 0——batch 内没有可
+        区分的负样本，这是屏蔽语义的必然结果，不是训练异常。``positive`` 模式下同样的
+        batch 反而有 B-1 个正样本，损失不会退化为 0。
     """
 
-    def __init__(self, temperature: float = 0.07, mask_same_label: bool = False):
+    def __init__(self, temperature: float = 0.07, mask_same_label: str = "false"):
         super().__init__()
         if temperature <= 0:
             raise ValueError(f"temperature 必须为正数，收到 {temperature!r}")
         self.temperature = float(temperature)
-        self.mask_same_label = bool(mask_same_label)
+        self.mask_same_label = _normalize_mask_same_label(mask_same_label)
         self.last_stats: dict = {}
 
     def _zero_stats(self) -> dict:
@@ -132,7 +194,8 @@ class InfoNCELoss(nn.Module):
             visual_flat: ``[B, D]`` 或 ``[B, T, D]``，视觉侧 embedding。
             audio_flat: 形状与 visual_flat 一致的音频侧 embedding。
             group_ids: ``[B]`` 的整数分组（由 ``loss_factory`` 从标签派生）；仅当
-                ``mask_same_label=True`` 时使用，``None`` 表示不屏蔽。
+                ``mask_same_label`` 为 ``mask`` / ``positive`` 时使用，``None`` 表示
+                退化为 ``false`` 的行为。
             kwargs: 容忍上游多传的关键字，便于 loss 工厂统一调用。
 
         Returns:
@@ -148,19 +211,28 @@ class InfoNCELoss(nn.Module):
 
         similarity = _framewise_similarity(visual_flat, audio_flat)
 
-        # 同组非对角项置 -inf：softmax 之后它们对分母不再有贡献；
-        # 对角线（真正的正样本）从不屏蔽，因此不会出现整行 -inf 导致的 NaN
-        if self.mask_same_label and group_ids is not None:
+        # group_ids 缺失时静默退化为 false：屏蔽/多正样本都需要分组信息
+        same_group = None
+        if self.mask_same_label != "false" and group_ids is not None:
             groups = group_ids.reshape(-1)
             same_group = groups.unsqueeze(0) == groups.unsqueeze(1)
+
+        # mask 模式：同组非对角项置 -inf，softmax 之后它们对分母不再有贡献；
+        # 对角线（真正的正样本）从不屏蔽，因此不会出现整行 -inf 导致的 NaN
+        if self.mask_same_label == "mask" and same_group is not None:
             off_diagonal = ~torch.eye(batch_size, dtype=torch.bool, device=similarity.device)
             similarity = similarity.masked_fill(same_group & off_diagonal, float("-inf"))
 
         logits = similarity / self.temperature
         targets = torch.arange(batch_size, device=logits.device)
 
-        loss_v2a = F.cross_entropy(logits, targets)
-        loss_a2v = F.cross_entropy(logits.t(), targets)
+        if self.mask_same_label == "positive" and same_group is not None:
+            # 同组掩码天然包含对角线：每个锚点的正样本 = 自身配对 + 同组其它样本
+            loss_v2a = _multi_positive_infonce(logits, same_group)
+            loss_a2v = _multi_positive_infonce(logits.t(), same_group.t())
+        else:
+            loss_v2a = F.cross_entropy(logits, targets)
+            loss_a2v = F.cross_entropy(logits.t(), targets)
 
         # 统计量不参与反传：检索准确率用于观察对齐程度，正样本相似度用于观察 collapse
         with torch.no_grad():

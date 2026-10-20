@@ -17,11 +17,11 @@ _GROUP_IGNORE_KEYS = ("place", "voicing")  # 标签可能出现 -100（该帧不
 
 
 def _build_group_ids(labels) -> torch.Tensor | None:
-    """把四头标签压成每帧一个整数分组 key，用于 ``InfoNCELoss`` 的假负样本屏蔽。
+    """把四头标签压成每帧一个整数分组 key，供 ``InfoNCELoss`` 区分同组 / 异组样本。
 
     同一时间位置邻域内的帧往往共享 manner/place/voicing，它们在 InfoNCE 里会被当成
-    负样本互相推开，形成「假负样本」。用四头标签的组合值作为分组 key，屏蔽同 key 的
-    非对角项即可消除这种噪声。
+    负样本互相推开，形成「假负样本」。用四头标签的组合值作为分组 key，
+    ``mask_same_label`` 可以据此把同组的非对角项屏蔽掉或改当额外正样本。
 
     Args:
         labels: 数据集给出的标签字典，至少包含 manner / place / voicing /
@@ -32,7 +32,8 @@ def _build_group_ids(labels) -> torch.Tensor | None:
         会被覆盖成张量）或缺少任一键时返回 ``None``，调用方据此跳过屏蔽。
 
     Note:
-        分组只用于屏蔽，不改变损失权重：不同 manner 的帧永远被视为真正的负样本。
+        分组只用于区分同组 / 异组，不改变损失权重：不同 manner 的帧永远被视为真正的
+        负样本。
     """
     if not isinstance(labels, dict):
         return None

@@ -46,7 +46,7 @@ Shared across all pipelines:
 - Image model: `model.image_encoder.model_name` ∈ {vit, ViT-Base, ResNet50}; `model.temporal.temporal_type` ∈ {none, conformer}.
 - Audio model: `model.backbone.model_name` (HF id); `model.encoder.encoder_type` ∈ {attention, conformer}.
 - LR groups: img → `lr_encoder`/`lr_temporal`/`lr_classifier`; wav → `lr_backbone`/`lr_encoder`/`lr_classifier`/`lr_global`.
-- Loss: `loss.lambda_*` per task; `loss.contrast_loss_name` ∈ {null, cosine, info_nce/infonce/nt_xent}; `loss.contrast_loss_kwargs` (`temperature`, `mask_same_label`); `loss.use_class_weights: true`.
+- Loss: `loss.lambda_*` per task; `loss.contrast_loss_name` ∈ {null, cosine, info_nce/infonce/nt_xent}; `loss.contrast_loss_kwargs` (`temperature`, `mask_same_label` ∈ {false, mask, positive}; bool `true`/`false` still accepted, `true` ≡ `mask`); `loss.use_class_weights: true`.
 - Contrast model (`configs/contrast_post_temporal.yaml`): `model.contrast.{enabled,position,proj_dim,proj_hidden,dropout}`; `model.audio_branch.{checkpoint,freeze,cfg_from_checkpoint}` (`freeze` ∈ {all, backbone, none}; `checkpoint` may be a directory / file / `{fold}` template / `null` for the pretrained-only fallback — per-fold `best_model_fold_{fold}.pt` is auto-selected, with a warned fallback to `best_model.pt`); `train.{lr_contrast,select_metric,drop_last}`; `model.contrast.enabled` and `loss.contrast_loss_name` must agree or startup raises. `configs/contrast_baseline_config.yaml` documents the removed token-projection (65→31) variant and no longer matches the code.
 
 ## Conventions & pitfalls
