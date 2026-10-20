@@ -2,14 +2,16 @@
 
 Read the [Research plan](Research_plan.md) first — it contains the core project guide, dataset description, architecture overview, and evaluation plan. This document is a quick reference for the codebase.
 
-Multi-modal real-time MRI (rtMRI) speech articulography research project — frame-level phonological feature classification from rtMRI video. Audio (Wav2Vec2) is used as a training-time teacher only; **inference uses only the image branch**. Master's thesis project.
+Multi-modal real-time MRI (rtMRI) speech articulography research project — frame-level phonological feature classification from rtMRI video. 
+Two multimodal designs coexist:
+- **Contrastive pipeline**: audio is a training-time teacher only; **inference uses only the image branch**.
+- **Multimodal fusion pipeline** (`train_multimodal_fusion.py`): image **and** audio are both used at training **and** inference time.
 
 ## Notes
 
 - Using simplified Chinese for conversation and comments.
 - Do not run whole train and interference pipelines on this machine. If needed, tell the user to run on HPC. This machine is for code development and small-scale testing only.
 - The configs and checkpoints are unreliable and didn't use or generate by real experiments, do not use them for resoning and evaluation.
-
 ## Quick start
 
 - **Environment**: conda env `rtmri` (activated in terminal). Core deps: `torch==2.5.1+cu121`, `torchaudio`, `torchvision`, `transformers`, `monai`, `scikit-learn`, `PyYAML`, `matplotlib`, `pandas`.
