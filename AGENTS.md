@@ -22,20 +22,22 @@ Two multimodal designs coexist:
 - Train audio baseline: `python train_wav_baseline.py --config configs/wav_baseline_config.yaml`
 - Train contrastive model: `python train_contrast.py --config configs/contrast_baseline_config.yaml`
 - Train multimodal fusion: `python train_multimodal_fusion.py --config configs/multimodal_fusion_concat.yaml` (`fusion_type` ∈ concat | gated | cross_attention | mbt)
+- Train distillation (fusion teacher → img student): `python train_distill.py --config configs/distill_img_ResNet50_logit.yaml`（必须先在 `distill.teacher_ckpt` 填教师 ckpt 目录）
 - Evaluate: `python -m src.eval.evaluate --checkpoint checkpoints/best_model.pt --log-dir logs/<experiment>_<YYYYMMDD_HHMMSS>`
   - `--eval-folds`: compare per-fold checkpoints (`checkpoints/best_model_fold_{1..5}.pt`).
   - `--eval-folds` 只对比 `data.train_fold` 中列出的折（未列出时对比全部已发现折），避免历史遗留折 checkpoint 干扰。
   - `--skip-inference`: reuse cached `raw/results.pkl` instead of re-running inference.
   - All three test modes (`unseen_speaker`/`unseen_task`/`unseen_both`) run automatically.
 
-## Architecture overview — four pipelines
+## Architecture overview — five pipelines
 
-All four training pipelines share the same data layer, gated heads, loss factory, and eval harness:
+All five training pipelines share the same data layer, gated heads, loss factory, and eval harness:
 
 1. **Img-only pipeline** (`train_img_baseline.py`): MRI frame → ViT (`vit`/`ViT-Base`/`ResNet50`) → optional Conformer temporal encoder (multi-frame, center readout) → gated 4-head classifier. See `src/models/img_encoder.py`, `src/models/img_only_model.py`.
 2. **Audio-only pipeline** (`train_wav_baseline.py`): frozen HF `Wav2Vec2`/`HuBERT`/`XLSR` → AttentionPooling or Conformer → gated classifier. See `src/models/audio_ssl_encoder.py`, `src/models/audio_only_model.py`.
 3. **Contrastive pipeline** (`train_contrast.py`): image + audio encoders, token projection 65→31, cosine/InfoNCE loss; audio is a training-time teacher only, **inference uses only the image branch**. See `src/models/contrastive_model.py`, `src/losses/contrast_losses.py`.
 4. **Multimodal fusion pipeline** (`train_multimodal_fusion.py`): `ImageBranch` + `AudioBranch` → fusion module → gated 4-head classifier. `model.fusion.fusion_type` ∈ {concat, gated, cross_attention, mbt}. **Unlike contrast, both image and audio are used at inference.** See `src/models/multimodal_fusion.py`, `src/models/fusion_blocks.py`.
+5. **Distillation pipeline** (`train_distill.py`): frozen fusion teacher (**per-fold** `best_model_fold_{n}.pt`, same fold as the student) → img-only student, gated 4-head classifier. `distill.mode` ∈ {`logit`, `logit_feat`}; `distill.teacher_ckpt` may be a directory / `best_model.pt` / a `{fold}` template. Data fields `window_frames`/`fps`/`audio_sample_rate`/`img_size` are **inherited from the teacher ckpt config**; the CV pool fields (`unseen_*`, `n_splits`, `dataset`, `classification_task`) are asserted equal. Inference needs the image branch only. See `src/models/multi_distill_teacher.py`, `src/losses/distill_loss.py`.
 
 Shared across all pipelines:
 
@@ -86,6 +88,7 @@ Shared across all pipelines:
 | `docs/multiframe_temporal_plan.md` | Multi-frame image temporal encoder (implemented 2026-08-04). |
 | `docs/plans/multimodal_fusion_plan.md` | Multimodal fusion design: Phase 1 concat/gated → Phase 2 cross_attention → Phase 2.5 temporal_aggregation → MBT (implemented 2026-08-16+). |
 | `docs/test_plan.md` | Shape/overfit test plan. |
+| `docs/plans/distillation_plan.md` | Fusion → img distillation design: per-fold teacher (`src/models/multi_distill_teacher.py`), per-head KD + feature alignment (`src/losses/distill_loss.py`), `train_distill.py`, config inheritance/alignment rules, experiment matrix, test list. |
 
 ## Results clearfication
 Every result in the 'hpc' folder are the results of the experiments conducted on the HPC cluster. Other results outside the 'hpc' folder are the results of the experiments conducted on the local machine. DO NOT cofuse them.
