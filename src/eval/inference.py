@@ -43,7 +43,6 @@ _EXPERIMENT_TO_FAMILY: dict[str, str] = {
     "multimodal_fusion_concat":           "multimodal_fusion",
     "multimodal_fusion_gated":            "multimodal_fusion",
     "multimodal_fusion_cross_attn":       "multimodal_fusion",
-    # 蒸馏学生：权重只含图像分支（教师与投影头都不入档），必须按 image 族加载
     "kd_img_ResNet50_logit":              "image",
     "kd_img_ResNet50_logit_feat":         "image",
 }
@@ -210,7 +209,7 @@ def _resolve_model_family(
             return family
         # Soft match for partial names (e.g. "wav_baseline" → audio)
         lname = experiment_name.lower()
-        if any(k in lname for k in ("img", "resnet", "vit", "distill")):
+        if any(k in lname for k in ("img", "resnet", "vit", "distill", "kd")):
             return "image"
         if any(k in lname for k in ("fusion", "multimodal")):
             return "multimodal_fusion"
