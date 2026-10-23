@@ -30,7 +30,10 @@ from data.splits import (
     DEFAULT_UNSEEN_TASK_TYPES,
     _get_window_frames,
 )
-from src.models.multimodal_fusion import AudioVisionFusionModel
+from src.models.multimodal_fusion import (
+    AudioVisionFusionModel,
+    resolve_fusion_model_cfg,
+)
 
 #: 多任务模式下 ClassificationHead 的 num_classes 占位值（gated 四头由头内部决定类别数，
 #: 该值只在单任务构建路径上参与，此处传 18 与各 train_*.py 的 NUM_CLASSES[""] 一致）
@@ -342,8 +345,10 @@ class MultiDistillTeacher(nn.Module):
         model: 已加载权重的 ``AudioVisionFusionModel``。
         feature_dim: 教师 ``fused_embedding`` 维度，特征蒸馏的投影目标维度。
         fold: ckpt 记录的折号（可能为 None）。
-        meta: 记录 checkpoint 路径、来源、fold、epoch、best_val_loss、fusion_type 等，
+        meta: 教师身份与结构快照：checkpoint 路径、解析来源、折号、epoch、
+            best_val_loss、融合类型、特征维度、各分支结构名、冻结模式等。
             会被写进学生 checkpoint 的 ``teacher_info`` 字段，便于回溯本折用了哪个教师。
+        logger: 构造时传入的日志器；:meth:`_log_teacher_meta` 用它输出教师信息。
 
     Note:
         构造时会把 ``image_encoder.pretrained`` 强制置 False（权重来自 ckpt，避免联网
@@ -357,7 +362,7 @@ class MultiDistillTeacher(nn.Module):
             teacher_ckpt: 教师 checkpoint 模板，见 :func:`resolve_teacher_checkpoint`。
             fold_id: 当前折号（1 起）；与 ckpt 记录的 fold 不一致时只警告不拦截。
             amp: 前向是否用 bfloat16 autocast；默认 False，显存吃紧时再开。
-            logger: 可选日志器。
+            logger: 可选日志器；传入时构造末尾会调用 :meth:`_log_teacher_meta`。
 
         Raises:
             ValueError: ckpt 内嵌 config 不是四头多任务，或权重与模型结构不匹配。
@@ -396,35 +401,76 @@ class MultiDistillTeacher(nn.Module):
         self.model.eval()
 
         self.amp = bool(amp)
+        self.logger = logger
         self.feature_dim = self.model.fusion.output_dim
         self.fold = ckpt.get("fold")
+
+        # 补齐默认值再取结构名：训练脚本写进 logging 的取值与模型真正读到的保持一致
+        resolved_cfg = resolve_fusion_model_cfg(model_cfg)
         self.meta = {
             "checkpoint": str(path),
             "path_source": path_source,
+            # 教师结构与超参只来自 ckpt 内嵌 config，此处留痕便于区分"配置来自文件"还是"来自 ckpt"
+            "cfg_source": "ckpt",
             "fold": self.fold,
+            "requested_fold": fold_id,
             "epoch": ckpt.get("epoch"),
             "best_val_loss": ckpt.get("best_val_loss"),
             "fusion_type": self.model.fusion.fusion_type,
             "feature_dim": self.feature_dim,
+            "image_model_name": resolved_cfg["image_encoder"]["model_name"],
+            "image_temporal_type": resolved_cfg["image_temporal"]["temporal_type"],
+            "audio_model_name": resolved_cfg["audio_backbone"]["model_name"],
+            "audio_encoder_type": resolved_cfg["audio_encoder"]["encoder_type"],
+            "freeze": "all",
+            "num_params": sum(p.numel() for p in self.model.parameters()),
         }
 
-        if logger is not None:
-            logger.info(
-                "[distill] 教师: "
-                f"path={path} path_source={path_source} fold={self.fold} "
-                f"epoch={self.meta['epoch']} best_val_loss={self.meta['best_val_loss']} "
-                f"fusion_type={self.meta['fusion_type']} feature_dim={self.feature_dim}"
+        self._log_teacher_meta()
+
+        # 折号不符意味着教师训练过本折验证 subject：不拦截，但必须留痕
+        if (
+            logger is not None
+            and self.fold is not None
+            and fold_id is not None
+            and int(self.fold) != int(fold_id)
+        ):
+            logger.warning(
+                f"教师存档记录的 fold={self.fold} 与本折 {fold_id} 不一致："
+                "该教师见过本折的验证 subject，本折指标存在泄漏风险。"
             )
-            # 折号不符意味着教师训练过本折验证 subject：不拦截，但必须留痕
-            if (
-                self.fold is not None
-                and fold_id is not None
-                and int(self.fold) != int(fold_id)
-            ):
-                logger.warning(
-                    f"教师存档记录的 fold={self.fold} 与本折 {fold_id} 不一致："
-                    "该教师见过本折的验证 subject，本折指标存在泄漏风险。"
-                )
+
+    def _log_teacher_meta(self) -> None:
+        """把教师路径、结构与冻结模式写进日志，便于事后确认每折实际用到的教师。
+
+        两行输出：第一行是身份（路径、解析来源、折号、epoch、best_val_loss、冻结模式），
+        第二行是结构（图像/音频分支与融合类型、特征维度）。``path_source`` 是核对
+        折间泄露的关键字段：正常应为 ``fold_file``，回退到 ``global_best`` 时说明该折
+        教师训练过本折验证 subject。
+
+        Side effects:
+            向 ``self.logger`` 写两行 info；``self.logger`` 为 None 时直接返回。
+        """
+        if self.logger is None:
+            return
+
+        meta = self.meta
+        self.logger.info(
+            "[distill] 教师: "
+            f"path={meta['checkpoint']} path_source={meta['path_source']} "
+            f"fold={meta['fold']} requested_fold={meta['requested_fold']} "
+            f"epoch={meta['epoch']} best_val_loss={meta['best_val_loss']} "
+            f"cfg_source={meta['cfg_source']} freeze={meta['freeze']}"
+        )
+        self.logger.info(
+            "[distill] 教师结构: "
+            f"image_model_name={meta['image_model_name']} "
+            f"image_temporal_type={meta['image_temporal_type']} "
+            f"audio_model_name={meta['audio_model_name']} "
+            f"audio_encoder_type={meta['audio_encoder_type']} "
+            f"fusion_type={meta['fusion_type']} feature_dim={meta['feature_dim']} "
+            f"num_params={meta['num_params']}"
+        )
 
     def train(self, mode: bool = True):
         """始终保持 eval 态，无视调用方传入的模式。

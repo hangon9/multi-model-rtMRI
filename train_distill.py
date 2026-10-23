@@ -328,16 +328,15 @@ def main() -> None:
         train_loader = create_dataloader(train_df, config, train=True)
         val_loader = create_dataloader(val_df, config, train=False)
 
-        # 每折一个教师：第 j 折学生只用第 j 折教师，避免验证 subject 泄露
+        # 每折一个教师：第 j 折学生只用第 j 折教师，避免验证 subject 泄露。
+        # 构造时 MultiDistillTeacher._log_teacher_meta 会打印本折教师的路径/来源/结构，
+        # 核对 path_source=fold_file 即可确认没有回退到全局 ckpt
         teacher = MultiDistillTeacher(
             teacher_template,
             fold_id,
             amp=distill_cfg.get("teacher_amp", False),
             logger=logger,
         ).to(device)
-        logger.info(
-            f"[distill] fold {fold_id}: path_source={teacher.meta['path_source']}"
-        )
 
         model = ImageMultiheadClassifier(**model_params).to(device)
 

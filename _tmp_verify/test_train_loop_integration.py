@@ -282,6 +282,16 @@ def test_main_runs_end_to_end_and_saves_kd_checkpoint():
         assert effective["data"]["window_frames"] == TEACHER_WINDOW
         assert effective["model"]["image_encoder"]["img_size"] == 32
 
+        # ── training.log：每折一行教师身份 + 一行教师结构（_log_teacher_meta） ──
+        log_text = (run_dir / "training.log").read_text(encoding="utf-8")
+        identity_lines = [ln for ln in log_text.splitlines() if "[distill] 教师:" in ln]
+        structure_lines = [ln for ln in log_text.splitlines() if "[distill] 教师结构:" in ln]
+        assert len(identity_lines) == 1, identity_lines
+        assert len(structure_lines) == 1, structure_lines
+        assert "path_source=fold_file" in identity_lines[0], identity_lines[0]
+        assert "requested_fold=1" in identity_lines[0], identity_lines[0]
+        assert "fusion_type=concat" in structure_lines[0], structure_lines[0]
+
         # ── metrics.jsonl：训练行必须带蒸馏分项，验证行带一致率 ──
         records = [
             json.loads(line)
