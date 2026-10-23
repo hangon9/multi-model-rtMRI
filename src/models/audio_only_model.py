@@ -89,12 +89,18 @@ class AudioMultiHeadClassifier(nn.Module):
         try:
             with torch.no_grad():
                 device = next(self.backbone.parameters()).device
-                dummy = torch.zeros(1, num_samples, device=device)
-                hidden = self.backbone(dummy)
+                dummy = torch.zeros(1, num_samples, device=device)  # [1, L] 单条波形
+                hidden = self.backbone(dummy)  # [1, T_audio, D]
         finally:
             self.backbone.train(was_training)
 
-        return hidden.shape[1]
+        return hidden.shape[1]  # 返回 backbone 输出的序列长度 T_audio
+
+    def _to_padding_mask(self, attention_mask: torch.Tensor | None) -> torch.Tensor | None:
+        """将 1=有效 的 attention_mask 转为 conformer/中心池化使用的 padding_mask(True=padding)。"""
+        if attention_mask is None:
+            return None
+        return ~attention_mask.to(dtype=torch.bool)
 
     def forward(
         self,
@@ -102,15 +108,16 @@ class AudioMultiHeadClassifier(nn.Module):
         attention_mask: torch.Tensor | None = None,
         classification_task=None,
     ) -> dict[str, object]:
-        hidden = self.backbone(audio, attention_mask=attention_mask)
+        hidden = self.backbone(audio, attention_mask=attention_mask)  # [B, T_audio, D]
+        padding_mask = self._to_padding_mask(attention_mask)  # [B, T_audio] 布尔(True=padding)
 
         if self.encoder_type == "conformer":
-            x = self.norm(hidden)
-            x = self.encoder(x, padding_mask=attention_mask)
-            x = self.norm2(x)
-            pooled, attn_weights = self.pooling(x, padding_mask=attention_mask)
+            x = self.norm(hidden)  # [B, T_audio, D]
+            x = self.encoder(x, padding_mask=padding_mask)  # conformer 输出 [B, T_audio, D]
+            x = self.norm2(x)  # [B, T_audio, D]
+            pooled, attn_weights = self.pooling(x, padding_mask=padding_mask)  # 中心偏置注意力池化 -> [B, D] + 注意力权重
         else:
-            pooled, attn_weights = self.pooling(hidden)
+            pooled, attn_weights = self.pooling(hidden, attention_mask=attention_mask)  # 注意力池化 -> [B, D] + 注意力权重
 
         active_classification_task = (
             self.classification_task
@@ -119,7 +126,7 @@ class AudioMultiHeadClassifier(nn.Module):
         )
         logits = self.classifier(
             pooled, classification_task=active_classification_task
-        )
+        )  # 多任务: dict[头名, [B, C_i]]；单任务: [B, C]
 
         return {
             "logits": logits,

@@ -12,25 +12,32 @@ Two multimodal designs coexist:
 - Using simplified Chinese for conversation and comments.
 - Do not run whole train and interference pipelines on this machine. If needed, tell the user to run on HPC. This machine is for code development and small-scale testing only.
 - The configs and checkpoints are unreliable and didn't use or generate by real experiments, do not use them for resoning and evaluation.
+
 ## Quick start
 
 - **Environment**: conda env `rtmri` (activated in terminal). Core deps: `torch==2.5.1+cu121`, `torchaudio`, `torchvision`, `transformers`, `monai`, `scikit-learn`, `PyYAML`, `matplotlib`, `pandas`.
+*use 'conda activate rtmri' before running python scripts in this project*
 - **Run all commands from the repo root** (`f:\schoolworks\FAU\ss26\mt\multi-model-rtMRI`) — code uses relative paths like `data/`, `checkpoints/`, `logs/`.
 - Train image baseline: `python train_img_baseline.py --config configs/img_baseline_config.yaml`
 - Train audio baseline: `python train_wav_baseline.py --config configs/wav_baseline_config.yaml`
-- Train contrastive model: `python train_contrast.py --config configs/contrast_post_temporal.yaml` (teacher defaults to `hpc/audio_only_best_model.pt`; set `model.audio_branch.checkpoint` to `null` to fall back to the yaml structure + HF-pretrained backbone)
+- Train contrastive model: `python train_contrast.py --config configs/contrast_baseline_config.yaml`(teacher defaults to `hpc/audio_only_best_model.pt`; set `model.audio_branch.checkpoint` to `null` to fall back to the yaml structure + HF-pretrained backbone)
+- Train multimodal fusion: `python train_multimodal_fusion.py --config configs/multimodal_fusion_concat.yaml` (`fusion_type` ∈ concat | gated | cross_attention | mbt)
+- Train distillation (fusion teacher → img student): `python train_distill.py --config configs/distill_img_ResNet50_logit.yaml`（必须先在 `distill.teacher_ckpt` 填教师 ckpt 目录）
 - Evaluate: `python -m src.eval.evaluate --checkpoint checkpoints/best_model.pt --log-dir logs/<experiment>_<YYYYMMDD_HHMMSS>`
   - `--eval-folds`: compare per-fold checkpoints (`checkpoints/best_model_fold_{1..5}.pt`).
+  - `--eval-folds` 只对比 `data.train_fold` 中列出的折（未列出时对比全部已发现折），避免历史遗留折 checkpoint 干扰。
   - `--skip-inference`: reuse cached `raw/results.pkl` instead of re-running inference.
   - All three test modes (`unseen_speaker`/`unseen_task`/`unseen_both`) run automatically.
 
-## Architecture overview — three pipelines
+## Architecture overview — five pipelines
 
-All three training pipelines share the same data layer, gated heads, loss factory, and eval harness:
+All five training pipelines share the same data layer, gated heads, loss factory, and eval harness:
 
 1. **Img-only pipeline** (`train_img_baseline.py`): MRI frame → ViT (`vit`/`ViT-Base`/`ResNet50`) → optional Conformer temporal encoder (multi-frame, center readout) → gated 4-head classifier. See `src/models/img_encoder.py`, `src/models/img_only_model.py`.
 2. **Audio-only pipeline** (`train_wav_baseline.py`): frozen HF `Wav2Vec2`/`HuBERT`/`XLSR` → AttentionPooling or Conformer → gated classifier. See `src/models/audio_ssl_encoder.py`, `src/models/audio_only_model.py`.
 3. **Contrastive pipeline** (`train_contrast.py`): `ContrastImageBackbone` (own implementation in `src/models/contrastive_model.py`, layer order identical to `ImageMultiheadClassifier`) + frozen audio teacher `ContrastAudioTeacher` → two `ProjectionHead`s (`contrast.visual_proj` / `contrast.audio_proj`) → InfoNCE/cosine alignment loss added to the gated 4-head classification loss. The teacher comes from a wav-baseline checkpoint (`model.audio_branch.checkpoint`, supports a `{fold}` placeholder); without one it falls back to the yaml-config structure with HF-pretrained backbone weights. Audio is a training-time teacher only, **inference uses only the image backbone** (`inference_only=True` skips the teacher entirely). `model.contrast.enabled: false` degenerates to the image-only baseline (`image_branch.*` loads into `ImageMultiheadClassifier` verbatim). `src/models/contrastive_model.py` deliberately does not import `multimodal_fusion.py`. See `src/losses/contrast_losses.py`.
+4. **Multimodal fusion pipeline** (`train_multimodal_fusion.py`): `ImageBranch` + `AudioBranch` → fusion module → gated 4-head classifier. `model.fusion.fusion_type` ∈ {concat, gated, cross_attention, mbt}. **Unlike contrast, both image and audio are used at inference.** See `src/models/multimodal_fusion.py`, `src/models/fusion_blocks.py`.
+5. **Distillation pipeline** (`train_distill.py`): frozen fusion teacher (**per-fold** `best_model_fold_{n}.pt`, same fold as the student) → img-only student, gated 4-head classifier. `distill.mode` ∈ {`logit`, `logit_feat`}; `distill.teacher_ckpt` may be a directory / `best_model.pt` / a `{fold}` template. Data fields `window_frames`/`fps`/`audio_sample_rate`/`img_size` are **inherited from the teacher ckpt config**; the CV pool fields (`unseen_*`, `n_splits`, `dataset`, `classification_task`) are asserted equal. Inference needs the image branch only. See `src/models/multi_distill_teacher.py`, `src/losses/distill_loss.py`.
 
 Shared across all pipelines:
 
@@ -43,10 +50,15 @@ Shared across all pipelines:
 - `data.classification_task`: `""` = multi-task (all 4 heads); otherwise one of `manner|place|voicing|vowel_backness`.
 - `data.window_frames`: `1` = single-frame; `5` = multi-frame (image + audio share the window; must be odd).
 - `data.phonemic_table` must point to `data/Phonemic_Table.xlsx`.
-- Image model: `model.image_encoder.model_name` ∈ {vit, ViT-Base, ResNet50}; `model.temporal.temporal_type` ∈ {none, conformer}.
-- Audio model: `model.backbone.model_name` (HF id); `model.encoder.encoder_type` ∈ {attention, conformer}.
-- LR groups: img → `lr_encoder`/`lr_temporal`/`lr_classifier`; wav → `lr_backbone`/`lr_encoder`/`lr_classifier`/`lr_global`.
-- Loss: `loss.lambda_*` per task; `loss.contrast_loss_name` ∈ {null, cosine, info_nce/infonce/nt_xent}; `loss.contrast_loss_kwargs` (`temperature`, `mask_same_label`); `loss.use_class_weights: true`.
+- **Prefix convention (img/wav/fusion，代码侧已统一)**: 这三个 pipeline 的模型键均使用 `image_*` / `audio_*` 前缀；仓库里的 YAML 尚未同步（仍是旧键），**以代码为准**。
+- Image model: `model.image_encoder.model_name` ∈ {vit, ViT-Base, ResNet50}; `model.image_temporal.temporal_type` ∈ {none, conformer}.
+- Audio model: `model.audio_backbone.model_name` (HF id); `model.audio_encoder.encoder_type` ∈ {attention, conformer}.
+- **Fusion model** (`configs/multimodal_fusion_*.yaml`): `model.image_encoder` + `model.image_temporal` + `model.audio_backbone` + `model.audio_encoder` + `model.fusion` + `model.classifier`. `model.fusion.fusion_type` ∈ {concat, gated, cross_attention, mbt}:
+  - `concat`/`gated` (`FusionModule`): pooled-feature fusion; `gated` = dual per-dim sigmoid gates → output `fusion_dim`, `concat` output `2*fusion_dim`.
+  - `cross_attention` (`CrossAttentionFusion`): image seq = query, audio seq = key/value (seq-level, `T_img != T_audio` OK); keys `cross_attention_layers`, `num_heads`, `temporal_aggregation` ∈ {center, attn_pool, conformer} (P2.5, default `center`).
+  - `mbt` (`MBTFusion`): shared bottleneck tokens exchange info; keys `mbt_layers`, `num_bottlenecks`, `mbt_readout` ∈ {center_bottleneck, bottleneck_only, center_only}, `bottleneck_update` ∈ {image_first, audio_first, symmetric}. MulT is **not** implemented.
+- LR groups: img → `lr_image_encoder`/`lr_image_temporal`/`lr_classifier`; wav → `lr_backbone`/`lr_encoder`/`lr_classifier`/`lr_global`; fusion → `lr_image_encoder`/`lr_image_temporal`/`lr_audio_backbone`/`lr_audio_encoder`/`lr_fusion`/`lr_classifier`.
+- Loss: `loss.lambda_*` per task; `loss.contrast_loss_name` ∈ {null, cosine, infonce}; `loss.use_class_weights: true`. Fusion defaults to contrast off (`lambda_contrast: 0.0`, `contrast_loss_name: null`).
 - Contrast model (`configs/contrast_post_temporal.yaml`): `model.contrast.{enabled,position,proj_dim,proj_hidden,dropout}`; `model.audio_branch.{checkpoint,freeze,cfg_from_checkpoint}` (`checkpoint` supports a `{fold}` placeholder or `null` for the pretrained-only fallback, `freeze` ∈ {all, backbone, none}); `train.{lr_contrast,select_metric,drop_last}`; `model.contrast.enabled` and `loss.contrast_loss_name` must agree or startup raises. `configs/contrast_baseline_config.yaml` documents the removed token-projection (65→31) variant and no longer matches the code.
 
 ## Conventions & pitfalls
@@ -56,6 +68,8 @@ Shared across all pipelines:
 - Comments and figures must be in **Chinese** (user preference). Plotting relevant could be in English.
 - Labels are multi-hot rows in the DataFrame (Silence, Stop, …, Voiceless); the dataset derives per-head targets with gating — silence/vowel → `-100` (ignored) for place/voicing; vowel_backness is multi-hot BCE on vowel frames only.
 - Class weights are computed at train time from the training fold (Silence ≈ 29% of data — severe imbalance).
+- **Fusion ≠ contrast**: `AudioVisionFusionModel` requires **both** `image` and `audio` at inference (contrast is image-only). Eval family = `multimodal_fusion` — `src/eval/inference.py` maps concat/gated/cross_attn explicitly in `_EXPERIMENT_TO_FAMILY`; `mbt` is caught by the `"fusion"/"multimodal"` soft match.
+- Fusion modules carry a class attribute `requires_sequence_input`: `FusionModule` (concat/gated) = `False` (pooled input); `CrossAttentionFusion`/`MBTFusion` = `True` (sequence input) — controls whether `AudioVisionFusionModel.forward` feeds pooled or seq-level features.
 - ViT input: grayscale image duplicated to 3 channels.
 - Audio window is centered on the frame timestamp (~66.67 ms at 15 fps / 16 kHz), not from 0.
 - All-ignored validation batch → NaN: the loss factory uses `reduction="sum"` + manual normalization to avoid it.
@@ -74,5 +88,7 @@ Shared across all pipelines:
 | `docs/multiframe_temporal_plan.md` | Multi-frame image temporal encoder (implemented 2026-08-04). |
 | `docs/plans/contrast_update_plan.md` | Contrast model redesign (v2): audio-teacher loading/freezing, InfoNCE with false-negative masking, per-head param groups, eval/inference changes. |
 | `docs/test_plan.md` | Shape/overfit test plan. |
-| `docs/problems0613.md` | Historical bug-diagnosis report (mostly fixed in current scripts). |
-| `docs/meeting0601_note.txt` | Meeting notes / roadmap context. |
+| `docs/plans/distillation_plan.md` | Fusion → img distillation design: per-fold teacher (`src/models/multi_distill_teacher.py`), per-head KD + feature alignment (`src/losses/distill_loss.py`), `train_distill.py`, config inheritance/alignment rules, experiment matrix, test list. |
+
+## Results clearfication
+Every result in the 'hpc' folder are the results of the experiments conducted on the HPC cluster. Other results outside the 'hpc' folder are the results of the experiments conducted on the local machine. DO NOT cofuse them.

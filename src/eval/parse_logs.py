@@ -76,6 +76,21 @@ def _parse_metrics_jsonl(metrics_path: Path) -> pd.DataFrame:
                 "val_acc_voicing":   float("nan"),
                 "val_acc_vowel_backness":       float("nan"),
                 "val_acc_vowel_backness_nonsil": float("nan"),
+                "val_f1_mean":    float("nan"),
+                "val_f1_manner":  float("nan"),
+                "val_f1_place":   float("nan"),
+                "val_f1_voicing": float("nan"),
+                "val_f1_vowel_backness": float("nan"),
+                "val_image_only_f1_mean":    float("nan"),
+                "val_image_only_f1_manner":  float("nan"),
+                "val_image_only_f1_place":   float("nan"),
+                "val_image_only_f1_voicing": float("nan"),
+                "val_image_only_f1_vowel_backness": float("nan"),
+                "val_audio_only_f1_mean":    float("nan"),
+                "val_audio_only_f1_manner":  float("nan"),
+                "val_audio_only_f1_place":   float("nan"),
+                "val_audio_only_f1_voicing": float("nan"),
+                "val_audio_only_f1_vowel_backness": float("nan"),
                 "train_lr":          float("nan"),
                 "val_lr":            float("nan"),
                 "timestamp_train":   None,
@@ -105,6 +120,9 @@ def _parse_metrics_jsonl(metrics_path: Path) -> pd.DataFrame:
                 "timestamp_train":   ts,
             })
         elif phase == "validation":
+            f1 = rec.get("f1") or {}
+            image_only_f1 = rec.get("image_only_f1") or {}
+            audio_only_f1 = rec.get("audio_only_f1") or {}
             rows[key].update({
                 "val_loss":            loss,
                 "val_cls_loss":        cls_loss,
@@ -115,6 +133,21 @@ def _parse_metrics_jsonl(metrics_path: Path) -> pd.DataFrame:
                 "val_acc_voicing": float(acc.get("voicing", float("nan"))),
                 "val_acc_vowel_backness":       float(acc.get("vowel_backness",        float("nan"))),
                 "val_acc_vowel_backness_nonsil": float(acc.get("vowel_backness_nonsil", float("nan"))),
+                "val_f1_mean":    float(f1.get("mean",    float("nan"))),
+                "val_f1_manner":  float(f1.get("manner",  float("nan"))),
+                "val_f1_place":   float(f1.get("place",   float("nan"))),
+                "val_f1_voicing": float(f1.get("voicing", float("nan"))),
+                "val_f1_vowel_backness": float(f1.get("vowel_backness", float("nan"))),
+                "val_image_only_f1_mean":    float(image_only_f1.get("mean",    float("nan"))),
+                "val_image_only_f1_manner":  float(image_only_f1.get("manner",  float("nan"))),
+                "val_image_only_f1_place":   float(image_only_f1.get("place",   float("nan"))),
+                "val_image_only_f1_voicing": float(image_only_f1.get("voicing", float("nan"))),
+                "val_image_only_f1_vowel_backness": float(image_only_f1.get("vowel_backness", float("nan"))),
+                "val_audio_only_f1_mean":    float(audio_only_f1.get("mean",    float("nan"))),
+                "val_audio_only_f1_manner":  float(audio_only_f1.get("manner",  float("nan"))),
+                "val_audio_only_f1_place":   float(audio_only_f1.get("place",   float("nan"))),
+                "val_audio_only_f1_voicing": float(audio_only_f1.get("voicing", float("nan"))),
+                "val_audio_only_f1_vowel_backness": float(audio_only_f1.get("vowel_backness", float("nan"))),
                 "val_lr":          lr,
                 "timestamp_val":   ts,
             })
