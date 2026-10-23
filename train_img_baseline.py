@@ -238,7 +238,7 @@ def build_optimizer(model, config, logger=None):
     """
     train_cfg = config.get("train", {})
     encoder_lr = float(train_cfg.get("lr_image_encoder", 1e-4))
-    temporal_lr = float(train_cfg.get("lr_image_temporal", encoder_lr))
+    temporal_lr = float(train_cfg.get("lr_image_temporal", 1e-4))
     classifier_lr = float(train_cfg.get("lr_classifier", 1e-4))
     weight_decay = float(train_cfg.get("weight_decay", 0.0))
 

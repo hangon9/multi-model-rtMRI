@@ -21,6 +21,7 @@ def _parse_metrics_jsonl(metrics_path: Path) -> pd.DataFrame:
             "phase": "training" | "validation",
             "loss": float,
             "cls_loss": float,
+            "contrast_loss": float,  # ← optional: only contrast runs write it
             "acc": {"mean": float, "manner": float, "place": float, "voicing": float},
             "fold_id": int,          # ← note: fold_id, not fold
             "classification_task": str,
@@ -31,6 +32,7 @@ def _parse_metrics_jsonl(metrics_path: Path) -> pd.DataFrame:
         fold, epoch,
         train_loss, train_cls_loss, train_contrast_loss,
         val_loss,   val_cls_loss,   val_contrast_loss,
+        # contrast columns stay NaN for runs that log no contrast_loss
         # bonus columns present only when parsed from metrics.jsonl:
         train_acc_mean, train_acc_manner, train_acc_place, train_acc_voicing,
         val_acc_mean,   val_acc_manner,   val_acc_place,   val_acc_voicing,
@@ -99,6 +101,9 @@ def _parse_metrics_jsonl(metrics_path: Path) -> pd.DataFrame:
 
         loss     = float(rec.get("loss",     float("nan")))
         cls_loss = float(rec.get("cls_loss", float("nan")))
+        # 对比分量：只有带对比损失的实验才会写这一项，其余实验保持 NaN，
+        # 让 visualize 能区分「没有对比分量」与「对比损失为 0」
+        contrast_loss = float(rec.get("contrast_loss", float("nan")))
         acc      = rec.get("acc") or {}
         lr       = float(rec.get("lr",       float("nan")))
         ts       = rec.get("timestamp")
@@ -107,9 +112,7 @@ def _parse_metrics_jsonl(metrics_path: Path) -> pd.DataFrame:
             rows[key].update({
                 "train_loss":          loss,
                 "train_cls_loss":      cls_loss,
-                # contrast_loss not logged by wav baseline → keep NaN so visualize
-                # can still tell there is no contrastive component
-                "train_contrast_loss": float("nan"),
+                "train_contrast_loss": contrast_loss,
                 "train_acc_mean":    float(acc.get("mean",    float("nan"))),
                 "train_acc_manner":  float(acc.get("manner",  float("nan"))),
                 "train_acc_place":   float(acc.get("place",   float("nan"))),
@@ -126,7 +129,7 @@ def _parse_metrics_jsonl(metrics_path: Path) -> pd.DataFrame:
             rows[key].update({
                 "val_loss":            loss,
                 "val_cls_loss":        cls_loss,
-                "val_contrast_loss":   float("nan"),
+                "val_contrast_loss":   contrast_loss,
                 "val_acc_mean":    float(acc.get("mean",    float("nan"))),
                 "val_acc_manner":  float(acc.get("manner",  float("nan"))),
                 "val_acc_place":   float(acc.get("place",   float("nan"))),
