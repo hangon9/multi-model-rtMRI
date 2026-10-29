@@ -1,3 +1,5 @@
+import contextlib
+
 import torch
 import torch.nn as nn
 
@@ -8,6 +10,38 @@ from src.models.conformer_encoder import ConformerEncoder
 from src.models.fusion_blocks import CrossAttentionFusion, MBTFusion
 from src.models.img_encoder import build_image_encoder
 from src.models.img_only_model import ImageTemporalEncoder
+
+
+@contextlib.contextmanager
+def temporary_eval(*modules: nn.Module):
+    """在上下文内把若干模块临时切到 ``eval()``，退出时按各自原状态恢复。
+
+    诊断类前向（例如 ``estimate_unimodal_logits``）需要在 ``train()`` 的训练循环里
+    复现"确定性"的融合+分类结果：否则 ``nn.Dropout`` 会给两次估计施加**各自独立**的
+    随机掩码，让诊断量凭空带上噪声。
+
+    Args:
+        *modules: 需要临时切到 eval 的模块；``None`` 会被忽略。
+
+    Yields:
+        None。
+
+    Note:
+        只针对内部含 Dropout 的子模块使用。恢复时用 ``module.train(was_training)`` 保留
+        每个模块自己的原状态，因此即使外层本来就在 eval（例如验证期调用）也不会被误改成
+        train。
+    """
+    restore = []
+    try:
+        for module in modules:
+            if module is None:
+                continue
+            restore.append((module, module.training))
+            module.eval()
+        yield
+    finally:
+        for module, was_training in restore:
+            module.train(was_training)
 
 
 # ---------------------------------------------------------------------------
@@ -474,6 +508,83 @@ class AudioVisionFusionModel(nn.Module):
             seq = seq.mean(dim=0, keepdim=True).expand_as(seq).contiguous()
         return pooled, seq
 
+    @torch.no_grad()
+    def estimate_unimodal_logits(
+        self,
+        pooled_img: torch.Tensor,
+        pooled_audio: torch.Tensor,
+        img_seq: torch.Tensor | None = None,
+        audio_seq: torch.Tensor | None = None,
+        audio_padding_mask: torch.Tensor | None = None,
+        classification_task: str | None = None,
+    ) -> tuple[dict | torch.Tensor, dict | torch.Tensor]:
+        """用零向量替换另一侧模态，复用当前 fusion+classifier 估计"单模态" logits。
+
+        服务于 OGM-GE 的模态贡献差异（discrepancy ratio）估计：把某一侧模态特征置零后
+        重新跑一遍真实的 fusion + classifier，得到"假如只有图像 / 只有音频"时的 logits。
+        因为分类头在融合之后还有 LayerNorm→Linear→GELU→Linear，无法像原始论文那样直接
+        切分类器权重矩阵，所以统一走这条与 fusion_type 无关的路径。
+
+        该方法是**纯诊断用途**：整段在 ``torch.no_grad()`` 下运行，只由训练脚本按需调用，
+        ``forward()`` 与 eval/推理路径完全不受影响。
+
+        融合与分类头在估计期间会临时切到 ``eval()``（见 :func:`temporary_eval`）：
+        调用方通常在 ``train()`` 状态下使用本方法，若不关掉 ``nn.Dropout``，image-only 与
+        audio-only 两次估计会各自吃到独立的随机掩码，"单模态基线"本身和二者比值都会带噪。
+
+        Args:
+            pooled_img: 图像 pooled 表征，``[B, D_img]``。
+            pooled_audio: 音频 pooled 表征，``[B, D_audio]``。
+            img_seq: 图像序列 ``[B, T_img, D_img]``；requires_sequence_input 的融合必须提供。
+            audio_seq: 音频序列 ``[B, T_audio, D_audio]``；同上。
+            audio_padding_mask: 音频 padding 掩码（True=padding），仅序列级融合使用；
+                不传时按"全部有效"处理，只影响诊断数值的精确度。
+            classification_task: 覆盖实例默认任务，None 表示使用构造时的取值。
+
+        Returns:
+            ``(logits_image_only, logits_audio_only)``，格式与 ``self.classifier`` 的正常输出
+            一致：多任务时是含 manner/place/voicing/vowel_backness 的字典，单任务时是张量。
+
+        Raises:
+            ValueError: 序列级融合缺少 ``img_seq`` / ``audio_seq`` 时抛出。
+        """
+        if getattr(self.fusion, "requires_sequence_input", False):
+            if img_seq is None or audio_seq is None:
+                raise ValueError(
+                    "requires_sequence_input 的融合模块（cross_attention/mbt）必须提供 "
+                    "img_seq 与 audio_seq 才能估计单模态 logits。"
+                )
+
+        active_classification_task = (
+            self.classification_task
+            if classification_task is None
+            else classification_task
+        )
+
+        with temporary_eval(self.fusion, self.classifier):
+            if getattr(self.fusion, "requires_sequence_input", False):
+                fused_img_only = self.fusion(
+                    img_seq,
+                    torch.zeros_like(audio_seq),
+                    audio_padding_mask=audio_padding_mask,
+                )
+                fused_audio_only = self.fusion(
+                    torch.zeros_like(img_seq),
+                    audio_seq,
+                    audio_padding_mask=audio_padding_mask,
+                )
+            else:
+                fused_img_only = self.fusion(pooled_img, torch.zeros_like(pooled_audio))
+                fused_audio_only = self.fusion(torch.zeros_like(pooled_img), pooled_audio)
+
+            logits_img_only = self.classifier(
+                fused_img_only, classification_task=active_classification_task
+            )
+            logits_audio_only = self.classifier(
+                fused_audio_only, classification_task=active_classification_task
+            )
+        return logits_img_only, logits_audio_only
+
     def forward(
         self,
         image: torch.Tensor,
@@ -490,6 +601,7 @@ class AudioVisionFusionModel(nn.Module):
         if force_drop_modality not in (None, "audio", "image"):
             raise ValueError(f"Invalid force_drop_modality: {force_drop_modality!r}")
 
+        audio_padding_mask = None  # 仅序列级融合会产生该掩码，供 OGM-GE 复用
         if getattr(self.fusion, "requires_sequence_input", False):
             img_seq = self.image_branch.encode_sequence(image)  # [B, T_img, D_img]
             audio_seq, audio_padding_mask = self.audio_branch.encode_sequence(
@@ -548,4 +660,7 @@ class AudioVisionFusionModel(nn.Module):
             # 新增：训练态为 [B] 布尔张量（哪些样本被丢弃音频），eval/未启用时为 None，
             # 供训练脚本统计实际丢弃比例；推理路径(_extract_logits)不读取该键。
             "audio_drop_mask": audio_drop_mask,
+            # 新增：序列级融合（cross_attention/mbt）下的音频 padding 掩码（True=padding），
+            # 其余融合方式为 None；供 OGM-GE 估计单模态 logits 时复用，推理路径不读取。
+            "audio_padding_mask": audio_padding_mask,
         }

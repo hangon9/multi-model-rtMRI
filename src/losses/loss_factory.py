@@ -68,6 +68,81 @@ def _build_group_ids(labels) -> torch.Tensor | None:
     return group_ids
 
 
+def compute_modality_confidence(
+    logits_by_task: dict[str, torch.Tensor],
+    labels_by_task: dict[str, torch.Tensor],
+    active_tasks: tuple[str, ...] = (
+        "manner",
+        "place",
+        "voicing",
+        "vowel_backness",
+    ),
+    ce_ignore_index: int = -100,
+    vowel_manner_id: int = 5,
+) -> torch.Tensor | None:
+    """估计"只用单个模态"时模型对真实标签的平均置信度（供 OGM-GE 计算）。
+
+    对每个任务单独求平均置信度，再对任务取简单平均，得到这一步该模态的总体分数
+    ``s``；训练脚本用两个模态的 ``s`` 相除得到 discrepancy ratio ``rho``。这是一个
+    已知的简化：四个头各自的失衡程度被揉成一个标量，需要按头分别调制时要另行升级。
+
+    各任务的口径：
+    - manner / place / voicing（多分类 CE）：``softmax`` 在真实标签位置的概率，
+      按 ``ce_ignore_index`` 排除无效样本（例如元音帧上的 place/voicing）。
+    - vowel_backness（多标签 BCE）：每个二元位置上"赋给正确标签的概率"的平均值
+      ``mean_k[y_k*p_k + (1-y_k)*(1-p_k)]``，只在元音帧上统计。
+
+    Args:
+        logits_by_task: 任务名 → logits；可直接传 ``ClassificationHead`` 的多任务输出
+            （含 ``all_logits`` 键时自动解包）。
+        labels_by_task: 任务名 → 标签；``vowel_backness`` 的元音帧掩码优先取同字典里的
+            ``manner``（``== vowel_manner_id``），与 :meth:`BuildLoss._masked_vowel_backness_bce`
+            的判定保持一致，取不到时退化为"全部样本"。
+        active_tasks: 参与平均的任务名，通常多任务是四个头、单任务只传一个。
+        ce_ignore_index: CE 头的 ignore 取值。
+        vowel_manner_id: manner 标签里代表元音的类别 id。
+
+    Returns:
+        标量 Tensor（已 detach），或 ``None`` —— 所有任务在 batch 内都没有有效样本时。
+    """
+    if "all_logits" in logits_by_task:
+        logits_by_task = logits_by_task["all_logits"]
+
+    task_scores = []
+    for task in active_tasks:
+        logits = logits_by_task.get(task)
+        labels = labels_by_task.get(task)
+        if logits is None or labels is None:
+            continue
+
+        if task == "vowel_backness":
+            manner_labels = labels_by_task.get("manner")
+            if manner_labels is not None:
+                valid = manner_labels == vowel_manner_id
+            else:
+                valid = torch.ones(
+                    labels.shape[0], dtype=torch.bool, device=labels.device
+                )
+            if not bool(valid.any()):
+                continue
+            probs = torch.sigmoid(logits[valid].float())
+            targets = labels[valid].float()
+            score = (targets * probs + (1.0 - targets) * (1.0 - probs)).mean()
+        else:
+            valid = labels != ce_ignore_index
+            if not bool(valid.any()):
+                continue
+            probs = torch.softmax(logits[valid].float(), dim=-1)
+            score = probs.gather(-1, labels[valid].long().unsqueeze(-1)).mean()
+
+        if torch.isfinite(score):
+            task_scores.append(score.detach())
+
+    if not task_scores:
+        return None
+    return torch.stack(task_scores).mean()
+
+
 class BuildLoss(nn.Module):
     """任务损失 + 对比损失的统一工厂，img / wav / fusion / contrast 四个脚本共用。
 
