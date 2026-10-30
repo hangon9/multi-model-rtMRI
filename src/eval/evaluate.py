@@ -45,16 +45,18 @@ from src.eval.inference import MODEL_FAMILY_ALIASES, TASKS, resolve_model_family
 from src.eval.metrics import compute_metrics
 from src.eval.parse_logs import parse_training_log
 from src.eval.visualize import (
+    LOSS_COMPONENTS_BY_FAMILY,
     ensure_dir,
     plot_fold_loss,
     plot_fold_loss_components,
+    plot_fold_head_loss,
     plot_all_folds_val_loss,
     plot_fold_f1,
-    plot_all_folds_f1,
     plot_task_prf1,
     plot_task_confusion,
     plot_task_multilabel_confusion,
     plot_task_prf1_fold_comparison,
+    resolve_plot_family,
 )
 
 
@@ -572,7 +574,34 @@ def _run_fold_comparison(
 # Visualisation helpers
 # ---------------------------------------------------------------------------
 
-def _generate_loss_plots(log_dir: str, checkpoint_path: str, figures_dir: Path) -> None:
+def _generate_loss_plots(
+    log_dir: str,
+    checkpoint_path: str,
+    figures_dir: Path,
+    model_family_hint: Optional[str] = None,
+) -> None:
+    """根据训练日志与 ckpt 生成逐折 loss 曲线，图集按流水线类型分化。
+
+    图集规则（详见 ``docs/plans/eval_loss_plots_by_pipeline.md``）：
+
+    - 所有流水线：``all_folds_val_loss.png`` + ``fold{N}_head_loss.png``；
+    - 除 kd 外：再加 ``fold{N}_loss.png``（train/val 总损失）；
+    - contrast：再加 ``fold{N}_loss_components.png``（CLS / Contrast）；
+    - kd：再加 ``fold{N}_loss_components.png``（CLS / KD / KD-Feat / Total，
+      前三格里的蒸馏项只有 train 侧）；kd **不出** ``fold{N}_loss.png``，因为它的
+      train loss 含蒸馏而 val loss 不含，两者不同口径；
+    - fusion：再加 ``fold{N}_f1.png``（``all_folds_f1.png`` 已取消）。
+
+    Args:
+        log_dir: run 目录（含 ``metrics.jsonl`` 或 ``training.log``）。
+        checkpoint_path: 全局最优 ckpt 路径；其所在目录用于逐折元信息与流水线判定。
+        figures_dir: 图片输出目录（已存在）。
+        model_family_hint: CLI ``--model`` 翻译后的内部模型族标签，作为流水线判定的
+            次级依据；``None`` 表示完全依赖 ckpt config 与日志列。
+
+    Returns:
+        None。副作用：写 PNG 图与 ``raw/loss.csv``，并向 stdout 打印进度/告警。
+    """
     from src.eval.visualize import load_checkpoint_meta
 
     print(f"[evaluate] Parsing training log from {log_dir} ...")
@@ -584,25 +613,100 @@ def _generate_loss_plots(log_dir: str, checkpoint_path: str, figures_dir: Path) 
     print(f"[evaluate] Saved parsed log → {loss_csv}")
 
     ckpt_path = Path(checkpoint_path)
+    family = resolve_plot_family(ckpt_path, loss_df, hint=model_family_hint)
+    _warn_missing_plot_columns(family, loss_df)
+
     histories: Dict[int, Any] = {}
+    components = LOSS_COMPONENTS_BY_FAMILY.get(family)
 
     for fold in sorted(loss_df["fold"].unique()):
         df_fold = loss_df[loss_df["fold"] == fold].copy().reset_index(drop=True)
         histories[fold] = df_fold
 
         meta = load_checkpoint_meta(ckpt_path.parent, fold=fold)
-        plot_fold_loss(df_fold, fold, meta, figures_dir)
-        plot_fold_loss_components(df_fold, fold, figures_dir)
-        plot_fold_f1(df_fold, fold, figures_dir)
-        print(f"[evaluate] Saved loss/F1 plots for fold {fold}")
+        # kd 的 train/val 口径不同（训练含蒸馏、验证不含），因此不出 total loss 单折图
+        if family != "kd":
+            plot_fold_loss(df_fold, fold, meta, figures_dir)
+        plot_fold_head_loss(df_fold, fold, figures_dir)
+        if components is not None:
+            plot_fold_loss_components(df_fold, fold, figures_dir, components)
+        if family == "fusion" and _has_f1_data(df_fold):
+            plot_fold_f1(df_fold, fold, figures_dir)
+        print(f"[evaluate] Saved loss/F1 plots for fold {fold} (family={family})")
 
     if histories:
         best_meta = load_checkpoint_meta(
             ckpt_path.parent, fold=None, best_model_name=ckpt_path.name
         )
         plot_all_folds_val_loss(histories, best_meta, figures_dir)
-        plot_all_folds_f1(histories, figures_dir)
-        print("[evaluate] Saved all_folds_val_loss.png / all_folds_f1.png")
+        print("[evaluate] Saved all_folds_val_loss.png")
+
+
+def _has_f1_data(df) -> bool:
+    """判断该折的日志里是否存在可画的验证 F1（只有 fusion 会写这些列）。
+
+    Args:
+        df: 单折 DataFrame。
+
+    Returns:
+        ``val_f1_<head>`` 中任一头有非 NaN 值时返回 True；否则 False
+        （此时不生成空白 f1 图，只保留上游告警）。
+    """
+    for task in TASKS:
+        column = f"val_f1_{task}"
+        if column in df.columns and df[column].notna().any():
+            return True
+    return False
+
+
+def _warn_missing_plot_columns(family: str, loss_df) -> None:
+    """对“该流水线本应可画、但数据缺失”的字段给出 WARNING。
+
+    Args:
+        family: :func:`resolve_plot_family` 的返回值。
+        loss_df: :func:`parse_training_log` 的输出。
+
+    Returns:
+        None；只打印告警，不改变后续流程，确保缺数据时画图不中断。
+    """
+    if family == "fusion":
+        f1_col = "val_f1_manner"
+        if f1_col not in loss_df.columns or not loss_df[f1_col].notna().any():
+            print(
+                "[evaluate] WARNING: fusion run 没有验证 F1 字段，跳过 fold{N}_f1.png"
+                "（F1 只写在 metrics.jsonl 里，training.log 无此信息）"
+            )
+
+    if family in LOSS_COMPONENTS_BY_FAMILY:
+        missing = [
+            train_col
+            for _, train_col, _ in LOSS_COMPONENTS_BY_FAMILY[family]
+            if train_col not in loss_df.columns or not loss_df[train_col].notna().any()
+        ]
+        if missing:
+            print(f"[evaluate] WARNING: {family} 的 loss 分项缺失 {missing}，对应子图将标 n/a")
+
+    # 改造前的 kd run 把总损失记在 loss_total 里，loss 只是分类项；此时 Total 格与 CLS 格重合
+    if family == "kd":
+        both = loss_df[["train_loss", "train_cls_loss"]].dropna()
+        if not both.empty and (both["train_loss"] == both["train_cls_loss"]).all():
+            print(
+                "[evaluate] WARNING: kd 的 train loss 与 cls_loss 全程相等，"
+                "可能是改造前的旧 run（总损失当年记在 loss_total）；"
+                "此时 Total Loss 格与 CLS 格重合，需用新代码重训才有真实曲线"
+            )
+
+    missing_heads = [
+        task
+        for task in TASKS
+        if f"train_loss_{task}" not in loss_df.columns
+        or not loss_df[f"train_loss_{task}"].notna().any()
+    ]
+    if missing_heads:
+        print(
+            f"[evaluate] WARNING: 分类头 {missing_heads} 没有 loss 曲线，"
+            "fold{N}_head_loss.png 中对应子图将标 n/a（单任务 run 属正常）"
+        )
 
 
 def _generate_task_plots(
@@ -742,10 +846,22 @@ def _run_eval_for_mode(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    """评测入口：画 loss 图 → 三个测试集推理 → 逐任务图/指标。
+
+    流程：解析路径（``--log-dir`` 优先，其次 ``--runs-dir`` 自动挑选最新 run）→
+    按 ckpt 自动识别流水线并生成对应 loss 图集 → 对 ``unseen_speaker`` /
+    ``unseen_task`` / ``unseen_both`` 逐个推理并出 PRF1/混淆矩阵（``--skip-inference``
+    时复用缓存，``--eval-folds`` 额外做逐折对比）。
+
+    Args:
+        None；参数全部来自 CLI（见 :func:`build_parser`）。
+
+    Returns:
+        None。副作用：创建 ``<output_dir>/eval/`` 目录树并写 PNG / JSON / pickle。
+    """
     parser = build_parser()
     args = parser.parse_args()
 
-    
     print("[evaluate] Resolving paths ...")
     checkpoint_path = str(Path(args.checkpoint).resolve())
     # ── Resolve log directory ────────────────────────────────────────────────
@@ -780,23 +896,22 @@ def main() -> None:
     ensure_dir(figures_dir)
     ensure_dir(raw_dir)
 
-
+    # 在入口处就把 --model 的别名翻译成内部标签（``multi`` → ``multimodal_fusion``），
+    # 下游的缓存校验拿 meta["model_family"] 直接比字符串即可。
+    # 提前到画图之前：_generate_loss_plots 拿它作为流水线判定的次级依据。
+    model_family = resolve_model_family_override(args.model)
+    if model_family is not None:
+        print(f"[evaluate] Model family pinned via --model: {model_family}")
 
     # ── 1. Training loss plots (optional) ───────────────────────────────────
     if log_dir is not None:
-        _generate_loss_plots(log_dir, checkpoint_path, figures_dir)
+        _generate_loss_plots(log_dir, checkpoint_path, figures_dir, model_family_hint=model_family)
     else:
         print("[evaluate] No log directory provided; skipping loss curves.")
 
     # ── 2. Inference ─────────────────────────────────────────────────────────
     device = _resolve_device(args.device)
     checkpoint_dir = Path(args.checkpoint).resolve().parent
-
-    # 在入口处就把 --model 的别名翻译成内部标签（``multi`` → ``multimodal_fusion``），
-    # 下游的缓存校验拿 meta["model_family"] 直接比字符串即可。
-    model_family = resolve_model_family_override(args.model)
-    if model_family is not None:
-        print(f"[evaluate] Model family pinned via --model: {model_family}")
 
     for mode in ("unseen_speaker", "unseen_task", "unseen_both"):
         print(f"[evaluate] === Running eval_mode={mode} ===")

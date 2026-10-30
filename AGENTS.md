@@ -28,6 +28,10 @@ Two multimodal designs coexist:
   - `--eval-folds` 只对比 `data.train_fold` 中列出的折（未列出时对比全部已发现折），避免历史遗留折 checkpoint 干扰。
   - `--skip-inference`: reuse cached `raw/results.pkl` instead of re-running inference.
   - All three test modes (`unseen_speaker`/`unseen_task`/`unseen_both`) run automatically.
+  - Loss 曲线按 pipeline 自动分化（`visualize.resolve_plot_family` 读 ckpt config 判定）：所有 pipeline 出
+    `all_folds_val_loss.png` + `fold{N}_head_loss.png`；除 kd 外还出 `fold{N}_loss.png`；contrast / kd 另出
+    `fold{N}_loss_components.png`（kd 为 cls/kd/kd_feat/total 四格）；fusion 另出 `fold{N}_f1.png`
+    （`all_folds_f1.png` 已取消）。详见 `docs/plans/eval_loss_plots_by_pipeline.md`。
 
 ## Architecture overview — five pipelines
 

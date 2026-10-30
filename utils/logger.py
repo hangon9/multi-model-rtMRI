@@ -135,7 +135,8 @@ class TrainingLogger:
                 self.info(f"Fold {fold_id} - Task: {classification_task}")
             self.info(f"Epoch {epoch + 1} - {phase.upper()}")
 
-            loss_value = metrics.get("loss", metrics.get("loss_total", 0))
+            # 所有流水线都写 ``loss``（KD 里它是分类 + 蒸馏的总损失），无需其他回退键
+            loss_value = metrics.get("loss", 0)
             self.info(f"  Loss: {loss_value:.4f}")
 
             if "cls_loss" in metrics or "contrast_loss" in metrics:

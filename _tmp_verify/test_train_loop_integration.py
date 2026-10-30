@@ -283,16 +283,19 @@ def test_main_runs_end_to_end_and_saves_kd_checkpoint():
         assert effective["model"]["image_encoder"]["img_size"] == 32
 
         # ── training.log：每折一行教师身份 + 一行教师结构（_log_teacher_meta） ──
-        log_text = (run_dir / "training.log").read_text(encoding="utf-8")
-        identity_lines = [ln for ln in log_text.splitlines() if "[distill] 教师:" in ln]
-        structure_lines = [ln for ln in log_text.splitlines() if "[distill] 教师结构:" in ln]
+        # 日志在 Windows 上按系统默认编码（cp936）落盘，中文标记会变成非 UTF-8 字节；
+        # 因此用 errors="replace" 读，并改用 ASCII 片段定位（path_source= / image_model_name=），
+        # 这样同一份测试在 Windows 与 Linux 上都能跑。
+        log_text = (run_dir / "training.log").read_text(encoding="utf-8", errors="replace")
+        identity_lines = [ln for ln in log_text.splitlines() if "requested_fold=" in ln]
+        structure_lines = [ln for ln in log_text.splitlines() if "image_model_name=" in ln]
         assert len(identity_lines) == 1, identity_lines
         assert len(structure_lines) == 1, structure_lines
         assert "path_source=fold_file" in identity_lines[0], identity_lines[0]
         assert "requested_fold=1" in identity_lines[0], identity_lines[0]
         assert "fusion_type=concat" in structure_lines[0], structure_lines[0]
 
-        # ── metrics.jsonl：训练行必须带蒸馏分项，验证行带一致率 ──
+        # ── metrics.jsonl：训练行带蒸馏分项（且 loss 为分类+蒸馏的总损失），验证行带一致率 ──
         records = [
             json.loads(line)
             for line in (run_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
@@ -302,9 +305,13 @@ def test_main_runs_end_to_end_and_saves_kd_checkpoint():
         val_rows = [r for r in records if r["phase"] == "validation"]
         assert len(train_rows) == NUM_EPOCHS, len(train_rows)
         for row in train_rows:
-            for key in ("loss", "loss_total", "loss_kd", "loss_feat", "loss_kd_manner"):
+            for key in ("loss", "cls_loss", "loss_kd", "loss_feat", "loss_kd_manner"):
                 assert key in row, f"metrics.jsonl 缺少 {key}"
                 assert isinstance(row[key], float), (key, type(row[key]))
+            # loss 是总损失（分类 + 蒸馏）：蒸馏项非负，因此严格大于分类损失；
+            # 这条断言同时守护“loss 不能被退回成只记硬标签项”的回归
+            assert row["loss"] > row["cls_loss"], row
+            assert "loss_total" not in row, "loss_total 已废弃，总损失统一记在 loss"
         assert val_rows and any("agree_manner" in row for row in val_rows), val_rows
 
 

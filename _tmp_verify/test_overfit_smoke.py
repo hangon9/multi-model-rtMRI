@@ -120,12 +120,13 @@ def test_overfits_single_synthetic_batch():
 
             first, last = history[0], history[-1]
             print(
-                f"[overfit] 硬标签损失 {first['loss']:.4f} → {last['loss']:.4f}；"
+                f"[overfit] 总损失(分类+蒸馏) {first['loss']:.4f} → {last['loss']:.4f}；"
+                f"分类损失 {first['cls_loss']:.4f} → {last['cls_loss']:.4f}；"
                 f"蒸馏项 {first['loss_kd']:.4f} → {last['loss_kd']:.4f}；"
                 f"特征项 {first['loss_feat']:.4f} → {last['loss_feat']:.4f}"
             )
 
-            # 接线正确时硬标签损失应明显下降；不降说明梯度没到学生或优化器没步进
+            # 接线正确时总损失（分类 + 蒸馏）应明显下降；不降说明梯度没到学生或优化器没步进
             assert last["loss"] < 0.6 * first["loss"], (
                 f"损失未下降：{first['loss']:.4f} → {last['loss']:.4f}"
             )

@@ -47,7 +47,8 @@ from utils.model_params import log_model_params
 
 #: 硬标签分项（与 train_img_baseline.evaluate 的日志键一致）
 _TASK_LOSS_KEYS = ("loss_manner", "loss_place", "loss_voicing", "loss_vowel_backness")
-#: 蒸馏分项：写进 metrics.jsonl 便于事后画曲线，parse_logs 会忽略它们
+#: 蒸馏分项：写进 metrics.jsonl 便于事后画曲线；src/eval/parse_logs.py 解析为
+#: train_kd_loss / train_kd_feat_loss 两列（其余 loss_kd_* 只留在 jsonl 里）
 _DISTILL_LOG_KEYS = (
     "loss_kd",
     "loss_feat",
@@ -149,12 +150,22 @@ def train_one_epoch_distill(
         grad_clip: 梯度裁剪阈值，0 或 None 表示不裁剪。
 
     Returns:
-        dict：``loss``（**仅硬标签项**，与验证、baseline 可比）、``loss_total``
-        （硬标签 + 蒸馏）、``cls_loss``、四个 ``loss_*`` 分项、六个蒸馏日志项，
-        以及 ``acc``（各头与 ``mean``）。所有取值均为 Python float。
+        dict，键与语义：
+
+        - ``loss``：**总损失 = 分类损失 + 蒸馏损失**（含 ramp 与 λ 的真实反传量，
+          可跨 batch 比较，是训练曲线的唯一总量）；
+        - ``cls_loss``：分类损失（硬标签项），与验证集的 ``loss`` 同口径；
+        - ``loss_manner`` / ``loss_place`` / ``loss_voicing`` / ``loss_vowel_backness``：
+          四个分类头的硬标签分项；
+        - ``loss_kd`` / ``loss_feat`` / ``loss_kd_*``：蒸馏诊断量，**未乘 ramp/λ**，
+          只用于观察，相加不等于 ``loss - cls_loss``；
+        - ``acc``：各头与 ``mean`` 的 batch 加权平均准确率。
+
+        所有取值均为 Python float。
     """
     model.train()  # 教师不受影响：MultiDistillTeacher.train() 永远转 eval
-    keys = ("loss", "loss_total", "cls_loss", *_TASK_LOSS_KEYS, *_DISTILL_LOG_KEYS)
+    # 日志键集合固定：缺失会直接 KeyError，因此不在 epochs 之间增删键
+    keys = ("loss", "cls_loss", *_TASK_LOSS_KEYS, *_DISTILL_LOG_KEYS)
     sums = {key: 0.0 for key in keys}
     acc_sum = {"mean": 0.0}
     n = 0
@@ -195,10 +206,10 @@ def train_one_epoch_distill(
         if scheduler is not None:
             scheduler.step()
 
+        # 累加按样本数加权：本函数返回 epoch 级平均值，末尾由 n 归一化
         batch_size = image.size(0)
-        sums["loss"] += hard["loss"].item() * batch_size
-        sums["loss_total"] += loss.item() * batch_size
-        sums["cls_loss"] += hard.get("cls_loss", torch.tensor(0.0)).item() * batch_size
+        sums["loss"] += loss.item() * batch_size                # 总损失：分类 + 蒸馏
+        sums["cls_loss"] += hard["cls_loss"].item() * batch_size  # 分类损失（硬标签项）
         for key in _TASK_LOSS_KEYS:
             if key in hard:
                 sums[key] += hard[key].item() * batch_size
@@ -409,21 +420,26 @@ def main() -> None:
                 log_to_console=False,
             )
 
+            # 控制台一行的口径：L= 总损失（分类 + 蒸馏），括号内的 cls/分头均为分类项，
+            # kd/feat 为未乘 ramp/λ 的蒸馏诊断量。该行同时是 training.log 的后备解析源。
             log_msg = (
                 f"Fold {fold_id}, Epoch {epoch + 1}: "
                 f"L={train_log['loss']:.3f} "
-                f"(m={train_log.get('loss_manner', 0):.3f} "
+                f"(cls={train_log['cls_loss']:.3f} "
+                f"m={train_log.get('loss_manner', 0):.3f} "
                 f"p={train_log.get('loss_place', 0):.3f} "
                 f"v={train_log.get('loss_voicing', 0):.3f} "
                 f"vb={train_log.get('loss_vowel_backness', 0):.3f}) "
                 f"kd={train_log['loss_kd']:.3f} "
                 f"feat={train_log['loss_feat']:.3f} "
-                f"total={train_log['loss_total']:.3f} "
                 f"acc={train_log['acc']['mean']:.3f}"
             )
 
             # 验证只跑学生单模态前向，且只用硬标签损失：选模标准与教师解耦，
-            # 因此与 baseline 的 val loss 可比
+            # 因此与 baseline 的 val loss 可比。
+            # 注意：验证集的 ``loss`` 是分类损失（不跑教师），与上面的训练 ``loss``
+            # （分类 + 蒸馏）不同口径；评测作图时 KD 因此不画 train/val 混合的
+            # fold loss 图，详见 docs/plans/eval_loss_plots_by_pipeline.md。
             if epoch % 5 == 0 or epoch == num_epochs - 1:
                 val_log = evaluate(
                     model,
