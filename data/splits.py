@@ -64,7 +64,7 @@ def _add_task_type(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 DEFAULT_UNSEEN_SPEAKERS = ["sub023", "sub028", "sub043", "sub061"]
-DEFAULT_UNSEEN_TASK_TYPES = ["vcv"]
+DEFAULT_UNSEEN_TASK_TYPES = ["topic"]
 
 def make_train_test_split(config: dict):
     """
