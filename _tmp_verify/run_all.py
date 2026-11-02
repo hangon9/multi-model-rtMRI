@@ -1,8 +1,9 @@
-"""一键跑完蒸馏相关的全部本地测试（形状 / 数值 / 兼容性 / 冒烟过拟合）。
+"""一键跑完仓库的本地测试（形状 / 数值 / 兼容性 / 冒烟过拟合 / TIMIT 跨域评估）。
 
 这些测试只做本地验证，不涉及真实训练，也不会联网：
 - 音频骨干用桩件替换，图像编码器用 ``vit``（无预训练权重）；
-- teacher checkpoint 都是内存里现场生成的极小 ckpt。
+- teacher / student checkpoint 都是内存里现场生成的极小 ckpt；
+- USC-TIMIT 相关测试用 ``tempfile`` 造假数据，不读真实语料。
 
 用法::
 
@@ -19,7 +20,7 @@ from pathlib import Path
 
 #: 仓库根目录；子进程以它为工作目录，保证相对导入（``_tmp_verify.xxx``）成立
 REPO_ROOT = Path(__file__).resolve().parents[1]
-#: 按计划顺序排列的测试脚本（先教师、再损失、最后端到端）
+#: 按计划顺序排列的测试脚本（先教师、再损失、最后端到端与跨域评估）
 TEST_SCRIPTS = (
     "test_teacher_resolve.py",
     "test_teacher_load.py",
@@ -29,6 +30,10 @@ TEST_SCRIPTS = (
     "check_bce_scale_numpy.py",
     "test_overfit_smoke.py",
     "test_train_loop_integration.py",
+    # USC-TIMIT 跨域评估：先是数据层，再是评估链路（均基于假数据）
+    "test_timit_prepare.py",
+    "test_timit_loader.py",
+    "test_eval_timit_smoke.py",
 )
 
 

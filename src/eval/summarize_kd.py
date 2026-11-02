@@ -23,8 +23,9 @@ import csv
 import json
 from pathlib import Path
 
-#: 评估链固定跑的三个测试集
-MODES = ("unseen_speaker", "unseen_task", "unseen_both")
+#: 评估链可产出的测试集目录名：前三个为 USC-annot-16 的 in-domain 划分，
+#: ``timit`` 为跨域语料（仅当 evaluate 传了 ``--eval-sets timit`` 时才存在，缺失则自动跳过）
+MODES = ("unseen_speaker", "unseen_task", "unseen_both", "timit")
 #: 四个分类头的顺序，与 src/eval/evaluate.py 的 CLASS_NAMES 一致
 TASKS = ("manner", "place", "voicing", "vowel_backness")
 
@@ -52,7 +53,7 @@ def load_single_mode(run_dir: Path, mode: str) -> dict:
 
     Args:
         run_dir: ``evaluate.py --output-dir`` 指向的运行目录（含 ``eval/`` 子目录）。
-        mode: ``unseen_speaker`` / ``unseen_task`` / ``unseen_both``。
+        mode: ``unseen_speaker`` / ``unseen_task`` / ``unseen_both`` / ``timit``。
 
     Returns:
         ``{task: f1}``；缺失的头不出现。
@@ -194,10 +195,15 @@ def main() -> None:
     print(_format_rows(rows))
 
     if args.csv and rows:
-        # 列序与文本表一致；无 fold 汇总时不会出现 fold_* 列
-        fieldnames = list(rows[0].keys())
+        # 列序与文本表一致；用所有行的键的并集而不是 rows[0] 的键：
+        # 同一个 run 可能只跑了单次评估、另一个跑了 --eval-folds，后者才有 fold_* 列
+        ordered = ["run", "mode", *TASKS, "mean_f1"]
+        extra_columns = sorted(
+            {key for row in rows for key in row} - set(ordered)
+        )
+        fieldnames = ordered + extra_columns
         with open(args.csv, "w", encoding="utf-8-sig", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer = csv.DictWriter(f, fieldnames=fieldnames, restval=float("nan"))
             writer.writeheader()
             writer.writerows(rows)
         print(f"\n[summarize_kd] CSV 已保存: {args.csv}")

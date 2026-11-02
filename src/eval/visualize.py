@@ -708,7 +708,25 @@ def extract_prf1(report_obj: Mapping[str, Any], task: str) -> Tuple[List[str], n
     return labels, arr[:, 0], arr[:, 1], arr[:, 2]
 
 
-def plot_task_prf1(report_obj: Mapping[str, Any], task: str, out_dir: Path) -> None:
+def plot_task_prf1(
+    report_obj: Mapping[str, Any],
+    task: str,
+    out_dir: Path,
+    show_paper_ref: bool = True,
+) -> None:
+    """画单次评估的逐类 Precision / Recall / F1 柱状图。
+
+    Args:
+        report_obj: ``evaluate._build_report_obj`` 产出的报表（需含 ``per_class`` 与
+            ``macro avg``）。
+        task: 头名（``manner`` / ``place`` / ``voicing`` / ``vowel_backness``）。
+        out_dir: 图片输出目录（已存在）。
+        show_paper_ref: 是否画 :data:`PAPER_MACRO_F1` 参考线。该字典是 in-domain 论文数字，
+            跨域（USC-TIMIT）结果与它不可比，调用方应传 False 否则图会误导。
+
+    Returns:
+        None。副作用：写 ``<task>_prf1.png``，无标签时只打印 WARN 并跳过。
+    """
     labels, precision, recall, f1 = extract_prf1(report_obj, task)
     if not labels:
         print(f"[WARN] No PRF1 labels found for task={task}; skip prf1 plot.")
@@ -726,7 +744,7 @@ def plot_task_prf1(report_obj: Mapping[str, Any], task: str, out_dir: Path) -> N
     ax.bar_label(recall_bars, fmt="%.2f", padding=2)
     ax.bar_label(f1_bars, fmt="%.2f", padding=2)
 
-    ref = PAPER_MACRO_F1.get(task)
+    ref = PAPER_MACRO_F1.get(task) if show_paper_ref else None
     if ref is not None:
         ax.axhline(ref, linestyle="--", linewidth=1.2, color="gray", label=f"Paper macro F1={ref:.2f}")
 
@@ -743,8 +761,25 @@ def plot_task_prf1(report_obj: Mapping[str, Any], task: str, out_dir: Path) -> N
     plt.close(fig)
 
 
-def plot_task_prf1_fold_comparison(agg: Mapping[str, Any], task: str, out_dir: Path) -> None:
-    """Plot N-fold mean ± std precision/recall/F1 with per-bar labels."""
+def plot_task_prf1_fold_comparison(
+    agg: Mapping[str, Any],
+    task: str,
+    out_dir: Path,
+    show_paper_ref: bool = True,
+) -> None:
+    """Plot N-fold mean ± std precision/recall/F1 with per-bar labels.
+
+    Args:
+        agg: ``evaluate._aggregate_fold_metrics`` 的输出（每类 + ``Macro Avg``，
+            各自含 ``folds`` / ``mean`` / ``std``）。
+        task: 头名。
+        out_dir: 图片输出目录（已存在）。
+        show_paper_ref: 是否画 :data:`PAPER_MACRO_F1` 参考线；该字典是 in-domain 论文数字，
+            跨域（USC-TIMIT）图应传 False。
+
+    Returns:
+        None。副作用：写 ``<task>_prf1_fold_comparison.png``；无标签时只打印 WARN 并跳过。
+    """
     labels = [key for key in agg.keys() if key != "Macro Avg"]
     if "Macro Avg" in agg:
         labels.append("Macro Avg")
@@ -771,7 +806,7 @@ def plot_task_prf1_fold_comparison(agg: Mapping[str, Any], task: str, out_dir: P
         )
         ax.bar_label(bars, fmt="%.2f", padding=2)
 
-    ref = PAPER_MACRO_F1.get(task)
+    ref = PAPER_MACRO_F1.get(task) if show_paper_ref else None
     if ref is not None:
         ax.axhline(ref, linestyle="--", linewidth=1.2, color="gray", label=f"Paper macro F1={ref:.2f}")
 

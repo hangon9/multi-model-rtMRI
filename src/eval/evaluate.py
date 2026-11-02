@@ -41,7 +41,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 from sklearn.metrics import confusion_matrix, multilabel_confusion_matrix
 
-from src.eval.inference import MODEL_FAMILY_ALIASES, TASKS, resolve_model_family_override, run_inference
+from src.eval.inference import (
+    MODEL_FAMILY_ALIASES,
+    TASKS,
+    TIMIT_MODE,
+    resolve_model_family_override,
+    run_inference,
+)
 from src.eval.metrics import compute_metrics
 from src.eval.parse_logs import parse_training_log
 from src.eval.visualize import (
@@ -78,6 +84,17 @@ CLASS_NAMES: Dict[str, List[str]] = {
         "Front", "Central", "Back",
     ],
 }
+
+
+# ---------------------------------------------------------------------------
+# Evaluation sets
+# ---------------------------------------------------------------------------
+#: 全部可用测试集：前三个是 USC-annot-16 的 in-domain 划分，最后一个是从未参与训练的跨域语料
+EVAL_SET_CHOICES: Tuple[str, ...] = (
+    "unseen_speaker", "unseen_task", "unseen_both", TIMIT_MODE,
+)
+#: 不传 ``--eval-sets`` 时的默认行为：与引入 TIMIT 之前完全一致
+DEFAULT_EVAL_SETS: Tuple[str, ...] = EVAL_SET_CHOICES[:3]
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +248,40 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Run fold-comparison evaluation for best_model_fold_*.pt checkpoints",
     )
+    timit_group = parser.add_argument_group(
+        "cross-domain (USC-TIMIT) evaluation",
+        "Only used when 'timit' appears in --eval-sets. USC-TIMIT is eval-only: "
+        "it never enters training and uses its own dataset loader.",
+    )
+    timit_group.add_argument(
+        "--eval-sets",
+        nargs="+",
+        default=list(DEFAULT_EVAL_SETS),
+        choices=list(EVAL_SET_CHOICES),
+        help=(
+            "Test sets to evaluate (default: the three USC-annot-16 splits). "
+            "Add 'timit' for the cross-domain USC-TIMIT set; each set is written "
+            "to its own eval/<set>/ subdirectory."
+        ),
+    )
+    timit_group.add_argument(
+        "--timit-root",
+        type=str,
+        default="data/USC-TIMIT",
+        help=(
+            "USC-TIMIT root directory containing labels/ images/ audios/ "
+            "(default: data/USC-TIMIT). Ignored unless 'timit' is in --eval-sets."
+        ),
+    )
+    timit_group.add_argument(
+        "--timit-subjects",
+        nargs="+",
+        default=None,
+        help=(
+            "Restrict the USC-TIMIT evaluation to these subject directories "
+            "(e.g. --timit-subjects f1). Default: every subject under labels/."
+        ),
+    )
     return parser
 
 
@@ -257,6 +308,47 @@ def _active_tasks_from_meta(meta: Dict[str, Any]) -> Tuple[str, ...]:
     return tuple(TASKS)
 
 
+def _timit_cache_mismatch(
+    meta: Dict[str, Any],
+    mode: str,
+    timit_root: Optional[Path],
+    timit_subjects: Optional[List[str]],
+) -> Optional[str]:
+    """检查缓存 meta 与本次 TIMIT 评估参数是否一致。
+
+    Args:
+        meta: 缓存里存下的推理 meta。
+        mode: 本次测试集模式。
+        timit_root: 本次解析后的 USC-TIMIT 根目录（绝对路径）；非 timit 模式可为 None。
+        timit_subjects: 本次的被试过滤列表；None 表示全部被试。
+
+    Returns:
+        不一致时返回中文原因（供日志打印），一致或无需校验（非 timit 模式）时返回 None。
+
+    Note:
+        只拿 ``timit_root`` / ``timit_subjects`` 作废缓存：换了数据目录或换了被试后读到旧结果，
+        指标会全部错位且从输出上完全看不出来。非 timit 模式不受影响（其数据源由 config 决定）。
+        以库方式调用时可能仍未给 ``timit_root``（CLI 在选 timit 时必给），此时一律作废而不是
+        拿 None 去做路径比较（那会抛掩蔽真因的 TypeError）。
+    """
+    if mode != TIMIT_MODE:
+        return None
+
+    if timit_root is None:
+        return "本次调用未提供 timit_root（缓存里的数据目录无从比较）"
+
+    cached_root = meta.get("timit_root")
+    if cached_root is None:
+        return "缓存 meta 中没有 timit_root（早于跨域评估功能写下）"
+    if Path(cached_root) != Path(timit_root):
+        return f"缓存的 timit_root={cached_root} 与当前的 {timit_root} 不同"
+
+    cached_subjects = meta.get("timit_subjects")
+    if list(cached_subjects or []) != list(timit_subjects or []):
+        return f"缓存的 timit_subjects={cached_subjects} 与当前的 {timit_subjects} 不同"
+    return None
+
+
 def _run_or_load_inference(
     checkpoint_path: str,
     device: str,
@@ -264,6 +356,8 @@ def _run_or_load_inference(
     skip_inference: bool,
     raw_dir: Path,
     model_family: Optional[str] = None,
+    timit_root: Optional[Path] = None,
+    timit_subjects: Optional[List[str]] = None,
 ) -> Tuple[Dict[str, Dict[str, np.ndarray]], Dict[str, Any]]:
     """跑推理（或读缓存），返回 ``(results, meta)``。
 
@@ -275,31 +369,40 @@ def _run_or_load_inference(
         raw_dir: 缓存 pickle 的所在目录（不存在时自动创建）。
         model_family: ``--model`` 解析后的内部模型族标签，见 ``_run_eval_for_mode``；
             ``None`` 表示自动识别（此时无条件信任缓存）。
+        timit_root: 本次解析后的 USC-TIMIT 根目录（绝对路径）；``mode == "timit"`` 时必填。
+        timit_subjects: 本次的 TIMIT 被试过滤列表；None 表示全部被试。
 
     Returns:
         ``results``：``{task: {"preds": ndarray, "labels": ndarray}}``；
         ``meta``：checkpoint 元信息 + ``model_family`` 等推理期字段。
 
     Note:
-        缓存里存了上次推理实际用的 ``model_family``。显式给了 ``--model`` 且与缓存
-        不一致时缓存作废（日志会说明原因），否则会把旧模型的结果当成新模型的指标，
-        且从输出上完全看不出来。
+        缓存里存了上次推理实际用的 ``model_family`` / ``timit_root`` / ``timit_subjects``。
+        任一项与本次请求不一致时缓存作废（日志会说明原因），否则会把旧模型或旧数据目录的
+        结果当成新配置的指标，且从输出上完全看不出来。
     """
     results_pkl = raw_dir / "results.pkl"
 
     if skip_inference and results_pkl.exists():
-        print(f"[evaluate] Loading cached results from {results_pkl}")
-
         with results_pkl.open("rb") as f:
             cached_results, cached_meta = pickle.load(f)
-        cached_family = cached_meta.get("model_family")       # 早于本功能写下的缓存无此键
-        if model_family is None or cached_family == model_family:
+
+        # 两道校验：模型族（仅在显式给了 --model 时有约束）与 TIMIT 数据源
+        family_stale = (
+            model_family is not None and cached_meta.get("model_family") != model_family
+        )
+        timit_stale = _timit_cache_mismatch(cached_meta, mode, timit_root, timit_subjects)
+        if not family_stale and timit_stale is None:
             print(f"[evaluate] Loading cached results from {results_pkl}")
             return cached_results, cached_meta
-        print(
-            f"[evaluate] Cached results are model_family={cached_family!r} but "
-            f"--model requested {model_family!r}; re-running inference."
-        )
+
+        if family_stale:
+            print(
+                f"[evaluate] Cached results are model_family={cached_meta.get('model_family')!r} "
+                f"but --model requested {model_family!r}; re-running inference."
+            )
+        if timit_stale is not None:
+            print(f"[evaluate] Cached TIMIT results are stale: {timit_stale}; re-running.")
 
     print("[evaluate] Running inference ...")
     results, meta = run_inference(
@@ -307,6 +410,8 @@ def _run_or_load_inference(
         device=device,
         mode=mode,
         model_family=model_family,
+        timit_root=timit_root,
+        timit_subjects=timit_subjects,
     )
 
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -453,6 +558,8 @@ def _run_fold_comparison(
     skip_inference: bool = False,
     allowed_folds: set[int] | None = None,
     model_family: Optional[str] = None,
+    timit_root: Optional[Path] = None,
+    timit_subjects: Optional[List[str]] = None,
 ) -> None:
     """跑 ``best_model_fold_*.pt`` 的逐折对比评估。
 
@@ -465,9 +572,12 @@ def _run_fold_comparison(
         mode: 测试集模式。
         out_dir: 本次 fold 对比的输出根目录，内部再分子目录 ``figures/``、``metrics/``、
             ``raw/``（逐折缓存写 ``raw/results_fold{n}.pkl``）。
-        skip_inference: True 时优先复用逐折缓存；缺失或与 ``model_family`` 不符的折才重跑。
+        skip_inference: True 时优先复用逐折缓存；缺失或与 ``model_family`` / TIMIT 数据源
+            不符的折才重跑。
         model_family: ``--model`` 解析后的内部模型族标签；``None`` 表示自动识别。
         allowed_folds: 仅比较这些折；None 表示全部已发现折。
+        timit_root: USC-TIMIT 根目录（绝对路径）；``mode == "timit"`` 时必填。
+        timit_subjects: TIMIT 被试过滤列表；None 表示全部被试。
 
 
     Side effects:
@@ -513,12 +623,21 @@ def _run_fold_comparison(
             with cache_path.open("rb") as f:
                 cached = pickle.load(f)
 
-            # 缓存是 (results, meta) 二元组；meta 里记录着该折实际用的模型族。
+            # 缓存是 (results, meta) 二元组；meta 里记录着该折实际用的模型族与 TIMIT 数据源。
             cached_family = cached[1].get("model_family")
             if model_family is not None and cached_family != model_family:
                 print(
                     f"[evaluate] Fold {fold_id} cache is model_family={cached_family!r} but "
                     f"--model requested {model_family!r}; re-running this fold."
+                )
+                stale_folds.append(fold_id)
+                continue
+
+            timit_stale = _timit_cache_mismatch(cached[1], mode, timit_root, timit_subjects)
+            if timit_stale is not None:
+                print(
+                    f"[evaluate] Fold {fold_id} cached TIMIT results are stale: "
+                    f"{timit_stale}; re-running this fold."
                 )
                 stale_folds.append(fold_id)
                 continue
@@ -529,7 +648,13 @@ def _run_fold_comparison(
         if stale_folds:
             print(f"[evaluate] Running inference for folds: {stale_folds}")
             fresh = run_inference_all_folds(
-                checkpoint_dir, device=device, mode=mode, allowed_folds=allowed_folds, model_family=model_family
+                checkpoint_dir,
+                device=device,
+                mode=mode,
+                allowed_folds=allowed_folds,
+                model_family=model_family,
+                timit_root=timit_root,
+                timit_subjects=timit_subjects,
             )
             for fold_id, value in fresh.items():
                 cache_path = raw_dir / f"results_fold{fold_id}.pkl"
@@ -539,7 +664,13 @@ def _run_fold_comparison(
     else:
         print("[evaluate] Running fold-comparison inference ...")
         per_fold = run_inference_all_folds(
-            checkpoint_dir, device=device, mode=mode, allowed_folds=allowed_folds, model_family=model_family
+            checkpoint_dir,
+            device=device,
+            mode=mode,
+            allowed_folds=allowed_folds,
+            model_family=model_family,
+            timit_root=timit_root,
+            timit_subjects=timit_subjects,
         )
         for fold_id, value in per_fold.items():
             cache_path = raw_dir / f"results_fold{fold_id}.pkl"
@@ -566,7 +697,10 @@ def _run_fold_comparison(
 
         agg = _aggregate_fold_metrics(per_fold_reports, CLASS_NAMES[task])
         _save_fold_comparison_json(agg, task, metrics_dir)
-        plot_task_prf1_fold_comparison(agg, task, figures_dir)
+        # 论文 macro F1 是 in-domain 数字，画在 TIMIT 图上会误导
+        plot_task_prf1_fold_comparison(
+            agg, task, figures_dir, show_paper_ref=(mode != TIMIT_MODE)
+        )
         print(f"[evaluate] Saved fold-comparison PRF1 plot for task={task}")
 
 
@@ -713,7 +847,20 @@ def _generate_task_plots(
     results: Dict[str, Dict[str, np.ndarray]],
     figures_dir: Path,
     metrics_dir: Path,
+    show_paper_ref: bool = True,
 ) -> None:
+    """逐任务写 PRF1 图 / 混淆矩阵图与 metrics JSON。
+
+    Args:
+        results: ``run_inference`` 的输出（已按 manner 门控）。
+        figures_dir: 图片输出目录（已存在）。
+        metrics_dir: JSON 输出目录（不存在时自动创建）。
+        show_paper_ref: 是否在 PRF1 图上画论文的 in-domain macro F1 参考线。
+            TIMIT 是跨域结果，与论文数字不可比，调用方应传 False。
+
+    Returns:
+        None。副作用：写 PNG / JSON，并向 stdout 打印进度。
+    """
     for task in results:
         y_true = results[task]["labels"]
         y_pred = results[task]["preds"]
@@ -726,7 +873,7 @@ def _generate_task_plots(
         if task == "vowel_backness":
             report_obj = _build_report_obj(y_true, y_pred, class_names, multilabel=True)
             _save_metrics_json(report_obj, task, metrics_dir)
-            plot_task_prf1(report_obj, task, figures_dir)
+            plot_task_prf1(report_obj, task, figures_dir, show_paper_ref=show_paper_ref)
             plot_task_multilabel_confusion(report_obj, task, figures_dir)
             print(f"[evaluate] Saved PRF1 & multilabel confusion plots for task={task}")
             continue
@@ -741,7 +888,7 @@ def _generate_task_plots(
 
         report_obj = _build_report_obj(y_true, y_pred, class_names)
         _save_metrics_json(report_obj, task, metrics_dir)
-        plot_task_prf1(report_obj, task, figures_dir)
+        plot_task_prf1(report_obj, task, figures_dir, show_paper_ref=show_paper_ref)
         plot_task_confusion(report_obj, task, figures_dir)
         print(f"[evaluate] Saved PRF1 & confusion plots for task={task}")
 
@@ -754,11 +901,13 @@ def _run_eval_for_mode(
     run_fold_comparison: bool,
     checkpoint_dir: Path,
     model_family: Optional[str] = None,
+    timit_root: Optional[Path] = None,
+    timit_subjects: Optional[List[str]] = None,
 ) -> None:
     """跑一次 inference + per-task 图/metrics + meta，全部写入 eval_root 下。
 
     Args:
-        mode: 测试集模式（``unseen_speaker`` / ``unseen_task`` / ``unseen_both``），
+        mode: 测试集模式（``unseen_speaker`` / ``unseen_task`` / ``unseen_both`` / ``timit``），
             也作为子目录名与 meta 里的标记。
         eval_root: 本模式的输出根目录（内部分 ``figures/``/``raw/``/``metrics/``
             /``fold_comparison/``）。
@@ -768,6 +917,8 @@ def _run_eval_for_mode(
         run_fold_comparison: 是否额外跑逐折对比评估（写入 ``fold_comparison/``）。
         checkpoint_dir: checkpoint 所在目录，逐折发现时用。
         model_family: ``--model`` 解析后的内部模型族标签；``None`` 表示自动识别。
+        timit_root: USC-TIMIT 根目录（绝对路径）；``mode == "timit"`` 时必填。
+        timit_subjects: TIMIT 被试过滤列表；None 表示全部被试。
 
     Side effects:
         创建目录、写图/JSON/pickle 缓存；均通过 ``print`` 汇报。
@@ -787,6 +938,8 @@ def _run_eval_for_mode(
         skip_inference=skip_inference,
         raw_dir=raw_dir,
         model_family=model_family,
+        timit_root=timit_root,
+        timit_subjects=timit_subjects,
     )
 
     active_tasks = _active_tasks_from_meta(meta)
@@ -798,7 +951,9 @@ def _run_eval_for_mode(
     )
 
     metrics_dir.mkdir(parents=True, exist_ok=True)
-    _generate_task_plots(results, figures_dir, metrics_dir)
+    _generate_task_plots(
+        results, figures_dir, metrics_dir, show_paper_ref=(mode != TIMIT_MODE)
+    )
 
     meta["mode"] = mode
     meta["n_samples"] = n_samples
@@ -839,6 +994,8 @@ def _run_eval_for_mode(
             skip_inference=skip_inference,
             allowed_folds=allowed_folds,
             model_family=model_family,
+            timit_root=timit_root,
+            timit_subjects=timit_subjects,
         )
 
 # ---------------------------------------------------------------------------
@@ -846,18 +1003,23 @@ def _run_eval_for_mode(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    """评测入口：画 loss 图 → 三个测试集推理 → 逐任务图/指标。
+    """评测入口：画 loss 图 → 按 ``--eval-sets`` 逐个测试集推理 → 逐任务图/指标。
 
     流程：解析路径（``--log-dir`` 优先，其次 ``--runs-dir`` 自动挑选最新 run）→
-    按 ckpt 自动识别流水线并生成对应 loss 图集 → 对 ``unseen_speaker`` /
-    ``unseen_task`` / ``unseen_both`` 逐个推理并出 PRF1/混淆矩阵（``--skip-inference``
-    时复用缓存，``--eval-folds`` 额外做逐折对比）。
+    按 ckpt 自动识别流水线并生成对应 loss 图集 → 对 ``--eval-sets`` 指定的测试集
+    （默认 ``unseen_speaker`` / ``unseen_task`` / ``unseen_both``，可选加 ``timit``）
+    逐个推理并出 PRF1/混淆矩阵（``--skip-inference`` 时复用缓存，``--eval-folds`` 额外
+    做逐折对比）。
 
     Args:
         None；参数全部来自 CLI（见 :func:`build_parser`）。
 
     Returns:
         None。副作用：创建 ``<output_dir>/eval/`` 目录树并写 PNG / JSON / pickle。
+
+    Note:
+        ``timit`` 的目录完整性（``labels/`` / ``images/`` / ``audios/`` 均存在）在启动时
+        校验：跨域推理动辄要跑几十万帧，跑到一半才因为路径错而挂掉代价太高。
     """
     parser = build_parser()
     args = parser.parse_args()
@@ -909,11 +1071,30 @@ def main() -> None:
     else:
         print("[evaluate] No log directory provided; skipping loss curves.")
 
+    # ── Resolve TIMIT root (仅选到 timit 时才解析与校验) ────────────────────
+    timit_root: Optional[Path] = None
+    if TIMIT_MODE in args.eval_sets:
+        timit_root = Path(args.timit_root).resolve()
+        missing_dirs = [
+            sub for sub in ("labels", "images", "audios")
+            if not (timit_root / sub).is_dir()
+        ]
+        if missing_dirs:
+            parser.error(
+                f"--timit-root {timit_root} 缺少子目录 {missing_dirs}；"
+                "USC-TIMIT 需包含 labels/ images/ audios/。"
+            )
+        print(f"[evaluate] USC-TIMIT root: {timit_root}")
+        if args.timit_subjects:
+            print(f"[evaluate] USC-TIMIT subjects: {args.timit_subjects}")
+
     # ── 2. Inference ─────────────────────────────────────────────────────────
     device = _resolve_device(args.device)
     checkpoint_dir = Path(args.checkpoint).resolve().parent
 
-    for mode in ("unseen_speaker", "unseen_task", "unseen_both"):
+    # 去重保序：重复的 mode 会重建同一目录两次，等于把最贵的推理跑两遍
+    eval_sets = list(dict.fromkeys(args.eval_sets))
+    for mode in eval_sets:
         print(f"[evaluate] === Running eval_mode={mode} ===")
         _run_eval_for_mode(
             mode=mode,
@@ -924,6 +1105,8 @@ def main() -> None:
             run_fold_comparison=args.eval_folds,
             checkpoint_dir=checkpoint_dir,
             model_family=model_family,
+            timit_root=timit_root,
+            timit_subjects=args.timit_subjects,
         )
 
     print("[evaluate] Done.")

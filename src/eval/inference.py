@@ -14,7 +14,7 @@ from src.models.contrastive_model import AudioVisionContrastiveModel
 from src.models.audio_only_model import AudioMultiHeadClassifier
 from src.models.img_only_model import ImageMultiheadClassifier
 from src.models.multimodal_fusion import AudioVisionFusionModel
-from data.splits import make_train_test_split, create_dataloader
+from data.splits import make_train_test_split, create_dataloader, create_timit_dataloader, make_timit_test_set
 
 
 NUM_CLASSES: dict[str, int] = {
@@ -225,11 +225,41 @@ def _resolve_model_family(
 # ---------------------------------------------------------------------------
 _SPEAKER_TASK_MODES = ("unseen_speaker", "unseen_task", "unseen_both")
 
-def _get_test_dataframe(config: dict[str, Any], mode: str) -> pd.DataFrame:
-    """Rebuild the held-out test set from config."""
+#: 跨域（USC-TIMIT）测试集模式名；也是 ``evaluate.py`` 的子目录名与 meta 标记
+TIMIT_MODE = "timit"
+
+
+def _get_test_dataframe(
+    config: dict[str, Any],
+    mode: str,
+    timit_root: str | Path | None = None,
+    timit_subjects: list[str] | None = None,
+) -> pd.DataFrame:
+    """按测试集模式重建待推理的帧级 DataFrame。
+
+    Args:
+        config: checkpoint 内嵌的完整配置（取 ``data.fps`` 等字段）。
+        mode: ``unseen_speaker`` / ``unseen_task`` / ``unseen_both`` / ``timit``。
+        timit_root: USC-TIMIT 根目录；``mode == "timit"`` 时必填。这里刻意不回落到任何
+            默认路径——静默用错目录会产出一份「看起来正常」的跨域指标。
+        timit_subjects: 只评估这些被试目录；None 表示全部。仅 ``mode == "timit"`` 有效。
+
+    Returns:
+        帧级 DataFrame（列约定见 ``data/timit_prepare.py``）。
+
+    Raises:
+        ValueError: ``mode`` 未知，或 ``mode == "timit"`` 却没有给 ``timit_root``。
+    """
     if mode in _SPEAKER_TASK_MODES:
         _, test_sets = make_train_test_split(config)
         return test_sets[mode]
+    if mode == TIMIT_MODE:
+        if timit_root is None:
+            raise ValueError(
+                "mode='timit' 需要显式提供 timit_root（USC-TIMIT 根目录）；"
+                "不提供默认值以避免读到错误的数据目录。"
+            )
+        return make_timit_test_set(timit_root, config, subjects=timit_subjects)
     raise ValueError(f"Unknown mode: {mode}")
 
 
@@ -518,15 +548,19 @@ def run_inference_all_folds(
     mode: str = "default",
     model_family: str | None = None,
     allowed_folds: set[int] | None = None,
+    timit_root: str | Path | None = None,
+    timit_subjects: list[str] | None = None,
 ) -> dict[int, tuple[dict, dict]]:
     """Run run_inference() for every discovered fold checkpoint.
 
     Args:
         checkpoint_dir: 存放 ``best_model_fold_*.pt`` 的目录；没有匹配文件时返回空字典。
         device: 推理设备字符串（``"cuda"`` / ``"cpu"``）。
-        mode: 测试集模式（``unseen_speaker`` / ``unseen_task`` / ``unseen_both``）。
+        mode: 测试集模式（``unseen_speaker`` / ``unseen_task`` / ``unseen_both`` / ``timit``）。
         model_family: 可选的模型族覆盖，取值同 ``--model``；``None`` 时逐折自动识别。
         allowed_folds: 仅推理这些折号；None 表示全部折。
+        timit_root: USC-TIMIT 根目录，仅 ``mode == "timit"`` 时使用，透传给 ``run_inference``。
+        timit_subjects: 仅评估这些被试验；None 表示全部。
 
     Returns:
         ``{fold_id: (results, meta)}``，键按 fold 升序（``discover_fold_checkpoints`` 已排序）。
@@ -547,6 +581,8 @@ def run_inference_all_folds(
             device=device,
             mode=mode,
             model_family=model_family,
+            timit_root=timit_root,
+            timit_subjects=timit_subjects,
         )
     return results
 
@@ -560,6 +596,8 @@ def run_inference(
     device: str = "cuda",
     mode: str = "default",
     model_family: str | None = None,
+    timit_root: str | Path | None = None,
+    timit_subjects: list[str] | None = None,
 ) -> tuple[dict, dict]:
     """
     Load a checkpoint, detect its model type, run inference on the held-out
@@ -569,9 +607,11 @@ def run_inference(
     ──────────
     checkpoint_path : 训练脚本保存的 checkpoint 路径；``ckpt["config"]`` 必须存在。
     device          : 推理设备；CUDA 不可用时静默退到 CPU。
-    mode            : 测试集模式，决定取哪一份 held-out 数据。
+    mode            : 测试集模式，决定取哪一份 held-out 数据（``unseen_*`` 或 ``timit``）。
     model_family    : ``--model`` 指定的模型族覆盖（``audio`` / ``image`` / ``multi`` /
                       ``contrast``）；``None`` 时走下面的自动识别。
+    timit_root      : USC-TIMIT 根目录；``mode == "timit"`` 时必填，否则不会被读取。
+    timit_subjects  : 只评估这些被试目录；None 表示全部。
 
     Model-family detection order
     ────────────────────────────
@@ -592,13 +632,16 @@ def run_inference(
     ───────
     results : dict[task, {"preds": ndarray, "labels": ndarray}]
     meta    : {fold, epoch, best_val_loss, classification_task, config,
-               model_family, experiment_name}
+               model_family, experiment_name, domain, timit_root, timit_subjects,
+               n_frames_df, n_frames_evaluated, dropped_boundary_frames}
 
     Note
     ────
     Contrastive checkpoints carry audio-teacher and projection weights that the
     image-only inference copy does not build, so they are loaded leniently (extra
     keys dropped, missing keys still fatal) — see :func:`_load_state`.
+    ``mode == "timit"`` 走 ``create_timit_dataloader``（TIMIT 的取邻帧规则与 USC-16
+    不同，交给 ``create_dataloader`` 会把多帧窗口退化成重复中心帧）。
     """
     checkpoint_path = Path(checkpoint_path)
     device_obj = torch.device(
@@ -624,8 +667,18 @@ def run_inference(
     model.eval()
 
     # ── Test data ────────────────────────────────────────────────────────────
-    test_df = _get_test_dataframe(config, mode)
-    test_loader = create_dataloader(test_df, config, train=False)
+    # TIMIT 必须走专用 dataloader：它的图像命名不匹配基类的取邻帧正则
+    test_df = _get_test_dataframe(config, mode, timit_root, timit_subjects)
+    if mode == TIMIT_MODE:
+        test_loader = create_timit_dataloader(test_df, config)
+    else:
+        test_loader = create_dataloader(test_df, config, train=False)
+    n_frames_in_df = len(test_df)
+    # 多帧窗口会在数据集构造时丢首尾边界帧；把两个数都带进 meta，便于核对 samples 差值来源
+    n_frames_evaluated = len(test_loader.dataset)
+    dropped_boundary_frames = int(
+        getattr(test_loader.dataset, "dropped_boundary_frames", 0)
+    )
 
     # ── Inference loop ───────────────────────────────────────────────────────
     preds_by_task:  dict[str, list[torch.Tensor]] = {t: [] for t in active_tasks}
@@ -678,6 +731,18 @@ def run_inference(
             or config.get("experiment", {}).get("name")
             or config.get("name")
         ),
+        # 域标记与 TIMIT 根目录写进 meta：既便于结果追溯，也是 evaluate 端缓存失效的依据
+        "domain":              TIMIT_MODE if mode == TIMIT_MODE else "in_domain",
+        "timit_root":          (
+            str(Path(timit_root).resolve()) if mode == TIMIT_MODE else None
+        ),
+        "timit_subjects":      (
+            list(timit_subjects) if (mode == TIMIT_MODE and timit_subjects) else None
+        ),
+        # 帧数流水：DataFrame 行数 → 多帧窗口丢边界后的实际评估帧数
+        "n_frames_df":          n_frames_in_df,
+        "n_frames_evaluated":   n_frames_evaluated,
+        "dropped_boundary_frames": dropped_boundary_frames,
     }
 
     return results, meta
