@@ -60,18 +60,22 @@ _DISTILL_LOG_KEYS = (
 
 
 def set_seed(seed: int) -> None:
-    """设置全局随机种子。
+    """设置 Python / NumPy / PyTorch 的全局随机种子。
 
-    DataLoader 的 worker 种子由主进程 RNG 派生（含 ``random`` 与 numpy），因此不需要
-    给 ``create_dataloader`` 传 ``worker_init_fn``，也不必改 ``splits.py``。
+    三条 RNG 流都要播：DataLoader 的 worker 种子由主进程 RNG 派生（含 ``random`` 与
+    numpy），因此不需要给 ``create_dataloader`` 传 ``worker_init_fn``，也不必改
+    ``data/splits.py``；模型初始化与增强只吃 torch / numpy 流。
 
     Args:
         seed: 整数种子；训练脚本按 ``seed + fold_id`` 传入，使折间互不相关但可复现。
+
+    Side effects:
+        改动进程级全局 RNG 状态，后续所有采样（权重初始化、shuffle、增强）随之变化。
     """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    torch.cuda.manual_seed_all(seed)  # 所有 GPU 都播，避免多卡时各卡初始化不一致
 
 
 def assert_checkpoint_dirs_differ(student_dir, teacher_template) -> None:
@@ -285,7 +289,7 @@ def main() -> None:
     train_folds = resolve_train_folds(data_cfg, n_splits)
     run_folds = sorted(train_folds) if train_folds else list(range(1, n_splits + 1))
     num_epochs = train_cfg.get("epochs", 10)
-    seed = int(train_cfg.get("seed", 42))
+    seed = int(data_cfg.get("seed", 42))  # 缺省 42：与历史 config 一致
     grad_clip = train_cfg.get("grad_clip", 0.5)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

@@ -18,6 +18,7 @@
 """
 
 import argparse
+import random
 from pathlib import Path
 
 import numpy as np
@@ -573,6 +574,25 @@ def _validate_contrast_config(model_cfg: dict, loss_cfg: dict) -> None:
         )
 
 
+def set_seed(seed: int) -> None:
+    """设置 Python / NumPy / PyTorch 的全局随机种子。
+
+    三条 RNG 流都要播：DataLoader 的 worker 种子由主进程 RNG 派生（含 ``random`` 与
+    numpy），因此不需要给 ``create_dataloader`` 传 ``worker_init_fn``，也不必改
+    ``data/splits.py``；图像背骨与音频教师的权重初始化、图像增强都吃这三条流。
+
+    Args:
+        seed: 整数种子；main 按 ``seed + fold_id`` 传入，使折间互不相关但可复现。
+
+    Side effects:
+        改动进程级全局 RNG 状态，后续所有采样（权重初始化、shuffle、增强）随之变化。
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # 所有 GPU 都播，避免多卡时各卡初始化不一致
+
+
 def main():
     """训练入口。"""
     parser = argparse.ArgumentParser()
@@ -619,6 +639,8 @@ def main():
     n_splits = data_cfg.get("n_splits", 5)
     train_folds = resolve_train_folds(data_cfg, n_splits)
     num_epochs = train_cfg.get("epochs", 10)
+    # 全局种子：每折实际用 seed + fold_id，保证单折与全折运行采样一致
+    seed = int(data_cfg.get("seed", 42))  # 缺省 42：与历史 config 一致
     checkpoint_dir = Path(config["paths"]["checkpoint_dir"])
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -627,6 +649,7 @@ def main():
     logger.info(f"Classification task: {classification_task or 'multi-task'}")
     logger.info(f"Checkpoint select metric: {select_metric}")
     logger.info(f"Cross-validation: {n_splits} folds, {num_epochs} epochs each")
+    logger.info(f"Global seed: {seed}（每折使用 seed + fold_id）")
     if train_folds is None:
         logger.info(f"train_fold: 留空，跑全部 {n_splits} 折")
     else:
@@ -642,6 +665,9 @@ def main():
         fold_id = fold + 1
         if train_folds is not None and fold_id not in train_folds:
             continue
+        # 每折独立播种：单折与全 5 折中的该折采样序列一致（对比模型尤其重要：
+        # 图片/音频双分支的初始化与增强都会吃主进程 RNG）
+        set_seed(seed + fold_id)
 
         logger.info(f"{'=' * 60}")
         logger.info(f"Fold {fold_id}/{n_splits}")
