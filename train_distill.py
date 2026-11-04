@@ -16,6 +16,7 @@
 import argparse
 import random
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -41,6 +42,7 @@ from train_img_baseline import (
     move_labels_to_device,
     resolve_model_params,
     resolve_train_folds,
+    shuffle_val_dataframe,
 )
 from utils.logger import TrainingLogger
 from utils.model_params import log_model_params
@@ -300,6 +302,15 @@ def main() -> None:
     )
     logger.info(f"Config loaded from {args.config}")
     logger.info(f"Using device: {device}")
+    # 选模固定为验证集 macro-F1 的未加权平均；旧的 train.select_metric 已废弃
+    # 注：distill 继承教师数据字段，但 ``train`` 节（含 select_metric）仍来自学生配置
+    if train_cfg.get("select_metric") is not None:
+        logger.warning(
+            f"train.select_metric={train_cfg.get('select_metric')!r} 已忽略："
+            "选模固定为验证集 F1 mean，不再支持按 loss 选模。"
+        )
+    logger.info("Checkpoint select metric: val F1 mean（四头 macro-F1 的未加权平均）")
+    logger.info("Val shuffle seed: data.seed + fold_id")
     assert_checkpoint_dirs_differ(config["paths"]["checkpoint_dir"], teacher_template)
 
     # 1) 预检所有折的教师配置，再继承数据字段。
@@ -323,7 +334,7 @@ def main() -> None:
     checkpoint_dir = Path(config["paths"]["checkpoint_dir"])
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    global_best_val_loss = float("inf")
+    global_best_f1 = float("-inf")
     global_best_ckpt_path = None
 
     for fold, (train_idx, val_idx) in enumerate(get_fold_indices(train_val_df, config)):
@@ -341,7 +352,10 @@ def main() -> None:
         logger.info(f"Train samples: {len(train_df)}, Val samples: {len(val_df)}")
 
         train_loader = create_dataloader(train_df, config, train=True)
-        val_loader = create_dataloader(val_df, config, train=False)
+        # 验证集固定种子全局打乱，种子与折内其它随机性同源（data.seed + fold_id）
+        val_loader = create_dataloader(
+            shuffle_val_dataframe(val_df, seed + fold_id), config, train=False
+        )
 
         # 每折一个教师：第 j 折学生只用第 j 折教师，避免验证 subject 泄露。
         # 构造时 MultiDistillTeacher._log_teacher_meta 会打印本折教师的路径/来源/结构，
@@ -388,7 +402,7 @@ def main() -> None:
             anneal_strategy="cos",
         )
 
-        fold_best_val_loss = float("inf")
+        fold_best_f1 = float("-inf")
         fold_best_ckpt_path = checkpoint_dir / f"best_model_fold_{fold_id}.pt"
 
         for epoch in range(num_epochs):
@@ -478,16 +492,27 @@ def main() -> None:
                     log_to_console=False,
                 )
 
+                f1 = val_log["f1"]
+                # 被选中 epoch 的 cls_loss：存档字段 best_val_loss 保持「loss 量级」，
+                # 避免推理 / 可视化脚本把 F1 当成 loss 画出来
+                val_cls_loss = val_log.get("cls_loss", val_log["loss"])
                 log_msg += (
                     f" | val L={val_log['loss']:.3f} "
                     f"acc={val_log['acc']['mean']:.3f}"
+                    f" | val f1={f1['mean']:.4f} "
+                    f"(manner={f1.get('manner', 0.0):.4f} place={f1.get('place', 0.0):.4f} "
+                    f"voicing={f1.get('voicing', 0.0):.4f} "
+                    f"vowel_backness={f1.get('vowel_backness', 0.0):.4f})"
                 )
                 if "agree_manner" in val_log:
                     log_msg += f" agree_manner={val_log['agree_manner']:.3f}"
                 logger.info(log_msg)
 
-                if val_log["loss"] < fold_best_val_loss:
-                    fold_best_val_loss = val_log["loss"]
+                # 选模用 val F1 mean：loss 不再参与择优，严格改善才覆盖
+                select_value = f1["mean"]
+
+                if select_value > fold_best_f1:
+                    fold_best_f1 = select_value
                     torch.save(
                         _build_checkpoint(
                             fold_id=fold_id,
@@ -495,7 +520,9 @@ def main() -> None:
                             model=model,
                             distill=distill,
                             optimizer=optimizer,
-                            best_val_loss=fold_best_val_loss,
+                            best_val_loss=val_cls_loss,
+                            select_metric="f1_mean",
+                            best_select_value=fold_best_f1,
                             teacher=teacher,
                             config=config,
                             checkpoint_type="fold_best",
@@ -504,12 +531,13 @@ def main() -> None:
                     )
                     logger.info(
                         f"Fold best checkpoint saved (Fold {fold_id}, "
-                        f"Epoch {epoch + 1}, val_loss={fold_best_val_loss:.4f}): "
+                        f"Epoch {epoch + 1}, val F1 mean={fold_best_f1:.4f}, "
+                        f"cls_loss={val_cls_loss:.4f}): "
                         f"{fold_best_ckpt_path}"
                     )
 
-                if val_log["loss"] < global_best_val_loss:
-                    global_best_val_loss = val_log["loss"]
+                if select_value > global_best_f1:
+                    global_best_f1 = select_value
                     if (
                         global_best_ckpt_path is not None
                         and global_best_ckpt_path.exists()
@@ -525,7 +553,9 @@ def main() -> None:
                             model=model,
                             distill=distill,
                             optimizer=optimizer,
-                            best_val_loss=global_best_val_loss,
+                            best_val_loss=val_cls_loss,
+                            select_metric="f1_mean",
+                            best_select_value=global_best_f1,
                             teacher=teacher,
                             config=config,
                             checkpoint_type=None,
@@ -534,7 +564,8 @@ def main() -> None:
                     )
                     logger.info(
                         f"Global best checkpoint saved (Fold {fold_id}, "
-                        f"Epoch {epoch + 1}, val_loss={global_best_val_loss:.4f}): {ckpt_path}"
+                        f"Epoch {epoch + 1}, val F1 mean={global_best_f1:.4f}, "
+                        f"cls_loss={val_cls_loss:.4f}): {ckpt_path}"
                     )
             else:
                 logger.info(log_msg)
@@ -546,7 +577,7 @@ def main() -> None:
 
     logger.info(f"{'=' * 60}")
     logger.info(
-        f"Training finished. Best val_loss across all folds: {global_best_val_loss:.4f}"
+        f"Training finished. Best val F1 mean across all folds: {global_best_f1:.4f}"
     )
     logger.info(f"Best checkpoint: {global_best_ckpt_path}")
 
@@ -599,6 +630,8 @@ def _build_checkpoint(
     teacher,
     config: dict,
     checkpoint_type,
+    select_metric: str = "f1_mean",
+    best_select_value: Optional[float] = None,
 ) -> dict:
     """组装学生 checkpoint 字典。
 
@@ -611,10 +644,12 @@ def _build_checkpoint(
         model: 学生模型。
         distill: 蒸馏损失（取其 ``projector``）。
         optimizer: 优化器，用于断点续训。
-        best_val_loss: 该 checkpoint 对应的验证硬标签损失。
+        best_val_loss: 被选中 epoch 的验证硬标签损失（保持 loss 量级，供可视化/推理兼容读取）。
         teacher: :class:`MultiDistillTeacher`，取其 ``meta``。
         config: 继承教师数据字段之后的实际 config。
         checkpoint_type: ``"fold_best"`` 或 ``None``（全局最优，保持与基线一致）。
+        select_metric: 选模指标名，固定写 ``"f1_mean"``（仅作留痕）。
+        best_select_value: 被选中 epoch 的验证 F1 均值；旧脚本构造时为 ``None``。
 
     Returns:
         可直接 ``torch.save`` 的字典。
@@ -628,9 +663,12 @@ def _build_checkpoint(
         ),
         "optimizer_state_dict": optimizer.state_dict(),
         "best_val_loss": best_val_loss,
+        "select_metric": select_metric,
         "teacher_info": teacher.meta,
         "config": config,
     }
+    if best_select_value is not None:
+        ckpt["best_select_value"] = best_select_value
     if checkpoint_type is not None:
         ckpt["checkpoint_type"] = checkpoint_type
     return ckpt

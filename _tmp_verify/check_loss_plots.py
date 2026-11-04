@@ -1,9 +1,14 @@
-"""临时校验脚本：按流水线分派的 loss 图集（可重复运行，不碰真实数据）。
+"""临时校验脚本：按流水线分派的 loss / F1 图集（可重复运行，不碰真实数据）。
 
 构造五份合成 metrics.jsonl（image / audio / fusion / contrast / kd）+ 五个假 ckpt，
 调用 ``src.eval.evaluate._generate_loss_plots``，断言各流水线产出的 PNG 文件集合，
-并检查 contrast 的 best-epoch 竖线口径、fusion 缺 F1 列时的降级告警、kd 不出
-``fold{N}_loss.png``。
+并检查：
+
+- F1 选模推广后**所有**流水线都出 ``fold{N}_f1.png`` 与 ``all_folds_f1.png``；
+- 缺 F1 列时只跳过 F1 图，其余图照出；
+- ``fold{N}_f1.png`` 的 best-epoch 竖线由 :func:`src.eval.f1.resolve_f1_best_epoch` 给（
+  ckpt 的 ``epoch`` 字段优先，否则取四头 F1 均值的 argmax）；
+- ``resolve_plot_family`` 不再把「日志含 val_f1_*」当作 fusion 的特征。
 
 用法::
 
@@ -84,12 +89,16 @@ def build_records(family: str, with_f1: bool = True) -> list:
         val_extra = {}
         if family == "contrast":
             val_extra = {"contrast_loss": 0.6}
-        if family == "fusion" and with_f1:
-            val_extra = {
-                "f1": {"mean": 0.6, **{head: 0.6 for head in HEADS}},
-                "image_only_f1": {"mean": 0.58, **{head: 0.58 for head in HEADS}},
-                "audio_only_f1": {"mean": 0.55, **{head: 0.55 for head in HEADS}},
-            }
+        # F1 选模推广后所有流水线都写 f1；image_only / audio_only 仍是 fusion 专属诊断
+        if with_f1:
+            val_extra["f1"] = {"mean": 0.6, **{head: 0.6 for head in HEADS}}
+            if family == "fusion":
+                val_extra.update(
+                    {
+                        "image_only_f1": {"mean": 0.58, **{head: 0.58 for head in HEADS}},
+                        "audio_only_f1": {"mean": 0.55, **{head: 0.55 for head in HEADS}},
+                    }
+                )
         records.append(
             {
                 **_common_record(epoch, "validation", val_cls, val_cls, val_heads),
@@ -143,14 +152,26 @@ def main() -> None:
         shutil.rmtree(base)
     base.mkdir(parents=True, exist_ok=True)
 
-    # 期望：所有流水线都有的两张图 + 各流水线的专属图
-    common = {"all_folds_val_loss.png", "fold1_loss.png", "fold1_head_loss.png"}
+    # 期望：所有流水线都有的图（含 F1）+ 各流水线的专属图
+    common = {
+        "all_folds_val_loss.png",
+        "all_folds_f1.png",
+        "fold1_loss.png",
+        "fold1_head_loss.png",
+        "fold1_f1.png",
+    }
+    kd_common = {
+        "all_folds_val_loss.png",
+        "all_folds_f1.png",
+        "fold1_head_loss.png",
+        "fold1_f1.png",
+    }
     expectations = {
         "image": common,
         "audio": common,
-        "fusion": common | {"fold1_f1.png"},
+        "fusion": common,
         "contrast": common | {"fold1_loss_components.png"},
-        "kd": {"all_folds_val_loss.png", "fold1_head_loss.png", "fold1_loss_components.png"},
+        "kd": kd_common | {"fold1_loss_components.png"},
     }
 
     failures = []
@@ -160,38 +181,66 @@ def main() -> None:
         if produced != expected:
             failures.append(f"{family}: expected {sorted(expected)}, got {sorted(produced)}")
 
-    # fusion 缺 F1 列时必须降级：不生成 f1 图，但其余图照出
+    # 缺 F1 列时必须降级：不生成 f1 / all_folds_f1 图，但其余图照出
     produced = run_family("fusion_no_f1", base / "fusion_no_f1_root", with_f1=False)
-    if "fold1_f1.png" in produced:
-        failures.append("fusion 缺 F1 列时不应生成 fold1_f1.png")
+    if "fold1_f1.png" in produced or "all_folds_f1.png" in produced:
+        failures.append("缺 F1 列时不应生成 f1 图")
     if "fold1_head_loss.png" not in produced:
-        failures.append("fusion 缺 F1 列时其余图仍应生成")
+        failures.append("缺 F1 列时其余图仍应生成")
 
-    # best-epoch 竖线口径：select_metric 存在时按该列 argmin，而不是 val_loss
-    check_best_epoch_metric()
+    # F1 竖线口径 + 流水线判定不再依赖 val_f1_* 列
+    check_f1_best_epoch()
+    check_family_not_from_f1_column(base, failures)
 
     if failures:
         raise AssertionError("\n".join(failures))
     print(f"[OK] 全部图集断言通过，输出目录：{base}")
 
 
-def check_best_epoch_metric() -> None:
-    """验证 :func:`infer_best_val_epoch` 跟随 ckpt 的 ``select_metric``。"""
+def check_f1_best_epoch() -> None:
+    """验证 :func:`resolve_f1_best_epoch`：ckpt epoch 优先，否则取四头均值 argmax。"""
     import pandas as pd
 
-    from src.eval.visualize import infer_best_val_epoch
+    from src.eval.f1 import resolve_f1_best_epoch
 
-    df = pd.DataFrame({
-        "epoch": [5, 6],
-        "val_loss": [4.0, 3.5],      # val_loss 最小在 epoch 6
-        "val_cls_loss": [2.0, 2.5],  # cls_loss 最小在 epoch 5
-    })
-    epoch, value, metric = infer_best_val_epoch(df, {"select_metric": "cls_loss"})
-    assert (epoch, metric) == (5, "val_cls_loss"), (epoch, metric)
-    assert value == 2.0, value
+    df = pd.DataFrame(
+        {
+            "epoch": [5, 6, 11],
+            "val_f1_manner": [0.50, 0.85, 0.60],
+            "val_f1_place": [0.40, 0.85, 0.70],
+            "val_f1_voicing": [0.60, 0.85, 0.55],
+            "val_f1_vowel_backness": [0.50, 0.85, 0.65],
+        }
+    )
 
-    epoch, _, metric = infer_best_val_epoch(df, {})
-    assert (epoch, metric) == (6, "val_loss"), (epoch, metric)
+    # ckpt 的 epoch 优先（即使它不是均值最大点）
+    epoch, value = resolve_f1_best_epoch(df, {"epoch": 11})
+    assert epoch == 11, epoch
+    assert abs(value - 0.625) < 1e-9, value
+
+    # 无 ckpt epoch 时按四头均值 argmax
+    epoch, value = resolve_f1_best_epoch(df, {})
+    assert epoch == 6, epoch
+    assert abs(value - 0.85) < 1e-9, value
+
+    # 完全没有 F1 列时返回 (None, None)
+    empty = pd.DataFrame({"epoch": [1, 2]})
+    assert resolve_f1_best_epoch(empty, {}) == (None, None)
+
+
+def check_family_not_from_f1_column(base: Path, failures: list) -> None:
+    """日志只有 ``val_f1_*`` 列时，不能再被判成 fusion（F1 已全流水线通用）。"""
+    import pandas as pd
+
+    from src.eval.visualize import resolve_plot_family
+
+    ckpt_dir = base / "family_check"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    torch.save({"fold": 1, "epoch": 1, "config": {}}, ckpt_dir / "best_model.pt")
+    log_df = pd.DataFrame({"val_f1_manner": [0.5], "val_loss": [1.0]})
+    family = resolve_plot_family(ckpt_dir / "best_model.pt", log_df=log_df)
+    if family == "fusion":
+        failures.append("只有 val_f1_* 列的日志不应被判成 fusion")
 
 
 if __name__ == "__main__":

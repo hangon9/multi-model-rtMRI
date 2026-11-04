@@ -34,7 +34,14 @@ from torch.optim import AdamW
 from tqdm import tqdm
 
 from data.splits import create_dataloader, make_train_test_split
-from src.eval.metrics import compute_metrics
+from src.eval.f1 import (
+    CONSONANT_MANNER_MAX as _CONSONANT_MANNER_MAX,
+    CONSONANT_MANNER_MIN as _CONSONANT_MANNER_MIN,
+    VOWEL_MANNER as _VOWEL_MANNER,
+    collect_predictions_for_f1,
+    finalize_f1_scores,
+    new_f1_buffers,
+)
 from src.losses.loss_factory import BuildLoss
 from src.models.contrastive_model import (
     AudioVisionContrastiveModel,
@@ -57,10 +64,8 @@ _PLACE_COLS = ["Labial", "Dental", "Alveolar", "Postalveolar", "Palatal", "Velar
 _VOICING_COLS = ["Voiced", "Voiceless"]
 _VOWEL_BACKNESS_COLS = ["Front", "Central", "Back"]
 
-# 与数据集一致的 manner 门控常量：1..4 为辅音（place/voicing 有效），5 为元音
-_CONSONANT_MANNER_MIN = 1
-_CONSONANT_MANNER_MAX = 4
-_VOWEL_MANNER = 5
+# Manner 门控常量不在此定义：从 ``src.eval.f1`` 别名引入（见文件头 import），
+# 保证 compute_accuracy 与 F1 收集用同一套边界，避免两份副本漂移。
 
 # 逐 batch 累计进 metrics.jsonl 的标量键；缺席的键不会写 0，而是整条不出现
 _SCALAR_METRIC_KEYS = (
@@ -74,14 +79,6 @@ _SCALAR_METRIC_KEYS = (
     "loss_voicing",
     "loss_vowel_backness",
 )
-
-#: 各头的类别列名（顺序即类别 id），供 macro-F1 的 per-class 指标使用
-_TASK_LABEL_NAMES = {
-    "manner": _MANNER_COLS,
-    "place": _PLACE_COLS,
-    "voicing": _VOICING_COLS,
-    "vowel_backness": _VOWEL_BACKNESS_COLS,
-}
 
 
 def _derive_class_indices(df, task: str):
@@ -269,99 +266,6 @@ def shuffle_val_dataframe(val_df, seed):
     rng = np.random.default_rng(seed)
     order = rng.permutation(len(val_df))
     return val_df.iloc[order].reset_index(drop=True)
-
-
-def new_f1_buffers():
-    """构造跨 batch 累积预测与标签的缓冲字典，键为四个头。"""
-    return {task: {"y_true": [], "y_pred": []} for task in TASKS}
-
-
-def collect_predictions_for_f1(logits, labels, classification_task, buffers):
-    """按与 :func:`compute_accuracy` 相同的门控规则累积预测与标签，供整集算 macro-F1。
-
-    macro-F1 必须在整个验证集上算一次：逐 batch 算再平均会让小类别（Glottal、Central
-    等）被重复计权。因此这里只往 ``buffers`` 追加 numpy 数组，数值计算留给
-    :func:`finalize_f1_scores`。
-
-    Args:
-        logits: 模型输出；多任务时是 ``{task: Tensor}``，单任务时是该头的 Tensor。
-        labels: 已搬到 device 的标签字典，键为四个头。
-        classification_task: 空串表示四头多任务，否则为单任务名。
-        buffers: :func:`new_f1_buffers` 的返回对象，由调用方跨 batch 持有。
-
-    Note:
-        place / voicing 的 ``-100`` 是数据集给的无效帧标记（silence / vowel），收集前必须
-        剔除；某 batch 全为无效帧时直接跳过，避免往缓冲里塞入空数组。
-    """
-    if classification_task != "":
-        pred = logits.argmax(dim=-1)
-        task_labels = labels[classification_task]
-        if classification_task in ("place", "voicing"):
-            valid_mask = task_labels != -100
-            if not valid_mask.any():
-                return
-            task_labels = task_labels[valid_mask]
-            pred = pred[valid_mask]
-        buffers[classification_task]["y_true"].append(task_labels.cpu().numpy())
-        buffers[classification_task]["y_pred"].append(pred.cpu().numpy())
-        return
-
-    if "manner" not in labels:
-        return
-
-    # 多任务：manner 全帧，place / voicing 只在辅音帧，vowel_backness 只在元音帧（多标签）
-    manner_labels = labels["manner"]
-    cons_mask = (manner_labels >= _CONSONANT_MANNER_MIN) & (
-        manner_labels <= _CONSONANT_MANNER_MAX
-    )
-    vowel_mask = manner_labels == _VOWEL_MANNER
-
-    for task in TASKS:
-        if task not in logits or task not in labels:
-            continue
-        if task in ("place", "voicing") and cons_mask.any():
-            pred = logits[task].argmax(dim=-1)
-            buffers[task]["y_true"].append(labels[task][cons_mask].cpu().numpy())
-            buffers[task]["y_pred"].append(pred[cons_mask].cpu().numpy())
-        elif task == "vowel_backness" and vowel_mask.any():
-            # 多标签：逐维度按 0.5 阈值二值化，与 compute_accuracy 的判定一致
-            pred = (torch.sigmoid(logits[task]) >= 0.5).float()
-            buffers[task]["y_true"].append(labels[task][vowel_mask].cpu().numpy())
-            buffers[task]["y_pred"].append(pred[vowel_mask].cpu().numpy())
-        elif task == "manner":
-            pred = logits[task].argmax(dim=-1)
-            buffers[task]["y_true"].append(labels[task].cpu().numpy())
-            buffers[task]["y_pred"].append(pred.cpu().numpy())
-
-
-def finalize_f1_scores(buffers, classification_task):
-    """拼接整集缓存，返回各头 macro-F1 及其未加权平均。
-
-    Args:
-        buffers: :func:`new_f1_buffers` 填充后的对象。
-        classification_task: 空串表示四头多任务，否则为单任务名。
-
-    Returns:
-        ``{<task>: macro_f1, "mean": 未加权平均}``。某头整折都没有有效帧时记 0.0
-        （与 :func:`compute_accuracy` 的占位口径一致），而不是 NaN。
-
-    Note:
-        ``mean`` 是选模依据：四头等权，避免 manner（帧数最多）单独主导。单任务时
-        ``mean`` 就等于该头的分数。
-    """
-    tasks = (classification_task,) if classification_task != "" else TASKS
-    scores = {}
-    for task in tasks:
-        y_true_parts = buffers.get(task, {}).get("y_true", [])
-        if not y_true_parts:
-            scores[task] = 0.0
-            continue
-        y_true = np.concatenate(y_true_parts)
-        y_pred = np.concatenate(buffers[task]["y_pred"])
-        result = compute_metrics(y_true, y_pred, _TASK_LABEL_NAMES[task])
-        scores[task] = float(result["macro_f1"])
-    scores["mean"] = sum(scores.values()) / max(len(scores), 1)
-    return scores
 
 
 def build_loss_from_config(config, device, class_weights=None, bce_pos_weight=None):

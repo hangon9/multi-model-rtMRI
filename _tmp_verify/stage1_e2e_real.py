@@ -65,7 +65,12 @@ def main():
     check("写出全局最佳 checkpoint", global_ckpt.exists(), str(global_ckpt))
 
     ckpt = torch.load(fold_ckpt, map_location="cpu", weights_only=False)
-    check("checkpoint 记录 select_metric", ckpt.get("select_metric") == "cls_loss", str(ckpt.get("select_metric")))
+    check("checkpoint 记录 select_metric", ckpt.get("select_metric") == "f1_mean", str(ckpt.get("select_metric")))
+    check(
+        "checkpoint 记录 best_select_value（F1 量级）",
+        0.0 <= float(ckpt.get("best_select_value", -1.0)) <= 1.0,
+        str(ckpt.get("best_select_value")),
+    )
     check(
         "checkpoint 记录 audio_checkpoint",
         str(ckpt.get("audio_checkpoint", "")).endswith("audio_only_best_model.pt"),
@@ -147,7 +152,7 @@ def main():
     check("日志记录教师路径解析来源", "path_source=given" in log_text)
     check("日志提示未找到同折存档", "不含折号" in log_text and "best_model_fold_" in log_text)
     check("日志记录对比位置与择优指标", "Contrast position: post_temporal" in log_text
-          and "Checkpoint select metric: cls_loss" in log_text)
+          and "Checkpoint select metric: val F1 mean" in log_text)
     print(f"\n{'=' * 60}")
     print(f"共 {len(FAILURES)} 项失败" if FAILURES else "全部通过")
     for name in FAILURES:

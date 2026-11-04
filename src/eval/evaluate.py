@@ -57,7 +57,9 @@ from src.eval.visualize import (
     plot_fold_loss_components,
     plot_fold_head_loss,
     plot_all_folds_val_loss,
+    plot_all_folds_f1,
     plot_fold_f1,
+    plot_heads_test_set_performance,
     plot_task_prf1,
     plot_task_confusion,
     plot_task_multilabel_confusion,
@@ -560,7 +562,7 @@ def _run_fold_comparison(
     model_family: Optional[str] = None,
     timit_root: Optional[Path] = None,
     timit_subjects: Optional[List[str]] = None,
-) -> None:
+) -> Dict[str, Dict[str, Any]]:
     """跑 ``best_model_fold_*.pt`` 的逐折对比评估。
 
     与单份 ``best_model.pt`` 评估路径刻意保持分离（见仓库记忆）：这里只产出折间汇总的
@@ -579,6 +581,10 @@ def _run_fold_comparison(
         timit_root: USC-TIMIT 根目录（绝对路径）；``mode == "timit"`` 时必填。
         timit_subjects: TIMIT 被试过滤列表；None 表示全部被试。
 
+    Returns:
+        ``{task: {"folds": {fold_id: f1}, "mean": float, "std": float}}``（std 为 ddof=0）；
+        无逐折 ckpt 或无可用任务时返回空 dict。这是 ``evaluate.main`` 拼按分类头柱状图的
+        数据来源。
 
     Side effects:
         创建输出目录、写入逐折 pickle 缓存、逐任务 JSON 与 PNG 图；全部通过 ``print`` 汇报。
@@ -608,8 +614,8 @@ def _run_fold_comparison(
         print(
             f"[evaluate] No best_model_fold_*.pt files{folds_text} "
             f"found in {checkpoint_dir}; skipping fold comparison."
-        )        
-        return
+        )
+        return {}
 
     per_fold: Dict[int, Tuple[Dict[str, Dict[str, np.ndarray]], Dict[str, Any]]] = {}
     if skip_inference:
@@ -678,6 +684,8 @@ def _run_fold_comparison(
                 pickle.dump(value, f)
             print(f"[evaluate] Cached fold {fold_id} results to {cache_path}")
 
+    # 逐头跳折汇总：{task: {"folds", "mean", "std"}}，供 main 拼按分类头柱状图
+    head_scores: Dict[str, Dict[str, Any]] = {}
     for task in TASKS:
         per_fold_reports: dict[int, dict] = {}
         for fold_id, (results, meta) in sorted(per_fold.items()):
@@ -697,11 +705,15 @@ def _run_fold_comparison(
 
         agg = _aggregate_fold_metrics(per_fold_reports, CLASS_NAMES[task])
         _save_fold_comparison_json(agg, task, metrics_dir)
+        # 顺手留下该头的跳折汇总（含 folds/mean/std），供 main 拼按分类头柱状图
+        head_scores[task] = agg["Macro Avg"]["f1"]
         # 论文 macro F1 是 in-domain 数字，画在 TIMIT 图上会误导
         plot_task_prf1_fold_comparison(
             agg, task, figures_dir, show_paper_ref=(mode != TIMIT_MODE)
         )
         print(f"[evaluate] Saved fold-comparison PRF1 plot for task={task}")
+
+    return head_scores
 
 
 # ---------------------------------------------------------------------------
@@ -718,13 +730,17 @@ def _generate_loss_plots(
 
     图集规则（详见 ``docs/plans/eval_loss_plots_by_pipeline.md``）：
 
-    - 所有流水线：``all_folds_val_loss.png`` + ``fold{N}_head_loss.png``；
+    - 所有流水线：``all_folds_val_loss.png`` + ``fold{N}_head_loss.png`` +（有 F1 列时）
+      ``fold{N}_f1.png`` + ``all_folds_f1.png``；
     - 除 kd 外：再加 ``fold{N}_loss.png``（train/val 总损失）；
     - contrast：再加 ``fold{N}_loss_components.png``（CLS / Contrast）；
     - kd：再加 ``fold{N}_loss_components.png``（CLS / KD / KD-Feat / Total，
       前三格里的蒸馏项只有 train 侧）；kd **不出** ``fold{N}_loss.png``，因为它的
-      train loss 含蒸馏而 val loss 不含，两者不同口径；
-    - fusion：再加 ``fold{N}_f1.png``（``all_folds_f1.png`` 已取消）。
+      train loss 含蒸馏而 val loss 不含，两者不同口径。
+
+    Note:
+        best epoch 的竖线只画在 F1 图上（F1 是五个流水线的选模口径），loss 图不再标记最优
+        验证 epoch；旧 run 的 ``metrics.jsonl`` 无 ``f1`` 字段时只有告警、不出 F1 图。
 
     Args:
         log_dir: run 目录（含 ``metrics.jsonl`` 或 ``training.log``）。
@@ -760,12 +776,13 @@ def _generate_loss_plots(
         meta = load_checkpoint_meta(ckpt_path.parent, fold=fold)
         # kd 的 train/val 口径不同（训练含蒸馏、验证不含），因此不出 total loss 单折图
         if family != "kd":
-            plot_fold_loss(df_fold, fold, meta, figures_dir)
+            plot_fold_loss(df_fold, fold, figures_dir)
         plot_fold_head_loss(df_fold, fold, figures_dir)
         if components is not None:
             plot_fold_loss_components(df_fold, fold, figures_dir, components)
-        if family == "fusion" and _has_f1_data(df_fold):
-            plot_fold_f1(df_fold, fold, figures_dir)
+        # F1 曲线是选模依据，所有流水线都出；旧 run 没有 val_f1_* 列时跳过并告警
+        if _has_f1_data(df_fold):
+            plot_fold_f1(df_fold, fold, figures_dir, meta=meta)
         print(f"[evaluate] Saved loss/F1 plots for fold {fold} (family={family})")
 
     if histories:
@@ -774,17 +791,20 @@ def _generate_loss_plots(
         )
         plot_all_folds_val_loss(histories, best_meta, figures_dir)
         print("[evaluate] Saved all_folds_val_loss.png")
+        if plot_all_folds_f1(histories, figures_dir):
+            print("[evaluate] Saved all_folds_f1.png")
 
 
 def _has_f1_data(df) -> bool:
-    """判断该折的日志里是否存在可画的验证 F1（只有 fusion 会写这些列）。
+    """判断该折的日志里是否存在可画的验证 F1 列。
 
     Args:
         df: 单折 DataFrame。
 
     Returns:
-        ``val_f1_<head>`` 中任一头有非 NaN 值时返回 True；否则 False
-        （此时不生成空白 f1 图，只保留上游告警）。
+        ``val_f1_<head>`` 中任一头有非 NaN 值时返回 True。F1 选模推广后所有流水线都会写
+        这些列；改造前的历史 run（`metrics.jsonl` 无 `f1` 字段）只能得到 False，
+        此时不生成空白 f1 图，只保留上游告警。
     """
     for task in TASKS:
         column = f"val_f1_{task}"
@@ -803,13 +823,13 @@ def _warn_missing_plot_columns(family: str, loss_df) -> None:
     Returns:
         None；只打印告警，不改变后续流程，确保缺数据时画图不中断。
     """
-    if family == "fusion":
-        f1_col = "val_f1_manner"
-        if f1_col not in loss_df.columns or not loss_df[f1_col].notna().any():
-            print(
-                "[evaluate] WARNING: fusion run 没有验证 F1 字段，跳过 fold{N}_f1.png"
-                "（F1 只写在 metrics.jsonl 里，training.log 无此信息）"
-            )
+    # F1 曲线：所有流水线都应有；缺失通常是改造前的旧 run（metrics.jsonl 无 f1 字段）
+    f1_col = "val_f1_manner"
+    if f1_col not in loss_df.columns or not loss_df[f1_col].notna().any():
+        print(
+            "[evaluate] WARNING: 没有验证 F1 字段，跳过 fold{N}_f1.png 与 all_folds_f1.png"
+            "（F1 只写在 metrics.jsonl 里；旧 run 需用新代码重训才会有）"
+        )
 
     if family in LOSS_COMPONENTS_BY_FAMILY:
         missing = [
@@ -848,7 +868,7 @@ def _generate_task_plots(
     figures_dir: Path,
     metrics_dir: Path,
     show_paper_ref: bool = True,
-) -> None:
+) -> Dict[str, float]:
     """逐任务写 PRF1 图 / 混淆矩阵图与 metrics JSON。
 
     Args:
@@ -859,8 +879,13 @@ def _generate_task_plots(
             TIMIT 是跨域结果，与论文数字不可比，调用方应传 False。
 
     Returns:
-        None。副作用：写 PNG / JSON，并向 stdout 打印进度。
+        ``{task: macro_f1}``。这是单 ckpt 路径下「按分类头汇总图」的数据来源；
+        无类别名的任务不计入。
+
+    Side effects:
+        写 PNG / JSON，并向 stdout 打印进度。
     """
+    scores: Dict[str, float] = {}
     for task in results:
         y_true = results[task]["labels"]
         y_pred = results[task]["preds"]
@@ -875,6 +900,7 @@ def _generate_task_plots(
             _save_metrics_json(report_obj, task, metrics_dir)
             plot_task_prf1(report_obj, task, figures_dir, show_paper_ref=show_paper_ref)
             plot_task_multilabel_confusion(report_obj, task, figures_dir)
+            scores[task] = float(report_obj["macro avg"]["f1"])
             print(f"[evaluate] Saved PRF1 & multilabel confusion plots for task={task}")
             continue
 
@@ -890,7 +916,9 @@ def _generate_task_plots(
         _save_metrics_json(report_obj, task, metrics_dir)
         plot_task_prf1(report_obj, task, figures_dir, show_paper_ref=show_paper_ref)
         plot_task_confusion(report_obj, task, figures_dir)
+        scores[task] = float(report_obj["macro avg"]["f1"])
         print(f"[evaluate] Saved PRF1 & confusion plots for task={task}")
+    return scores
 
 def _run_eval_for_mode(
     mode: str,
@@ -903,7 +931,7 @@ def _run_eval_for_mode(
     model_family: Optional[str] = None,
     timit_root: Optional[Path] = None,
     timit_subjects: Optional[List[str]] = None,
-) -> None:
+) -> Dict[str, Dict[str, Any]]:
     """跑一次 inference + per-task 图/metrics + meta，全部写入 eval_root 下。
 
     Args:
@@ -919,6 +947,10 @@ def _run_eval_for_mode(
         model_family: ``--model`` 解析后的内部模型族标签；``None`` 表示自动识别。
         timit_root: USC-TIMIT 根目录（绝对路径）；``mode == "timit"`` 时必填。
         timit_subjects: TIMIT 被试过滤列表；None 表示全部被试。
+
+    Returns:
+        ``{task: {"folds", "mean", "std"}}``：``--eval-folds`` 时为跳折汇总，否则为
+        单份 ``best_model.pt`` 的结果（``folds`` 为空、``std`` 为 0）。
 
     Side effects:
         创建目录、写图/JSON/pickle 缓存；均通过 ``print`` 汇报。
@@ -951,7 +983,7 @@ def _run_eval_for_mode(
     )
 
     metrics_dir.mkdir(parents=True, exist_ok=True)
-    _generate_task_plots(
+    task_scores = _generate_task_plots(
         results, figures_dir, metrics_dir, show_paper_ref=(mode != TIMIT_MODE)
     )
 
@@ -986,7 +1018,7 @@ def _run_eval_for_mode(
             allowed_folds = {int(fold) for fold in train_fold}
         else:
             allowed_folds = None
-        _run_fold_comparison(
+        return _run_fold_comparison(
             checkpoint_dir=checkpoint_dir,
             device=device,
             mode=mode,
@@ -997,6 +1029,69 @@ def _run_eval_for_mode(
             timit_root=timit_root,
             timit_subjects=timit_subjects,
         )
+
+    # 单 ckpt 路径：没有跳折数据，标准差记 0（柱状图会自动不画误差线）
+    return {
+        task: {"folds": {}, "mean": value, "std": 0.0}
+        for task, value in task_scores.items()
+    }
+
+def _overall_head_stats(head_stats: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """在四个头之外补一条 ``overall``：逐折先对可用头取平均，再跳折求 mean/std。
+
+    这个定义与训练脚本的选模指标 ``f1 mean`` 完全一致（四头等权），所以图上的 ``overall``
+    柱就是训练时用来选 ckpt 的那个量。单 ckpt 路径（无 ``folds``）退化为「四头 mean 的均值」，
+    标准差记 0。
+
+    Args:
+        head_stats: ``{head: {"folds": {fold_id: f1}, "mean": float, "std": float}}``；
+            来自 :func:`_run_fold_comparison` 或单 ckpt 路径的包装。
+
+    Returns:
+        新的字典，保留原头并在末尾追加 ``overall``（若四头均无数据则不追加）。
+    """
+    stats_by_head: Dict[str, Dict[str, Any]] = {
+        task: {
+            "folds": dict(values.get("folds") or {}),
+            "mean": float(values.get("mean", float("nan"))),
+            "std": float(values.get("std", 0.0)),
+        }
+        for task, values in head_stats.items()
+    }
+
+    # 逐折平均：只在该折有值的头之间平均，避免某个头整折无有效帧时被当成 0 稀释
+    fold_ids = sorted({fid for values in stats_by_head.values() for fid in values["folds"]})
+    overall_folds: Dict[int, float] = {}
+    for fold_id in fold_ids:
+        fold_values = [
+            values["folds"][fold_id]
+            for values in stats_by_head.values()
+            if fold_id in values["folds"]
+        ]
+        if fold_values:
+            overall_folds[fold_id] = float(np.mean(fold_values))
+
+    if overall_folds:
+        array = np.asarray(list(overall_folds.values()), dtype=float)
+        stats_by_head["overall"] = {
+            "folds": dict(sorted(overall_folds.items())),
+            "mean": float(array.mean()),
+            "std": float(array.std(ddof=0)),
+        }
+    else:
+        means = [
+            values["mean"]
+            for values in stats_by_head.values()
+            if not np.isnan(values["mean"])
+        ]
+        if means:
+            stats_by_head["overall"] = {
+                "folds": {},
+                "mean": float(np.mean(means)),
+                "std": 0.0,
+            }
+    return stats_by_head
+
 
 # ---------------------------------------------------------------------------
 # Main
@@ -1094,9 +1189,11 @@ def main() -> None:
 
     # 去重保序：重复的 mode 会重建同一目录两次，等于把最贵的推理跑两遍
     eval_sets = list(dict.fromkeys(args.eval_sets))
+    # 按分类头汇总：{mode: {head: {"folds", "mean", "std"}}}，跳 mode 累加
+    heads_by_mode: Dict[str, Dict[str, Dict[str, Any]]] = {}
     for mode in eval_sets:
         print(f"[evaluate] === Running eval_mode={mode} ===")
-        _run_eval_for_mode(
+        head_stats = _run_eval_for_mode(
             mode=mode,
             eval_root=eval_dir / mode,
             checkpoint_path=checkpoint_path,
@@ -1108,6 +1205,25 @@ def main() -> None:
             timit_root=timit_root,
             timit_subjects=args.timit_subjects,
         )
+        if head_stats:
+            heads_by_mode[mode] = _overall_head_stats(head_stats)
+
+    # 按分类头柱状图：跳过所有测试集拼一张图；失败不影响已跑完的推理与单集结果
+    if heads_by_mode:
+        try:
+            metrics_dir.mkdir(parents=True, exist_ok=True)
+            summary_path = metrics_dir / "heads_test_set_summary.json"
+            with summary_path.open("w", encoding="utf-8") as f:
+                json.dump(heads_by_mode, f, indent=2, ensure_ascii=False)
+            print(f"[evaluate] Saved head summary → {summary_path}")
+            plot_heads_test_set_performance(
+                heads_by_mode, figures_dir / "heads_test_set_performance.png"
+            )
+            print("[evaluate] Saved heads_test_set_performance.png")
+        except Exception as exc:  # noqa: BLE001 —— 画图失败不该让昂贵的评测总进程崩掉
+            print(f"[evaluate] WARNING: 按分类头汇总图生成失败（{exc}），跳过")
+    else:
+        print("[evaluate] WARNING: 没有可汇总的分类头指标，跳过 heads_test_set_performance.png")
 
     print("[evaluate] Done.")
 

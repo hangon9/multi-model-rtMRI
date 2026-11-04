@@ -30,7 +30,10 @@ TEST_SCRIPTS = (
     "check_bce_scale_numpy.py",
     "test_overfit_smoke.py",
     "test_train_loop_integration.py",
-    # contrast：验证集固定种子打乱 + 按 val macro-F1 选模（含 main 的存档字段与旁路）
+    # F1 选模 / 验证集 shuffle：共享模块 + 各流水线的接入点 + eval 侧的画图
+    "test_f1_module.py",
+    "test_f1_select_pipelines.py",
+    "test_heads_summary.py",
     "test_contrast_f1_select.py",
     # USC-TIMIT 跨域评估：先是数据层，再是评估链路（均基于假数据）
     "test_timit_prepare.py",

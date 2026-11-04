@@ -42,6 +42,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from src.eval.f1 import resolve_f1_best_epoch
+
 try:
     import torch
 except Exception:  # pragma: no cover
@@ -194,16 +196,6 @@ def extract_meta(ckpt: Mapping[str, Any]) -> Mapping[str, Any]:
     return ckpt
 
 
-def get_nested_number(d: Mapping[str, Any], keys: Sequence[str]) -> Optional[float]:
-    for k in keys:
-        if k in d and d[k] is not None:
-            try:
-                return float(d[k])
-            except Exception:
-                pass
-    return None
-
-
 def discover_checkpoint_for_fold(checkpoint_dir: Path, fold: int) -> Optional[Path]:
     candidates = [
         checkpoint_dir / f"fold{fold}_best.pt",
@@ -229,10 +221,6 @@ def load_checkpoint_meta(checkpoint_dir: Path, fold: Optional[int] = None, best_
     return extract_meta(safe_torch_load(path))
 
 
-#: ckpt 内 ``select_metric`` 取值 → 对应的验证列。contrast 训练脚本把真实择优指标
-#: 写进 ckpt（默认 ``cls_loss``），其它流水线没有这个键，回退到 ``val_loss``。
-_SELECT_METRIC_COLUMNS = {"loss": "val_loss", "cls_loss": "val_cls_loss"}
-
 #: 每类流水线的 loss 分项子图配置：``(子图标题, train 列, val 列或 None)``。
 #: ``val`` 为 ``None`` 表示该分项只在训练期存在（如 kd 的蒸馏项，验证不跑教师）。
 #: 不在表里的流水线（image / audio / fusion）不画 components 图。
@@ -250,53 +238,18 @@ LOSS_COMPONENTS_BY_FAMILY: Dict[str, Tuple[Tuple[str, str, Optional[str]], ...]]
 }
 
 
-def infer_best_val_epoch(
-    df: pd.DataFrame,
-    meta: Optional[Mapping[str, Any]] = None,
-) -> Tuple[Optional[int], Optional[float], str]:
-    """找出最优验证 epoch 及其指标名。
-
-    择优指标跟训练脚本保持一致：ckpt 里存了 ``select_metric`` 时（contrast 默认
-    ``cls_loss``）按该列取最小值；否则按 ``val_loss``（即日志里的 ``loss``）。
-    否则图上圈出的 best epoch 与 ckpt 记录的 ``best_val_loss`` 会对不上。
-
-    Args:
-        df: 单折的历史 DataFrame，需含 ``epoch`` 列。
-        meta: ckpt 元信息；可为 ``None`` 或空映射。
-
-    Returns:
-        ``(best_epoch, best_value, metric_name)``；找不到可用列时返回
-        ``(None, None, "val_loss")``，调用方据此跳过竖线标注。
-    """
-    metric = (meta or {}).get("select_metric")
-    column = _SELECT_METRIC_COLUMNS.get(metric, "val_loss") if metric else "val_loss"
-
-    # 配置的列可能因旧日志/单任务 run 全为 NaN，此时退回 val_loss
-    if column not in df.columns or df[column].dropna().empty:
-        column = "val_loss"
-    if column not in df.columns or df[column].dropna().empty:
-        return None, None, column
-
-    idx = df[column].astype(float).idxmin()
-    return int(df.loc[idx, "epoch"]), float(df.loc[idx, column]), column
-
-
-# -----------------------------
-# Plot 1 & 2: fold training curves
-# -----------------------------
-
-def plot_fold_loss(df: pd.DataFrame, fold: int, meta: Mapping[str, Any], out_dir: Path) -> None:
-    """绘制单折的 train/val 总损失曲线，并标出 ckpt 口径的最优 epoch。
+def plot_fold_loss(df: pd.DataFrame, fold: int, out_dir: Path) -> None:
+    """绘制单折的 train/val 总损失曲线。
 
     Args:
         df: 单折历史 DataFrame，需含 ``epoch`` 与 ``train_loss``/``val_loss``。
         fold: 折号，用于标题与文件名 ``fold{N}_loss.png``。
-        meta: 该折 ckpt 的元信息，用于读 ``best_val_loss`` 与 ``select_metric``。
         out_dir: 图片输出目录（已存在）。
 
     Note:
-        竖线取哪个指标的 argmin 由 ckpt 的 ``select_metric`` 决定（见
-        :func:`infer_best_val_epoch`），与训练脚本的择优口径保持一致。
+        这里刻意不标 best epoch：五个流水线的选模已统一为验证集 F1 均值，最优 epoch 的
+        竖线画在 ``fold{N}_f1.png`` 上（见 :func:`plot_fold_f1`）。在 loss 图上标 F1 选出的
+        epoch 只会让人误以为它是 loss 最小值。
     """
     fig, ax = plt.subplots(figsize=(9, 5.2))
 
@@ -307,29 +260,10 @@ def plot_fold_loss(df: pd.DataFrame, fold: int, meta: Mapping[str, Any], out_dir
         val_df = df[["epoch", "val_loss"]].dropna()
         ax.plot(val_df["epoch"], val_df["val_loss"], linestyle="--", marker="*", markersize=9, label="val_loss")
 
-    # best epoch：竖线按 ckpt 的择优指标，图例记录 ckpt 实际保存的数值
-    best_epoch, best_val_from_curve, metric_name = infer_best_val_epoch(df, meta)
-    best_val_from_ckpt = get_nested_number(meta, ("best_val_loss", "val_loss", "best_loss"))
-    label_loss = best_val_from_ckpt if best_val_from_ckpt is not None else best_val_from_curve
-
-    if best_epoch is not None:
-        ax.axvline(best_epoch, linestyle="--", linewidth=1.2, color="gray",
-                   label=f"best {metric_name} epoch={best_epoch}")
-        y_top = ax.get_ylim()[1]
-        ax.text(best_epoch, y_top, f"  epoch {best_epoch}", rotation=90, va="top", ha="left", color="gray")
-
     ax.set_title(f"Fold {fold} Loss")
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
-    if label_loss is not None:
-        select_metric = meta.get("select_metric") if meta else None
-        suffix = f" (select_metric={select_metric})" if select_metric else ""
-        handles, labels = ax.get_legend_handles_labels()
-        labels.append(f"checkpoint best_val_loss={label_loss:.6g}{suffix}")
-        handles.append(plt.Line2D([], [], linestyle="", marker="", color="none"))
-        ax.legend(handles, labels)
-    else:
-        ax.legend()
+    ax.legend()
     ax.grid(True, alpha=0.3)
     fig.tight_layout()
     fig.savefig(out_dir / f"fold{fold}_loss.png", dpi=200)
@@ -538,14 +472,13 @@ def resolve_plot_family(
     if family is None and hint in _HINT_TO_PLOT_FAMILY:
         family, reason = _HINT_TO_PLOT_FAMILY[hint], f"--model hint={hint!r}"
 
-    # 3) 日志列特征：蒸馏/对比分项与 F1 只由对应流水线写出
+    # 3) 日志列特征：蒸馏 / 对比分项只由对应流水线写出。
+    #    注意不要再拿 ``val_f1_*`` 判 fusion：F1 选模推广后所有流水线都写这些列，会误判。
     if family is None and log_df is not None:
         if "train_kd_loss" in log_df.columns and log_df["train_kd_loss"].notna().any():
             family, reason = "kd", "日志含 loss_kd 分项"
         elif "train_contrast_loss" in log_df.columns and log_df["train_contrast_loss"].notna().any():
             family, reason = "contrast", "日志含 contrast_loss 分项"
-        elif "val_f1_manner" in log_df.columns and log_df["val_f1_manner"].notna().any():
-            family, reason = "fusion", "日志含验证 F1 字段"
 
     if family is None:
         family, reason = "image", "无判定信息，默认按 image 处理"
@@ -595,9 +528,31 @@ def plot_fold_f1(
     df: pd.DataFrame,
     fold: int,
     out_dir: Path,
+    meta: Optional[Mapping[str, Any]] = None,
     tasks: Sequence[str] = _F1_TASKS,
 ) -> None:
-    """绘制单折验证 F1，并在存在字段时叠加两种强制单模态曲线。"""
+    """绘制单折验证 F1（四个头各一格），并标出被选中的 epoch。
+
+    Args:
+        df: 单折历史 DataFrame，需含 ``epoch`` 与 ``val_f1_<task>``；缺列的头子图标
+            ``n/a``（单任务 run 属正常）。
+        fold: 折号，用于标题与文件名 ``fold{N}_f1.png``。
+        out_dir: 图片输出目录（已存在）。
+        meta: 该折 ckpt 的元信息；用于取被选中的 epoch（优先 ``epoch`` 字段）。
+        tasks: 要画的四个头。
+
+    Note:
+        竖线的 epoch 由 :func:`src.eval.f1.resolve_f1_best_epoch` 给：与训练脚本的 F1 选模
+        完全同口径（四头 F1 均值最大）。fusion 的 ``val_image_only_f1_*`` /
+        ``val_audio_only_f1_*`` 诊断曲线在其他流水线不存在时自动跳过。
+    """
+    best_epoch, best_value = resolve_f1_best_epoch(df, meta, tasks=tasks)
+    marker_label = (
+        f"best epoch={best_epoch} (mean F1={best_value:.4f})"
+        if best_epoch is not None and best_value is not None
+        else (f"best epoch={best_epoch}" if best_epoch is not None else None)
+    )
+
     fig, axes = plt.subplots(2, 2, figsize=(13, 9))
     for ax, task in zip(axes.flat, tasks):
         columns = (
@@ -617,17 +572,148 @@ def plot_fold_f1(
                     linestyle=linestyle,
                     label=label,
                 )
+
+        if not ax.lines:
+            # 单任务 run 里未训练的头：标 n/a，与 fold{N}_head_loss 的做法一致
+            ax.text(0.5, 0.5, "n/a", ha="center", va="center", fontsize=14, color="gray",
+                    transform=ax.transAxes)
+
+        if best_epoch is not None:
+            ax.axvline(best_epoch, linestyle="--", linewidth=1.2, color="gray",
+                       label=marker_label)
+
         ax.set_title(task.capitalize())
         ax.set_xlabel("Epoch")
         ax.set_ylabel("Macro F1")
         ax.set_ylim(0, 1.05)
         ax.grid(True, alpha=0.3)
         if ax.lines:
-            ax.legend()
+            ax.legend(fontsize=8)
 
     fig.suptitle(f"Fold {fold} Validation F1")
     fig.tight_layout()
     fig.savefig(out_dir / f"fold{fold}_f1.png", dpi=200)
+    plt.close(fig)
+
+
+def plot_all_folds_f1(histories: Mapping[int, pd.DataFrame], out_dir: Path) -> bool:
+    """绘制跳折验证 F1 对比图（四头 F1 均值，每折一条曲线）。
+
+    Args:
+        histories: ``{fold: DataFrame}``，需含 ``epoch`` 与 ``val_f1_<task>``；没有可用 F1
+            列的折会被跳过。
+        out_dir: 图片输出目录（已存在）。
+
+    Returns:
+        True 表示已写出 ``all_folds_f1.png``；一个可用折都没有时返回 False（不写文件、
+        不抛异常，调用方据此打印不同的日志）。
+
+    Note:
+        纵轴是四头 macro-F1 的未加权平均，即训练脚本的选模指标 ``f1 mean``，因此可以
+        直接对照 ckpt 的 ``best_select_value``。
+    """
+    fig, ax = plt.subplots(figsize=(9.5, 5.5))
+    plotted = 0
+    for fold, df in sorted(histories.items()):
+        columns = [f"val_f1_{task}" for task in _F1_TASKS if f"val_f1_{task}" in df.columns]
+        if not columns:
+            continue
+        subset = df[["epoch", *columns]].dropna(subset=columns, how="all")
+        if subset.empty:
+            continue
+        mean_f1 = subset[columns].mean(axis=1, skipna=True)
+        ax.plot(subset["epoch"], mean_f1, marker="o", linestyle="--", label=f"Fold {fold}")
+        plotted += 1
+
+    if plotted == 0:
+        print("[visualize] WARNING: 没有可用于 all_folds_f1.png 的验证 F1 列，跳过该图")
+        plt.close(fig)
+        return False
+
+    ax.set_title("All Folds Validation F1 (mean of 4 heads)")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Macro F1 (mean)")
+    ax.set_ylim(0, 1.05)
+    ax.grid(True, alpha=0.3)
+    ax.legend(title="Folds")
+    fig.tight_layout()
+    fig.savefig(out_dir / "all_folds_f1.png", dpi=200)
+    plt.close(fig)
+    return True
+
+
+def plot_heads_test_set_performance(
+    summary: Mapping[str, Mapping[str, Mapping[str, Any]]],
+    out_path: Path,
+    heads: Sequence[str] = (*_F1_TASKS, "overall"),
+) -> None:
+    """绘制「按分类头 × 测试集」的 macro-F1 柱状图（跨折均值 ± 标准差）。
+
+    Args:
+        summary: ``{mode: {head: {"mean": float, "std": float, ...}}}``；由
+            ``evaluate.main`` 从 ``--eval-folds`` 的跳折汇总（或单 ckpt 结果）拼成。
+            ``head`` 除四个头外还应有 ``overall``（四头逐折平均）。
+        out_path: PNG 输出路径。
+        heads: x 轴上的头序列，最后一个通常是 ``overall``。
+
+    Returns:
+        None。副作用：写 PNG，并在没有可画数据时打 WARN 后返回。
+
+    Note:
+        误差线只在**跳折**数据（`--eval-folds`）下有意义；只有 1 折时自动不画 `yerr`，
+        y 轴标题也不会声称跳折。std 口径与 ``*_prf1_fold_comparison.png` 一致（ddof=0）。
+    """
+    modes = list(summary.keys())
+    if not modes:
+        print("[visualize] WARNING: 没有测试集汇总数据，跳过 heads_test_set_performance.png")
+        return
+
+    # 折数：所有 mode 一致时才写进 y 轴标题；单折时不画误差线
+    fold_counts = {
+        len(stats.get(heads[0], {}).get("folds", {}) or {})
+        for stats in summary.values()
+    }
+    n_folds = fold_counts.pop() if len(fold_counts) == 1 else None
+    show_err = n_folds is not None and n_folds > 1
+    if not show_err:
+        print("[visualize] WARNING: 汇总只有 1 折（或折数不一致），不画标准差误差线")
+
+    x = np.arange(len(heads))
+    width = 0.8 / max(len(modes), 1)
+    fig, ax = plt.subplots(figsize=(13, 7))
+
+    for index, mode in enumerate(modes):
+        stats_by_head = summary[mode]
+        means = [float(stats_by_head.get(h, {}).get("mean", float("nan"))) for h in heads]
+        stds = [float(stats_by_head.get(h, {}).get("std", 0.0)) for h in heads]
+        offset = (index - (len(modes) - 1) / 2) * width
+        bars = ax.bar(
+            x + offset,
+            means,
+            width,
+            yerr=stds if show_err else None,
+            capsize=4,
+            label=mode.replace("_", " "),
+        )
+        ax.bar_label(bars, fmt="%.3f", padding=3, fontsize=9)
+
+    only_unseen = all(mode.startswith("unseen_") for mode in modes)
+    ax.set_title(
+        "Unseen-set performance by feature head"
+        if only_unseen
+        else "Test-set performance by feature head"
+    )
+    ax.set_xlabel("Phonological feature head")
+    ax.set_ylabel(
+        f"Mean macro-F1 across {n_folds} folds" if show_err else "Macro-F1"
+    )
+    ax.set_ylim(0, 1.0)
+    ax.set_xticks(x)
+    ax.set_xticklabels(heads)
+    ax.grid(True, axis="y", linestyle="--", alpha=0.4)
+    ax.legend(title="Evaluation set")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=200)
     plt.close(fig)
 
 
@@ -942,8 +1028,7 @@ def generate_all(args: argparse.Namespace) -> None:
             print(f"[WARN] Failed to load history {path}: {exc}")
             continue
         histories[fold] = df
-        meta = load_checkpoint_meta(checkpoint_dir, fold=fold)
-        plot_fold_loss(df, fold, meta, out_dir)
+        plot_fold_loss(df, fold, out_dir)
         plot_fold_loss_components(df, fold, out_dir)
         plot_fold_head_loss(df, fold, out_dir)
         print(f"[OK] Saved fold {fold} loss plots from {path.name}")

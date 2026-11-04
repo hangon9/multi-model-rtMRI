@@ -23,6 +23,14 @@ from tqdm import tqdm
 from sklearn.model_selection import GroupKFold
 
 from data.splits import make_train_test_split, create_dataloader
+from src.eval.f1 import (
+    CONSONANT_MANNER_MAX as _CONSONANT_MANNER_MAX,
+    CONSONANT_MANNER_MIN as _CONSONANT_MANNER_MIN,
+    VOWEL_MANNER as _VOWEL_MANNER,
+    collect_predictions_for_f1,
+    finalize_f1_scores,
+    new_f1_buffers,
+)
 from src.models.img_only_model import ImageMultiheadClassifier
 from src.losses.loss_factory import BuildLoss
 from utils.logger import TrainingLogger
@@ -43,10 +51,8 @@ _PLACE_COLS   = ["Labial", "Dental", "Alveolar", "Postalveolar",
 _VOICING_COLS = ["Voiced", "Voiceless"]
 _VOWEL_BACKNESS_COLS = ["Front", "Central", "Back"]
 
-# Manner indices from _MANNER_COLS: Stop/Nasal/Fricative/Approximant are consonants.
-_CONSONANT_MANNER_MIN = 1
-_CONSONANT_MANNER_MAX = 4
-_VOWEL_MANNER = 5
+# Manner 门控常量不在此定义：从 ``src.eval.f1`` 别名引入（见文件头 import），
+# 保证 compute_accuracy 与 F1 收集用同一套边界，避免两份副本漂移。
 
 
 # ---------------------------------------------------------------------------
@@ -178,9 +184,40 @@ def compute_accuracy(logits, labels, classification_task=""):
         return acc
 
     # Single-task mode
+    # 单任务时 logits 是该头的 Tensor，而 labels 仍是 move_labels_to_device 过滤后的字典，
+    # 所以标签必须按任务名取；place / voicing 额外剔掉 -100（无效帧），与 F1 收集同分母
     pred = logits.argmax(dim=-1)
-    acc_val = (pred == labels).float().mean().item()
+    task_labels = labels[classification_task]
+    if classification_task in ("place", "voicing"):
+        valid_mask = task_labels != -100
+        if not valid_mask.any():
+            return {classification_task: 0.0, "mean": 0.0}
+        task_labels = task_labels[valid_mask]
+        pred = pred[valid_mask]
+    acc_val = (pred == task_labels).float().mean().item()
     return {classification_task: acc_val, "mean": acc_val}
+
+
+def shuffle_val_dataframe(val_df, seed):
+    """按固定种子全局打乱验证集的帧顺序（独立 RNG，不碰全局随机流）。
+
+    数据集按说话人 / 任务连续排列，验证集若不打乱，同质 batch 会放大类别不平衡带来的
+    波动；打乱后每个 batch 跨说话人。用 ``np.random.default_rng`` 而不动全局流，是为了让
+    「打乱与否」不影响训练期的采样序列。单标签指标（loss / macro-F1）与顺序无关，不受影响。
+
+    Args:
+        val_df: 当前折的验证 DataFrame，一行是一帧。
+        seed: 整数种子；``main`` 传 ``data.seed + fold_id``，与折内其它随机性同源。
+
+    Returns:
+        行顺序被置换、索引重排为 ``0..N-1`` 的新 DataFrame；原对象不被修改。
+
+    Note:
+        同一份打乱结果在该折所有 epoch 复用，验证顺序逐 epoch 一致，指标跳 epoch 可比。
+    """
+    rng = np.random.default_rng(seed)
+    order = rng.permutation(len(val_df))
+    return val_df.iloc[order].reset_index(drop=True)
 
 
 # ---------------------------------------------------------------------------
@@ -478,12 +515,32 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device,
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, device, classification_task="", name="val"):
+    """验证循环：返回 loss / cls_loss / 逐头 loss / 准确率，以及整集累积的 macro-F1。
+
+    ``loss`` 与 ``acc`` 按样本数加权（与训练循环同口径）。额外的 ``f1`` 字典必须整集
+    累积后算一次（见 :func:`src.eval.f1.collect_predictions_for_f1`），因此比训练循环多维护
+    一份缓冲；它是训练脚本的选模依据。
+
+    Args:
+        model: 待评估模型；本函数内部切到 ``eval()``，不负责切回训练态。
+        loader: 验证 DataLoader；``train=False`` 时 ``shuffle`` 关闭，迭代顺序即传入
+            DataFrame 的行序。
+        criterion: :class:`BuildLoss` 实例。
+        device: 推理设备。
+        classification_task: 空串表示四头多任务，否则为单任务名。
+        name: tqdm 进度条前缀。
+
+    Returns:
+        ``{"loss", "cls_loss", "acc", "f1", ...逐头 loss}``；某个逐头分项只有在 batch
+        真的算过时才出现。``f1`` 为 ``{<task>: macro_f1, "mean": 四头未加权平均}``。
+    """
     model.eval()
     total_loss = 0.0
     total_cls_loss = 0.0
     _TASK_LOSS_KEYS = ("loss_manner", "loss_place", "loss_voicing", "loss_vowel_backness")
     total_task_loss = {k: 0.0 for k in _TASK_LOSS_KEYS}
     total_acc = {"mean": 0.0}
+    f1_buffers = new_f1_buffers()
     n = 0
 
     for batch in tqdm(loader, desc=name, leave=False):
@@ -512,12 +569,14 @@ def evaluate(model, loader, criterion, device, classification_task="", name="val
         for k in batch_acc:
             total_acc.setdefault(k, 0.0)
             total_acc[k] += batch_acc[k] * bs
+        collect_predictions_for_f1(logits, labels, classification_task, f1_buffers)
         n += bs
 
     result = {
         "loss": total_loss / n,
         "cls_loss": total_cls_loss / n,
         "acc": {k: v / n for k, v in total_acc.items()},
+        "f1": finalize_f1_scores(f1_buffers, classification_task),
     }
     result.update({k: v / n for k, v in total_task_loss.items()})
     return result
@@ -563,6 +622,14 @@ def main():
     data_cfg = config.get("data", {})
     classification_task = data_cfg.get("classification_task", "") or ""
     grad_clip = train_cfg.get("grad_clip", 0.5)
+    # 选模固定为验证集 macro-F1 的未加权平均；旧的 train.select_metric 已废弃
+    legacy_select_metric = train_cfg.get("select_metric", None)
+    if classification_task == "vowel_backness":
+        # 该头是多标签 BCE，F1 收集走单标签 argmax 路径，会给出错误的 macro-F1
+        raise ValueError(
+            "classification_task='vowel_backness' 不支持 F1 选模：该头是多标签 BCE，"
+            "请留空（多任务）或改用 manner/place/voicing。"
+        )
 
     # 模型实参先解析出来：既用于写日志，也直接展开成 ImageMultiheadClassifier 的实参，
     # 保证日志记录的就是构造函数真正收到的取值
@@ -597,6 +664,13 @@ def main():
     logger.info(f"Image encoder: {model_params['model_name']}, freeze_layers: {model_params['freeze_layers']}")
     logger.info(f"Temporal encoder: {model_params['temporal_type']}")
     logger.info(f"Classification task: {classification_task or 'multi-task'}")
+    logger.info("Checkpoint select metric: val F1 mean（四头 macro-F1 的未加权平均）")
+    if legacy_select_metric is not None:
+        logger.warning(
+            f"train.select_metric={legacy_select_metric!r} 已忽略："
+            "选模固定为验证集 F1 mean，不再支持按 loss 选模。"
+        )
+    logger.info("Val shuffle seed: data.seed + fold_id")
     logger.info(f"Cross-validation: {n_splits} folds, {num_epochs} epochs each")
     logger.info(f"Global seed: {seed}（每折使用 seed + fold_id）")
     if train_folds is None:
@@ -607,7 +681,7 @@ def main():
     # 模型参数各折完全相同，只在训练开始前打印一次
     log_model_params(logger, "ImageMultiheadClassifier", model_params)
 
-    global_best_val_loss = float("inf")
+    global_best_f1 = float("-inf")
     global_best_ckpt_path = None
 
     for fold, (train_idx, val_idx) in enumerate(get_fold_indices(train_val_df, config)):
@@ -625,7 +699,10 @@ def main():
         logger.info(f"Train samples: {len(train_df)}, Val samples: {len(val_df)}")
 
         train_loader = create_dataloader(train_df, config, train=True)
-        val_loader = create_dataloader(val_df, config, train=False)
+        # 验证集固定种子全局打乱，种子与折内其它随机性同源（data.seed + fold_id）
+        val_loader = create_dataloader(
+            shuffle_val_dataframe(val_df, seed + fold_id), config, train=False
+        )
 
         # ---- model ----
         model = ImageMultiheadClassifier(**model_params).to(device)
@@ -650,7 +727,7 @@ def main():
             anneal_strategy="cos",
         )
 
-        fold_best_val_loss = float("inf")
+        fold_best_f1 = float("-inf")
         fold_best_ckpt_path = checkpoint_dir / f"best_model_fold_{fold_id}.pt"
 
         # ---- training loop ----
@@ -705,6 +782,10 @@ def main():
                     log_to_console=False,
                 )
 
+                f1 = val_log["f1"]
+                # 被选中 epoch 的 cls_loss：存档字段 best_val_loss 保持「loss 量级」，
+                # 避免推理 / 可视化脚本把 F1 当成 loss 画出来
+                val_cls_loss = val_log.get("cls_loss", val_log["loss"])
                 log_msg += (
                     f" | val L={val_log['loss']:.3f} "
                     f"(m={val_log.get('loss_manner', 0):.3f} "
@@ -712,19 +793,28 @@ def main():
                     f"v={val_log.get('loss_voicing', 0):.3f} "
                     f"vb={val_log.get('loss_vowel_backness', 0):.3f}) "
                     f"acc={val_log['acc']['mean']:.3f}"
+                    f" | val f1={f1['mean']:.4f} "
+                    f"(manner={f1.get('manner', 0.0):.4f} place={f1.get('place', 0.0):.4f} "
+                    f"voicing={f1.get('voicing', 0.0):.4f} "
+                    f"vowel_backness={f1.get('vowel_backness', 0.0):.4f})"
                 )
 
                 logger.info(log_msg)
 
-                if val_log["loss"] < fold_best_val_loss:
-                    fold_best_val_loss = val_log["loss"]
+                # 选模用 val F1 mean：loss 不再参与择优，严格改善才覆盖
+                select_value = f1["mean"]
+
+                if select_value > fold_best_f1:
+                    fold_best_f1 = select_value
                     torch.save(
                         {
                             "fold": fold_id,
                             "epoch": epoch + 1,
                             "model_state_dict": model.state_dict(),
                             "optimizer_state_dict": optimizer.state_dict(),
-                            "best_val_loss": fold_best_val_loss,
+                            "best_val_loss": val_cls_loss,
+                            "select_metric": "f1_mean",
+                            "best_select_value": fold_best_f1,
                             "checkpoint_type": "fold_best",
                             "config": config,
                         },
@@ -732,12 +822,12 @@ def main():
                     )
                     logger.info(
                         f"Fold best checkpoint saved (Fold {fold_id}, "
-                        f"Epoch {epoch + 1}, val_loss={fold_best_val_loss:.4f}): "
-                        f"{fold_best_ckpt_path}"
+                        f"Epoch {epoch + 1}, val F1 mean={fold_best_f1:.4f}, "
+                        f"cls_loss={val_cls_loss:.4f}): {fold_best_ckpt_path}"
                     )
 
-                if val_log["loss"] < global_best_val_loss:
-                    global_best_val_loss = val_log["loss"]
+                if select_value > global_best_f1:
+                    global_best_f1 = select_value
                     if global_best_ckpt_path is not None and global_best_ckpt_path.exists():
                         global_best_ckpt_path.unlink()
 
@@ -749,20 +839,23 @@ def main():
                             "epoch": epoch + 1,
                             "model_state_dict": model.state_dict(),
                             "optimizer_state_dict": optimizer.state_dict(),
-                            "best_val_loss": global_best_val_loss,
+                            "best_val_loss": val_cls_loss,
+                            "select_metric": "f1_mean",
+                            "best_select_value": global_best_f1,
                             "config": config,
                         },
                         ckpt_path,
                     )
                     logger.info(
                         f"Global best checkpoint saved (Fold {fold_id}, "
-                        f"Epoch {epoch + 1}, val_loss={global_best_val_loss:.4f}): {ckpt_path}"
+                        f"Epoch {epoch + 1}, val F1 mean={global_best_f1:.4f}, "
+                        f"cls_loss={val_cls_loss:.4f}): {ckpt_path}"
                     )
             else:
                 logger.info(log_msg)
 
     logger.info(f"{'=' * 60}")
-    logger.info(f"Training finished. Best val_loss across all folds: {global_best_val_loss:.4f}")
+    logger.info(f"Training finished. Best val F1 mean across all folds: {global_best_f1:.4f}")
     logger.info(f"Best checkpoint: {global_best_ckpt_path}")
 
 
