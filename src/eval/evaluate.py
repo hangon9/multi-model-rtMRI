@@ -782,7 +782,9 @@ def _generate_loss_plots(
             plot_fold_loss_components(df_fold, fold, figures_dir, components)
         # F1 曲线是选模依据，所有流水线都出；旧 run 没有 val_f1_* 列时跳过并告警
         if _has_f1_data(df_fold):
-            plot_fold_f1(df_fold, fold, figures_dir, meta=meta)
+            # family 决定图例名（image_model / audio_model / multimodal / …），
+            # 不能硬编码成 multimodal，否则五条流水线看起来都一样
+            plot_fold_f1(df_fold, fold, figures_dir, meta=meta, family=family)
         print(f"[evaluate] Saved loss/F1 plots for fold {fold} (family={family})")
 
     if histories:

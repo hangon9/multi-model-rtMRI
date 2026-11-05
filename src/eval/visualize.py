@@ -523,12 +523,42 @@ def plot_all_folds_val_loss(histories: Mapping[int, pd.DataFrame], best_meta: Ma
 
 _F1_TASKS = ("manner", "place", "voicing", "vowel_backness")
 
+#: ``--model`` / plot family → 主曲线的图例名。multimodal 保持旧行为不变；其余流水线
+#: 用各自的模型名，避免所有模型都显示成 multimodal。
+_F1_MODEL_LABELS = {
+    "image": "image_model",
+    "audio": "audio_model",
+    "fusion": "multimodal",
+    "contrast": "contrast_model",
+    "kd": "kd_student",
+}
+
+
+def _f1_at_epoch(df: pd.DataFrame, task: str, epoch: Optional[int]) -> Optional[float]:
+    """取某头在指定 epoch 的验证 macro-F1，缺失时返回 None。
+
+    Args:
+        df: 单折历史 DataFrame，需含 ``epoch``。
+        task: 头名。
+        epoch: 1-based epoch；``None`` 直接返回 None。
+
+    Returns:
+        该头的 F1；无该列、该 epoch 无记录或对应值为 NaN 时返回 None，供调用方退回
+        不带数值的图例文字。
+    """
+    column = f"val_f1_{task}"
+    if epoch is None or column not in df.columns:
+        return None
+    sub = df.loc[df["epoch"] == epoch, column].dropna()
+    return float(sub.iloc[0]) if not sub.empty else None
+
 
 def plot_fold_f1(
     df: pd.DataFrame,
     fold: int,
     out_dir: Path,
     meta: Optional[Mapping[str, Any]] = None,
+    family: Optional[str] = None,
     tasks: Sequence[str] = _F1_TASKS,
 ) -> None:
     """绘制单折验证 F1（四个头各一格），并标出被选中的 epoch。
@@ -539,24 +569,24 @@ def plot_fold_f1(
         fold: 折号，用于标题与文件名 ``fold{N}_f1.png``。
         out_dir: 图片输出目录（已存在）。
         meta: 该折 ckpt 的元信息；用于取被选中的 epoch（优先 ``epoch`` 字段）。
+        family: :func:`resolve_plot_family` 的返回值，决定主曲线的图例名（image_model /
+            audio_model / multimodal / contrast_model / kd_student）；``None`` 时回退成
+            ``val_f1``。
         tasks: 要画的四个头。
 
     Note:
         竖线的 epoch 由 :func:`src.eval.f1.resolve_f1_best_epoch` 给：与训练脚本的 F1 选模
-        完全同口径（四头 F1 均值最大）。fusion 的 ``val_image_only_f1_*`` /
-        ``val_audio_only_f1_*`` 诊断曲线在其他流水线不存在时自动跳过。
+        完全同口径（四头 F1 均值最大）。竖线的图例写的是**每个头自己**在该 epoch 的 F1，
+        不是四头均值。fusion 的 ``val_image_only_f1_*`` / ``val_audio_only_f1_*`` 诊断曲线
+        在其他流水线不存在时自动跳过。
     """
-    best_epoch, best_value = resolve_f1_best_epoch(df, meta, tasks=tasks)
-    marker_label = (
-        f"best epoch={best_epoch} (mean F1={best_value:.4f})"
-        if best_epoch is not None and best_value is not None
-        else (f"best epoch={best_epoch}" if best_epoch is not None else None)
-    )
+    best_epoch, _ = resolve_f1_best_epoch(df, meta, tasks=tasks)
+    model_label = _F1_MODEL_LABELS.get(family or "", "val_f1")
 
     fig, axes = plt.subplots(2, 2, figsize=(13, 9))
     for ax, task in zip(axes.flat, tasks):
         columns = (
-            (f"val_f1_{task}", "multimodal", "o", "-"),
+            (f"val_f1_{task}", model_label, "o", "-"),
             (f"val_image_only_f1_{task}", "img_only", "^", "--"),
             (f"val_audio_only_f1_{task}", "audio_only", "s", ":"),
         )
@@ -579,6 +609,13 @@ def plot_fold_f1(
                     transform=ax.transAxes)
 
         if best_epoch is not None:
+            # 图例里的数值必须是本头自己在该 epoch 的 F1，不是四头均值
+            head_value = _f1_at_epoch(df, task, best_epoch)
+            marker_label = (
+                f"best epoch={best_epoch} (F1={head_value:.4f})"
+                if head_value is not None
+                else f"best epoch={best_epoch}"
+            )
             ax.axvline(best_epoch, linestyle="--", linewidth=1.2, color="gray",
                        label=marker_label)
 
@@ -590,7 +627,7 @@ def plot_fold_f1(
         if ax.lines:
             ax.legend(fontsize=8)
 
-    fig.suptitle(f"Fold {fold} Validation F1")
+    fig.suptitle(f"Fold {fold} Validation F1 ({model_label})")
     fig.tight_layout()
     fig.savefig(out_dir / f"fold{fold}_f1.png", dpi=200)
     plt.close(fig)
@@ -660,23 +697,36 @@ def plot_heads_test_set_performance(
         None。副作用：写 PNG，并在没有可画数据时打 WARN 后返回。
 
     Note:
-        误差线只在**跳折**数据（`--eval-folds`）下有意义；只有 1 折时自动不画 `yerr`，
-        y 轴标题也不会声称跳折。std 口径与 ``*_prf1_fold_comparison.png` 一致（ddof=0）。
+        每个柱用的是它自己的跳折标准差（ddof=0，与 ``*_prf1_fold_comparison.png` 一致）；
+        某头某集不足 2 折时只该柱不画误差线，不会把整张图的误差线全关掉。
     """
     modes = list(summary.keys())
     if not modes:
         print("[visualize] WARNING: 没有测试集汇总数据，跳过 heads_test_set_performance.png")
         return
 
-    # 折数：所有 mode 一致时才写进 y 轴标题；单折时不画误差线
-    fold_counts = {
-        len(stats.get(heads[0], {}).get("folds", {}) or {})
-        for stats in summary.values()
+    # 逐柱各自判断能否画误差线：某头某集只有 1 折（或没有 folds）时该柱不画误差线，
+    # 但不能因为某一柱缺折就把整张图的误差线全关掉。
+    fold_counts_by_mode = {
+        mode: {
+            head: len((summary[mode].get(head, {}) or {}).get("folds") or {})
+            for head in heads
+        }
+        for mode in modes
     }
-    n_folds = fold_counts.pop() if len(fold_counts) == 1 else None
-    show_err = n_folds is not None and n_folds > 1
-    if not show_err:
-        print("[visualize] WARNING: 汇总只有 1 折（或折数不一致），不画标准差误差线")
+    all_counts = {count for per_head in fold_counts_by_mode.values() for count in per_head.values()}
+    multi_fold_counts = {count for count in all_counts if count > 1}
+    # 不能用 pop()：那会把集合清空，后面的 `if not multi_fold_counts` 就会误判成单折
+    n_folds = next(iter(multi_fold_counts)) if len(multi_fold_counts) == 1 else None
+
+    if not multi_fold_counts:
+        print("[visualize] WARNING: 汇总只有 1 折（或没有 folds 数据），不画标准差误差线")
+    elif n_folds is None or 0 in all_counts or 1 in all_counts:
+        # 折数不一致或部分柱缺折：照常画有折的那些柱，但 y 轴不能声称“across N folds”
+        print(
+            "[visualize] WARNING: 各测试集 / 各头的折数不一致 "
+            f"{fold_counts_by_mode}；逐柱画各自可用的标准差误差线"
+        )
 
     x = np.arange(len(heads))
     width = 0.8 / max(len(modes), 1)
@@ -684,14 +734,25 @@ def plot_heads_test_set_performance(
 
     for index, mode in enumerate(modes):
         stats_by_head = summary[mode]
-        means = [float(stats_by_head.get(h, {}).get("mean", float("nan"))) for h in heads]
-        stds = [float(stats_by_head.get(h, {}).get("std", 0.0)) for h in heads]
+        means: List[float] = []
+        stds: List[float] = []
+        bar_has_err = False
+        for head in heads:
+            stats = stats_by_head.get(head, {}) or {}
+            means.append(float(stats.get("mean", float("nan"))))
+            # 该柱自己的跳折标准差；不足 2 折时记 0（画出来只是长度为 0 的误差线）
+            if fold_counts_by_mode[mode][head] > 1:
+                stds.append(float(stats.get("std", 0.0)))
+                bar_has_err = True
+            else:
+                stds.append(0.0)
+
         offset = (index - (len(modes) - 1) / 2) * width
         bars = ax.bar(
             x + offset,
             means,
             width,
-            yerr=stds if show_err else None,
+            yerr=stds if bar_has_err else None,
             capsize=4,
             label=mode.replace("_", " "),
         )
@@ -704,9 +765,13 @@ def plot_heads_test_set_performance(
         else "Test-set performance by feature head"
     )
     ax.set_xlabel("Phonological feature head")
-    ax.set_ylabel(
-        f"Mean macro-F1 across {n_folds} folds" if show_err else "Macro-F1"
-    )
+    if n_folds is not None and n_folds > 1:
+        ylabel = f"Mean macro-F1 across {n_folds} folds"
+    elif multi_fold_counts:
+        ylabel = "Mean macro-F1 (± std across folds)"
+    else:
+        ylabel = "Macro-F1"
+    ax.set_ylabel(ylabel)
     ax.set_ylim(0, 1.0)
     ax.set_xticks(x)
     ax.set_xticklabels(heads)

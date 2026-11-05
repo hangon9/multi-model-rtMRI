@@ -190,6 +190,7 @@ def main() -> None:
 
     # F1 竖线口径 + 流水线判定不再依赖 val_f1_* 列
     check_f1_best_epoch()
+    failures.extend(check_f1_legends())
     check_family_not_from_f1_column(base, failures)
 
     if failures:
@@ -226,6 +227,55 @@ def check_f1_best_epoch() -> None:
     # 完全没有 F1 列时返回 (None, None)
     empty = pd.DataFrame({"epoch": [1, 2]})
     assert resolve_f1_best_epoch(empty, {}) == (None, None)
+
+
+def check_f1_legends() -> list:
+    """F1 图图例：主曲线按流水线命名（image_model / audio_model / …），fusion 保持 multimodal；
+    best-epoch 竖线图例写的是**该头自己**在该 epoch 的 F1，不是四头均值。
+
+    Returns:
+        失败描述列表；空列表表示全部通过。
+    """
+    import pandas as pd
+
+    import src.eval.visualize as visualize
+
+    failures: list = []
+    df = pd.DataFrame(
+        {
+            "epoch": [6, 11],
+            "val_f1_manner": [0.85, 0.60],
+            "val_f1_place": [0.75, 0.70],
+            "val_f1_voicing": [0.90, 0.80],
+            "val_f1_vowel_backness": [0.65, 0.55],
+        }
+    )
+    expected_labels = {
+        "image": "image_model",
+        "audio": "audio_model",
+        "fusion": "multimodal",
+        "contrast": "contrast_model",
+        "kd": "kd_student",
+    }
+
+    out_dir = Path(tempfile.mkdtemp(prefix="f1legend_"))
+    original_close = visualize.plt.close
+    visualize.plt.close = lambda *args, **kwargs: None
+    try:
+        for family, label in expected_labels.items():
+            visualize.plot_fold_f1(df, 1, out_dir, meta={"epoch": 11}, family=family)
+            legend_labels = visualize.plt.gcf().axes[0].get_legend_handles_labels()[1]
+            if label not in legend_labels:
+                failures.append(f"{family}: 图例缺 {label}，实际 {legend_labels}")
+            # manner 在 epoch 11 的 F1 = 0.60，不能显示成四头均值
+            if "best epoch=11 (F1=0.6000)" not in legend_labels:
+                failures.append(
+                    f"{family}: best-epoch 图例未标该头 F1，实际 {legend_labels}"
+                )
+    finally:
+        visualize.plt.close = original_close
+        visualize.plt.close(visualize.plt.gcf())
+    return failures
 
 
 def check_family_not_from_f1_column(base: Path, failures: list) -> None:

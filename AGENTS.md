@@ -40,7 +40,8 @@ Two multimodal designs coexist:
     loss 图不标 best epoch。旧 run 的 `metrics.jsonl` 无 `f1` 字段 → 只告警、不出 F1 图。
   - 跑完所有 `--eval-sets` 后额外产出 `eval/figures/heads_test_set_performance.png` +
     `eval/metrics/heads_test_set_summary.json`：x 轴四个头 + `overall`，按测试集分组，
-    `--eval-folds` 时为跳折均值 ± 标准差（ddof=0）；只 1 折时自动不画误差线。
+    每个柱用**它自己的**跳折标准差作误差线（ddof=0）；单独某柱不足 2 折时只该柱不画误差线，
+    整张图 1 折时全部不画（y 轴标题也会随之改写）。
     详见 `docs/plans/eval_loss_plots_by_pipeline.md`。
 
 ## Architecture overview — five pipelines

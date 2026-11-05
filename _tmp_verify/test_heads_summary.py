@@ -85,13 +85,15 @@ def test_overall_head_stats():
 
 
 def test_plot_both_fold_counts():
-    """多折出带误差线的图，单折降级为无误差线，二者都能落盘。"""
+    """多折出带误差线的图（逐柱各自 std），单折降级为无误差线，二者都能落盘。"""
     multi = {
         "unseen_speaker": _overall_head_stats(
-            _head_stats({h: [0.6 + 0.01 * i for i in range(5)] for h in HEADS})
+            _head_stats({h: [0.6 + 0.01 * i + 0.02 * j for i in range(5)]
+                         for j, h in enumerate(HEADS)})
         ),
         "unseen_task": _overall_head_stats(
-            _head_stats({h: [0.5 + 0.01 * i for i in range(5)] for h in HEADS})
+            _head_stats({h: [0.5 + 0.01 * i + 0.02 * j for i in range(5)]
+                         for j, h in enumerate(HEADS)})
         ),
     }
     single = {
@@ -107,15 +109,64 @@ def test_plot_both_fold_counts():
         tmpdir = Path(tmp)
         multi_path = tmpdir / "multi.png"
         single_path = tmpdir / "single.png"
-        plot_heads_test_set_performance(multi, multi_path)
-        plot_heads_test_set_performance(single, single_path)
-        check("多折输入写出 PNG", multi_path.exists() and multi_path.stat().st_size > 0)
-        check("单折输入写出 PNG", single_path.exists() and single_path.stat().st_size > 0)
+
+        # 多折：每个测试集一组柱，每组都必带误差线
+        multi_err = _plot_and_count_errorbars(multi, multi_path)
+        check("多折输入写出 PNG", multi_path.exists() and multi_path.stat().st_size != 0)
+        check("每个测试集一组柱都带误差线", multi_err == len(multi),
+              f"errorbar containers={multi_err}, modes={len(multi)}")
+
+        single_err = _plot_and_count_errorbars(single, single_path)
+        check("单折输入写出 PNG", single_path.exists() and single_path.stat().st_size != 0)
+        check("单折输入不画误差线", single_err == 0, f"errorbar containers={single_err}")
+
+        # 折数不一致（部分柱缺折）时仍要给有折的柱画误差线，不能因为一柱缺折就全关掉
+        mixed = {
+            "unseen_speaker": _overall_head_stats(
+                _head_stats({h: [0.6 + 0.01 * i for i in range(5)] for h in HEADS})
+            ),
+            "unseen_both": _overall_head_stats(
+                _head_stats({h: [0.5, 0.52] for h in HEADS})
+            ),
+        }
+        mixed_err = _plot_and_count_errorbars(mixed, tmpdir / "mixed.png")
+        check("折数不一致时仍逐柱画误差线", mixed_err == len(mixed),
+              f"errorbar containers={mixed_err}")
 
         # 空输入只打 WARN，不抛异常、不写文件
         empty_path = tmpdir / "empty.png"
         plot_heads_test_set_performance({}, empty_path)
         check("空输入不写文件", not empty_path.exists())
+
+
+def _plot_and_count_errorbars(summary, out_path) -> int:
+    """画图并返回图中 ErrorbarContainer 的数量（用于验证逐柱误差线真的画了）。
+
+    误差线是否被画出不能只看 PNG 大小，所以临时禁用 ``plt.close`` 后检查 figure 的
+    containers；否则函数内部已经把 figure 关掉了。
+
+    Args:
+        summary: 传给 :func:`plot_heads_test_set_performance` 的汇总字典。
+        out_path: PNG 输出路径。
+
+    Returns:
+        图中的 ``ErrorbarContainer`` 个数（matplotlib 每次带 ``yerr`` 的 ``bar()``
+        会生成一个）。
+    """
+    from matplotlib.container import ErrorbarContainer
+
+    import src.eval.visualize as visualize
+
+    original_close = visualize.plt.close
+    visualize.plt.close = lambda *args, **kwargs: None
+    try:
+        plot_heads_test_set_performance(summary, out_path)
+        axes = visualize.plt.gcf().axes
+        containers = axes[0].containers if axes else []
+        return sum(1 for container in containers if isinstance(container, ErrorbarContainer))
+    finally:
+        visualize.plt.close = original_close
+        visualize.plt.close(visualize.plt.gcf())
 
 
 def main():
