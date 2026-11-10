@@ -12,6 +12,7 @@ import torch.nn as nn
 
 from src.models.contrastive_model import AudioVisionContrastiveModel
 from src.models.audio_only_model import AudioMultiHeadClassifier
+from src.models.img_mask_model import ImageMaskMultiheadClassifier
 from src.models.img_only_model import ImageMultiheadClassifier
 from src.models.multimodal_fusion import AudioVisionFusionModel
 from data.splits import make_train_test_split, create_dataloader, create_timit_dataloader, make_timit_test_set
@@ -40,6 +41,8 @@ _EXPERIMENT_TO_FAMILY: dict[str, str] = {
     "img_ResNet18":                       "image",
     "img_ResNet50":                       "image",
     "img_ViT":                            "image",
+    # oracle 上界实验：结构与 image 同构但多一路 mask 输入，必须单独建模型
+    "img_mask_oracle_ResNet50":           "image_mask",
     "multimodal_fusion_concat":           "multimodal_fusion",
     "multimodal_fusion_gated":            "multimodal_fusion",
     "multimodal_fusion_cross_attn":       "multimodal_fusion",
@@ -55,6 +58,8 @@ MODEL_FAMILY_ALIASES: dict[str, str] = {
     "image":    "image",
     "multi":    "multimodal_fusion",
     "contrast": "contrastive",
+    # 图像 + 真值 mask 的 oracle 上界；`evaluate --model` 的 choices 由本字典派生
+    "image_mask": "image_mask",
 }
 
 # 内部标签集合：``resolve_model_family_override`` 用它保证幂等（内部标签原样返回），
@@ -209,6 +214,10 @@ def _resolve_model_family(
             return family
         # Soft match for partial names (e.g. "wav_baseline" → audio)
         lname = experiment_name.lower()
+        # mask 必须先判：下面的 ("img", "resnet", ...) 会把含 img 的实验名判成 image，
+        # 那样新 ckpt 会被当普通 image 模型建出来，直到 load_state_dict 才报错
+        if "mask" in lname:
+            return "image_mask"
         if any(k in lname for k in ("img", "resnet", "vit", "distill", "kd")):
             return "image"
         if any(k in lname for k in ("fusion", "multimodal")):
@@ -330,36 +339,81 @@ def _build_audio_model(
         sample_rate=data_cfg.get("audio_sample_rate", 16000),
     ).to(device)
 
+def _image_model_kwargs(
+    config: dict[str, Any],
+    classification_task: str,
+) -> dict[str, Any]:
+    """汇总 `ImageMultiheadClassifier` 系列模型共用的构造实参。
+
+    Args:
+        config: checkpoint 内嵌的配置，读 `model.image_encoder` / `model.classifier` /
+            `model.image_temporal`。
+        classification_task: "" 表示四头多任务，否则为单任务名。
+
+    Returns:
+        可直接展开成 `ImageMultiheadClassifier(**kwargs)` 的字典；缺失键回退到模型默认值。
+
+    Note:
+        图像 baseline 与 mask oracle 的差别只在后者多一个 `mask_channels`，其余超参必须逐项相同，
+        否则两边指标不可比；共用本函数是让这一点写不进两个地方的唯一办法。
+    """
+    model_cfg = config.get("model", {})
+    img_cfg = model_cfg.get("image_encoder", {})
+    clf_cfg = model_cfg.get("classifier", {})
+    temporal_cfg = model_cfg.get("image_temporal", {})
+
+    return {
+        "num_classes": NUM_CLASSES[classification_task],
+        "img_size": img_cfg.get("img_size", 128),
+        "patch_size": img_cfg.get("patch_size", 16),
+        "hidden_size": img_cfg.get("hidden_size", 768),
+        "mlp_dim": img_cfg.get("mlp_dim", 3072),
+        "clf_hidden_dim": clf_cfg.get("clf_hidden_dim", 256),
+        "num_layers": img_cfg.get("num_layers", 12),
+        "num_heads": img_cfg.get("num_heads", 12),
+        "dropout": img_cfg.get("dropout", 0.1),
+        "classification_task": classification_task,
+        "model_name": img_cfg.get("model_name", "vit"),
+        "pretrained": img_cfg.get("pretrained", True),
+        "freeze_layers": int(img_cfg.get("freeze_layers", 0)),
+        "temporal_type": temporal_cfg.get("temporal_type", "none"),
+        "conformer_layers": temporal_cfg.get("conformer_layers", 2),
+        "conformer_heads": temporal_cfg.get("conformer_heads", 8),
+        "conv_kernel_size": temporal_cfg.get("conv_kernel_size", 5),
+    }
+
+
 def _build_image_model(
     config: dict[str, Any],
     classification_task: str,
     device: torch.device,
 ) -> ImageMultiheadClassifier:
-    model_cfg = config.get("model", {})
-    data_cfg = config.get("data", {})
-    img_cfg = model_cfg.get("image_encoder", {})
-    clf_cfg = model_cfg.get("classifier", {})
-    temporal_cfg = model_cfg.get("image_temporal", {})
-
     return ImageMultiheadClassifier(
-            num_classes=NUM_CLASSES[classification_task],
-            img_size=img_cfg.get("img_size", 128),
-            patch_size=img_cfg.get("patch_size", 16),
-            hidden_size=img_cfg.get("hidden_size", 768),
-            mlp_dim=img_cfg.get("mlp_dim", 3072),
-            clf_hidden_dim=clf_cfg.get("clf_hidden_dim", 256),
-            num_layers=img_cfg.get("num_layers", 12),
-            num_heads=img_cfg.get("num_heads", 12),
-            dropout=img_cfg.get("dropout", 0.1),
-            classification_task=classification_task,
-            model_name=img_cfg.get("model_name", "vit"),
-            pretrained=img_cfg.get("pretrained", True),
-            freeze_layers=int(img_cfg.get("freeze_layers", 0)),
-            temporal_type=temporal_cfg.get("temporal_type", "none"),
-            conformer_layers=temporal_cfg.get("conformer_layers", 2),
-            conformer_heads=temporal_cfg.get("conformer_heads", 8),
-            conv_kernel_size=temporal_cfg.get("conv_kernel_size", 5),
+            **_image_model_kwargs(config, classification_task),
     ).to(device)
+
+
+def _build_image_mask_model(
+    config: dict[str, Any],
+    classification_task: str,
+    device: torch.device,
+) -> ImageMaskMultiheadClassifier:
+    """构建 oracle 流水线的推理副本（图像 + 真值 mask 双输入）。
+
+    Args:
+        config: checkpoint 内嵌配置；除图像族的键外还读
+            `model.image_encoder.mask_channels` / `img_size`。
+        classification_task: "" 表示四头多任务，否则为单任务名。
+        device: 建好模型随手 `.to(device)`。
+
+    Note:
+        `mask_mode` 不在这里决定（默认 `gt`），由 :func:`run_inference` 在载入权重后设置，
+        供 E2/E3 诊断（mask 置零 / 打乱）复用同一个 ckpt。
+    """
+    kwargs = _image_model_kwargs(config, classification_task)
+    img_cfg = config.get("model", {}).get("image_encoder", {})
+    kwargs["mask_channels"] = int(img_cfg.get("mask_channels", 4))
+    return ImageMaskMultiheadClassifier(**kwargs).to(device)
 
 
 def _build_multimodal_model(
@@ -387,6 +441,8 @@ def _build_model(
         return _build_audio_model(config, classification_task, device)
     if model_family == "image":
         return _build_image_model(config, classification_task, device)
+    if model_family == "image_mask":
+        return _build_image_mask_model(config, classification_task, device)
     if model_family == "multimodal_fusion":
         return _build_multimodal_model(config, classification_task, device)
     raise ValueError(f"Unknown model_family: {model_family!r}")
@@ -508,7 +564,9 @@ def _forward(
             attn_mask = attn_mask.to(device)
         return model(audio=audio, attention_mask=attn_mask)
 
-    if model_family == "image":
+    if model_family in ("image", "image_mask"):
+        # image_mask 族的 mask 已经在 image 张量里（数据层拼好的 [B,T,3+4,H,W]），
+        # 因此与 image 族同一路调用；不能只传 3 通道灰度图，模型会因通道数不符而报错
         image = batch["image"].to(device)
         return model(image=image)
 
@@ -550,6 +608,7 @@ def run_inference_all_folds(
     allowed_folds: set[int] | None = None,
     timit_root: str | Path | None = None,
     timit_subjects: list[str] | None = None,
+    mask_mode: str = "gt",
 ) -> dict[int, tuple[dict, dict]]:
     """Run run_inference() for every discovered fold checkpoint.
 
@@ -561,6 +620,7 @@ def run_inference_all_folds(
         allowed_folds: 仅推理这些折号；None 表示全部折。
         timit_root: USC-TIMIT 根目录，仅 ``mode == "timit"`` 时使用，透传给 ``run_inference``。
         timit_subjects: 仅评估这些被试验；None 表示全部。
+        mask_mode: 仅 ``image_mask`` 族有效，透传给 ``run_inference``。
 
     Returns:
         ``{fold_id: (results, meta)}``，键按 fold 升序（``discover_fold_checkpoints`` 已排序）。
@@ -583,6 +643,7 @@ def run_inference_all_folds(
             model_family=model_family,
             timit_root=timit_root,
             timit_subjects=timit_subjects,
+            mask_mode=mask_mode,
         )
     return results
 
@@ -598,6 +659,7 @@ def run_inference(
     model_family: str | None = None,
     timit_root: str | Path | None = None,
     timit_subjects: list[str] | None = None,
+    mask_mode: str = "gt",
 ) -> tuple[dict, dict]:
     """
     Load a checkpoint, detect its model type, run inference on the held-out
@@ -612,6 +674,8 @@ def run_inference(
                       ``contrast``）；``None`` 时走下面的自动识别。
     timit_root      : USC-TIMIT 根目录；``mode == "timit"`` 时必填，否则不会被读取。
     timit_subjects  : 只评估这些被试目录；None 表示全部。
+    mask_mode       : 仅 ``image_mask`` 族有效；``"gt"`` 用真值 mask、``"zero"`` 置零、
+                      ``"shuffle"`` 按样本打乱。E2/E3 诊断靠它复用同一份 ckpt。
 
     Model-family detection order
     ────────────────────────────
@@ -626,6 +690,7 @@ def run_inference(
     • "contrastive"  → AudioVisionContrastiveModel   (image branch only)
     • "audio"        → AudioMultiHeadClassifier      (audio branch)
     • "image"        → ImageMultiheadClassifier      (image branch)
+    • "image_mask"   → ImageMaskMultiheadClassifier  (image + 真值 mask，oracle)
     • "multimodal_fusion" → AudioVisionFusionModel   (image + audio)
 
     Returns
@@ -665,6 +730,15 @@ def run_inference(
     model = _build_model(config, classification_task, device_obj, model_family)
     _load_state(model, ckpt["model_state_dict"], model_family)
     model.eval()
+
+    # mask 族：载入权重之后再设诊断开关（只影响 forward，不改变参数）
+    if model_family == "image_mask":
+        if mask_mode not in ("gt", "zero", "shuffle"):
+            raise ValueError(
+                f"mask_mode 只能是 gt / zero / shuffle，实际得到: {mask_mode!r}"
+            )
+        model.mask_mode = mask_mode
+        print(f"[inference] image_mask mask_mode={mask_mode}")
 
     # ── Test data ────────────────────────────────────────────────────────────
     # TIMIT 必须走专用 dataloader：它的图像命名不匹配基类的取邻帧正则
@@ -726,6 +800,8 @@ def run_inference(
         "classification_task": classification_task,
         "config":              config,
         "model_family":        model_family,
+        # mask 族的诊断开关（其余族为 None）：追溯结果时必须能看出 mask 是否被置零/打乱
+        "mask_mode":           mask_mode if model_family == "image_mask" else None,
         "experiment_name":     (
             config.get("experiment_name")
             or config.get("experiment", {}).get("name")

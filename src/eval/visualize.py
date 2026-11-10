@@ -393,6 +393,8 @@ _PLOT_FAMILY_NAME_KEYWORDS = (
 #: ``--model`` 的内部标签（inference 模块的四类）→ 画图族
 _HINT_TO_PLOT_FAMILY = {
     "image": "image",
+    # mask oracle 与 image 共用一套 loss 曲线（多出来的 mask 输入不产生新的 loss 分项）
+    "image_mask": "image",
     "audio": "audio",
     "multimodal_fusion": "fusion",
     "contrastive": "contrast",
