@@ -161,6 +161,9 @@ def create_dataloader(
         cache_audio=True,
         train=train,
         data_augment=aug_cfg,
+        # mask 输入（oracle 实验）：默认关闭，关闭时数据集行为与旧版逐字节一致
+        use_mask=bool(cfg_data.get("use_mask", False)),
+        mask_values=cfg_data.get("mask_values"),
         )
     
 
@@ -258,6 +261,10 @@ def create_timit_dataloader(dataframe, config: dict) -> DataLoader:
         label_columns=None,
         cache_audio=True,
         audio_cache_size=cfg_data.get("timit_audio_cache_size", 8),
+        # 评估时从 ckpt 内嵌 config 取这两个键，因此 run_inference 不需要为 mask 单独选 loader；
+        # 开启时 _audit_mask_coverage 会在构造期拦截缺 mask 的被试
+        use_mask=bool(cfg_data.get("use_mask", False)),
+        mask_values=cfg_data.get("mask_values"),
     )
 
     return DataLoader(

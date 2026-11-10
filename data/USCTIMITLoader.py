@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import re
 from collections import OrderedDict
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -38,6 +39,8 @@ from data.USCAnnot16Loader import USCAnnot16Dataset
 
 #: 图像文件名 → 新帧号；必须命中结尾的 ``_<数字>.png``，否则抛 ValueError
 _FRAME_PATTERN = re.compile(r"_(\d+)\.png$")
+#: mask 文件名 → 新帧号；与图像同一套不补零帧号
+_MASK_PATTERN = re.compile(r"_(\d+)_mask\.png$")
 
 
 class USCTIMITDataset(USCAnnot16Dataset):
@@ -50,7 +53,19 @@ class USCTIMITDataset(USCAnnot16Dataset):
     Attributes:
         dropped_boundary_frames: 因多帧窗口越界而被基类丢弃的帧数（``window_frames > 1``
             时非零），构造后可用于日志核对；单帧模式恒为 0。
+
+    Note:
+        四个类属性（``_IMG_RE`` / ``_IMG_FMT`` / ``_MASK_RE`` / ``_MASK_FMT``）覆盖基类的
+        命名规则：TIMIT 帧号不补零，图像为 ``<stem>_<i>.png``、mask 为 ``<stem>_<i>_mask.png``。
+        基类单路取帧（无 mask）仍走本类覆盖的 ``_load_image_window``，与旧版一致；
+        mask 窗口则直接复用基类的 ``_load_image_mask_window``，靠这四个属性拿到正确帧号。
     """
+
+    #: 图像 / mask 文件名 → 新帧号（TIMIT 帧号不补零）
+    _IMG_RE = _FRAME_PATTERN
+    _IMG_FMT = "_{}.png"
+    _MASK_RE = _MASK_PATTERN
+    _MASK_FMT = "_{}_mask.png"
 
     def __init__(
         self,
@@ -62,6 +77,8 @@ class USCTIMITDataset(USCAnnot16Dataset):
         label_columns: list[str] | None = None,
         cache_audio: bool = True,
         audio_cache_size: int = 8,
+        use_mask: bool = False,
+        mask_values=None,
     ):
         """构建 TIMIT 评估数据集。
 
@@ -80,6 +97,11 @@ class USCTIMITDataset(USCAnnot16Dataset):
                 19s 的 wav × 30 万帧会慢到不可用，仅在调试时使用。
             audio_cache_size: 音频缓存的最大句数（LRU）。TIMIT 按句连续访问，8 句
                 已足够覆盖乱序的少量回跳；调大可换更少的重复解码、更高的常驻内存。
+            use_mask: 是否额外读同帧的器官 mask（``img_mask_oracle`` 流水线用）。
+                本地只有部分被试带 mask（如 ``data/USC-TIMIT/masks/f1``），
+                所以开启时会在构造期做一次覆盖检查，缺 mask 直接报错。
+            mask_values: 4 个器官灰度值，顺序即 one-hot 通道顺序；
+                ``use_mask=False`` 时不读。
 
         Note:
             ``train`` / ``data_augment`` / ``untrained_*`` 被固定为评估语义，不接受外部传入。
@@ -98,6 +120,8 @@ class USCTIMITDataset(USCAnnot16Dataset):
             label_columns=label_columns,
             cache_audio=cache_audio,
             data_augment=False,
+            use_mask=use_mask,
+            mask_values=mask_values,
         )
 
         # 基类在 window_frames>1 时会静默丢掉窗口越界的首尾帧，这里把差值记下来并在构造时
@@ -112,6 +136,61 @@ class USCTIMITDataset(USCAnnot16Dataset):
         # 用 OrderedDict 接管音频缓存：基类只做 get/insert，LRU 语义在 _load_full_audio 里
         self._audio_cache_size = max(int(audio_cache_size), 1)
         self.audio_cache: OrderedDict[str, np.ndarray] = OrderedDict()
+
+        # mask 模式：本地 mask 只覆盖部分被试，构造期就查清并报错，
+        # 不要等跑到第 N 个 batch 才在 Image.open 里抛 FileNotFoundError
+        if self.use_mask:
+            self._audit_mask_coverage()
+
+    # ------------------------------------------------------------------
+    # mask 覆盖检查（use_mask=True 专用）
+    # ------------------------------------------------------------------
+    def _audit_mask_coverage(self) -> None:
+        """检查每个待评估帧是否都有 mask 文件；有缺失则直接报错。
+
+        为什么要单独查：``data/USC-TIMIT/masks`` 下只有部分被试的 mask（本机只有 f1，
+        34,529 帧 / 308,378 帧），而 ``--eval-sets timit`` 默认跑全部 10 位被试。
+        不提前拦截的话，缺 mask 会在跑到对应被试时才炸，白白浪费前面的推理时间。
+
+        Raises:
+            ValueError: 任一帧的 mask 文件不存在时抛出，消息里给出缺口统计与可行的
+                ``--timit-subjects`` 取值。
+
+        Note:
+            ``mtime``/内容不在检查范围；只查「名字存在」——与 ``utils/check_masks.py``
+            同口径。同一目录只 list 一次，避免 30 万次 stat。
+        """
+        dir_cache: dict[Path, set[str]] = {}
+        missing_by_subject: dict[str, int] = {}
+        examples: list[str] = []
+
+        for subject, mask_path in zip(self.df["subject"], self.df["mask_path"]):
+            path = Path(mask_path)
+            names = dir_cache.get(path.parent)
+            if names is None:
+                names = (
+                    {p.name for p in path.parent.iterdir()}
+                    if path.parent.is_dir() else set()
+                )
+                dir_cache[path.parent] = names
+            if path.name in names:
+                continue
+            missing_by_subject[subject] = missing_by_subject.get(subject, 0) + 1
+            if len(examples) < 3:
+                examples.append(str(path))
+
+        if missing_by_subject:
+            n_missing = sum(missing_by_subject.values())
+            raise ValueError(
+                f"USC-TIMIT 有 {n_missing}/{len(self.df)} 帧找不到对应 mask，"
+                f"按被试用量统计：{missing_by_subject}；例如 {examples}。\n"
+                "本地 mask 只覆盖部分被试，请用 --timit-subjects 只评估有 mask 的被试"
+                "（如 f1），或补齐 mask 后重跑。"
+            )
+        print(
+            f"[mask] USC-TIMIT mask 覆盖检查通过：{len(self.df)} 帧全部有 mask"
+            f"（被试 {sorted(set(self.df['subject']))}）"
+        )
 
     # ------------------------------------------------------------------
     # 取帧
@@ -132,13 +211,9 @@ class USCTIMITDataset(USCAnnot16Dataset):
             ValueError: 路径不以 ``_<数字>.png`` 结尾时抛出。此处的「响亮失败」是刻意的：
                 基类对同样情形会原样返回中心帧路径，把 5 帧窗口退化成重复帧而不报错。
         """
-        new_path, n_replaced = _FRAME_PATTERN.subn(f"_{frame_idx}.png", str(image_path))
-        if n_replaced != 1:
-            raise ValueError(
-                f"无法把图像路径重写到帧 {frame_idx}：{image_path!r}；"
-                "期望以 '_<数字>.png' 结尾（USC-TIMIT 命名）。"
-            )
-        return new_path
+        return USCTIMITDataset._rewrite_frame(
+            image_path, frame_idx, USCTIMITDataset._IMG_RE, USCTIMITDataset._IMG_FMT
+        )
 
     def _load_image_window(self, row, center_idx: int):
         """加载以 ``center_idx`` 为中心的 T 帧图像窗口。
@@ -155,7 +230,12 @@ class USCTIMITDataset(USCAnnot16Dataset):
         Note:
             评估路径没有随机仿射（``train=False`` 使基类的 ``_random_affine`` 为 None），
             因此这里逐帧调用 ``_load_image`` 即可，无需共享仿射参数。
+            ``use_mask=True`` 时改由基类的 ``_load_image_mask_window`` 接管：它需要把
+            图像与 mask 放在同一个循环里读才能共用仿射参数，而本类覆盖的这份实现做不到。
         """
+        if self.use_mask:
+            return self._load_image_mask_window(row, center_idx)
+
         if self.window_frames <= 1:
             if center_idx == int(row["frame_idx"]):
                 return self._load_image(row["image_path"])

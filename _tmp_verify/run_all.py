@@ -39,6 +39,8 @@ TEST_SCRIPTS = (
     "test_timit_prepare.py",
     "test_timit_loader.py",
     "test_eval_timit_smoke.py",
+    # img_mask_oracle：mask 数据层 / 模型 / 评估接入（假数据，CPU）
+    "test_img_mask.py",
 )
 
 
